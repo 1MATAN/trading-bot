@@ -226,7 +226,7 @@ def _build_trades_table(result) -> str:
             <td>{str(t.entry_date)[:10]}</td>
             <td>${t.entry_price:.4f}</td>
             <td>{str(t.exit_date)[:10] if t.exit_date else '-'}</td>
-            <td>${t.exit_price:.4f if t.exit_price else 0}</td>
+            <td>${(t.exit_price or 0):.4f}</td>
             <td>{t.quantity}</td>
             <td class="{pnl_class}">${t.pnl:+.2f}</td>
             <td class="{pnl_class}">{t.pnl_pct:+.2%}</td>

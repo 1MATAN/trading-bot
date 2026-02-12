@@ -44,8 +44,12 @@ def download_historical_data(
     # Download from yfinance
     logger.info(f"Downloading {symbol} {interval} from {start_date} to {end_date}")
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date, interval=interval)
+        import time
+        time.sleep(0.5)  # rate limit courtesy
+        df = yf.download(
+            symbol, start=start_date, end=end_date,
+            interval=interval, progress=False, auto_adjust=True,
+        )
     except Exception as e:
         logger.error(f"Download failed for {symbol}: {e}")
         return pd.DataFrame()
@@ -54,10 +58,16 @@ def download_historical_data(
         logger.warning(f"No data returned for {symbol}")
         return df
 
+    # Handle multi-level columns from yfinance (e.g. ('Close', 'AAPL'))
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
     # Normalize column names
-    df.columns = [c.lower() for c in df.columns]
-    if "stock splits" in df.columns:
-        df.drop(columns=["stock splits", "dividends"], errors="ignore", inplace=True)
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    # Map 'adj close' or 'adj_close' to 'close' if present
+    if "adj_close" in df.columns and "close" not in df.columns:
+        df.rename(columns={"adj_close": "close"}, inplace=True)
+    df.drop(columns=["stock_splits", "dividends", "adj_close"], errors="ignore", inplace=True)
 
     # Ensure required columns
     required = ["open", "high", "low", "close", "volume"]
@@ -99,12 +109,12 @@ def get_penny_stock_universe(
 
     Note: This is a simplified approach. In production, use IBKR scanner.
     """
-    # Use a static list of common penny stock symbols for backtesting
+    # Active low-cap / volatile stocks for backtesting
     # In production, the IBKR scanner provides this dynamically
     candidates = [
-        "SNDL", "CLOV", "WISH", "SOFI", "PLTR", "BB", "NOK",
-        "GSAT", "TELL", "BNGO", "SENS", "MNMD", "TLRY", "ACB",
-        "FCEL", "PLUG", "IDEX", "ZOM", "NAKD", "CTRM",
+        "AMC", "SNAP", "HOOD", "MARA", "RIOT", "CLSK", "SOS",
+        "HIVE", "BITF", "JOBY", "SKLZ", "BARK", "CLOV", "BIRD",
+        "TTOO", "ASTS", "APGE", "IBRX", "WULF", "BTBT",
     ]
     return candidates
 
