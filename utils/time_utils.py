@@ -115,6 +115,43 @@ def today_str() -> str:
     return now_et().strftime("%Y-%m-%d")
 
 
+def seconds_until_next_session() -> float:
+    """Seconds until the next trading session starts (pre-market at 4:00 ET).
+
+    Returns 0 if any session is currently active.
+    """
+    if is_any_session_active():
+        return 0.0
+    now = now_et()
+    target = now.replace(
+        hour=int(PREMARKET_START.split(":")[0]),
+        minute=int(PREMARKET_START.split(":")[1]),
+        second=0,
+        microsecond=0,
+    )
+    # If past after-hours today or it's weekend, target next weekday
+    if now.time() >= _AFTERHOURS_END or now.weekday() >= 5:
+        days_ahead = 1
+        while True:
+            candidate = target + timedelta(days=days_ahead)
+            if candidate.weekday() < 5:
+                target = candidate
+                break
+            days_ahead += 1
+    return max(0.0, (target - now).total_seconds())
+
+
+def current_session_name() -> str:
+    """Return the name of the current trading session."""
+    if is_premarket():
+        return "pre-market"
+    if is_market_open():
+        return "regular"
+    if is_afterhours():
+        return "after-hours"
+    return "closed"
+
+
 def format_timestamp(dt: datetime) -> str:
     """Format datetime for display (Eastern time)."""
     return to_et(dt).strftime("%Y-%m-%d %H:%M:%S ET")

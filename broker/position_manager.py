@@ -27,6 +27,13 @@ class Position:
     highest_price: float = 0.0  # for trailing stop
     fib_levels: list = field(default_factory=list)
     notes: str = ""
+    # Fib live strategy fields
+    target_price: float = 0.0
+    target_order_id: int = 0
+    oca_group: str = ""
+    supporting_fib_level: float = 0.0
+    fib_level_index: int = -1
+    strategy: str = "momentum"
 
     @property
     def market_value(self) -> float:
@@ -74,6 +81,12 @@ class PositionManager:
         entry_price: float,
         stop_loss_price: float = 0.0,
         fib_levels: Optional[list] = None,
+        target_price: float = 0.0,
+        target_order_id: int = 0,
+        oca_group: str = "",
+        supporting_fib_level: float = 0.0,
+        fib_level_index: int = -1,
+        strategy: str = "momentum",
     ) -> Position:
         """Register a new position after a fill."""
         pos = Position(
@@ -85,6 +98,12 @@ class PositionManager:
             stop_loss_price=stop_loss_price,
             highest_price=entry_price,
             fib_levels=fib_levels or [],
+            target_price=target_price,
+            target_order_id=target_order_id,
+            oca_group=oca_group,
+            supporting_fib_level=supporting_fib_level,
+            fib_level_index=fib_level_index,
+            strategy=strategy,
         )
         self._positions[symbol] = pos
         logger.info(
@@ -119,7 +138,7 @@ class PositionManager:
 
     async def sync_with_ibkr(self) -> None:
         """Sync local state with IBKR's actual positions."""
-        ibkr_positions = self.ib.positions()
+        ibkr_positions = await self.ib.reqPositionsAsync()
         ibkr_symbols = set()
 
         for ib_pos in ibkr_positions:
@@ -178,5 +197,9 @@ class PositionManager:
                 "stop_loss_price": p.stop_loss_price,
                 "partial_exits_done": p.partial_exits_done,
                 "highest_price": p.highest_price,
+                "target_price": p.target_price,
+                "oca_group": p.oca_group,
+                "supporting_fib_level": p.supporting_fib_level,
+                "strategy": p.strategy,
             })
         return result

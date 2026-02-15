@@ -1,186 +1,220 @@
-"""Recursive Fibonacci retracement engine — the core innovation.
+"""Dual-series Fibonacci engine with auto-advance.
 
-Finds swing high/low, computes Fibonacci levels, then recursively
-computes sub-grids between adjacent levels for precision.
-Results are cached with 24h TTL and invalidated when price exceeds grid top.
+Series 1: anchor Low → High of the same candle.
+Series 2: anchor Low → 4.236 level of Series 1.
+Auto-advance: when price crosses 4.236 of current series, shift up.
+24 Fibonacci levels per series.
 """
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
 
-from config.settings import (
-    FIB_LEVELS,
-    FIB_LOOKBACK_DAYS,
-    FIB_CACHE_TTL_HOURS,
-    FIB_PROXIMITY_PCT,
-    FIB_MAX_RECURSION_DEPTH,
-)
+from config.settings import FIB_LEVELS_24, FIB_LOOKBACK_YEARS, FIB_CACHE_TTL_HOURS
 from utils.time_utils import now_utc
 
 logger = logging.getLogger("trading_bot.fibonacci")
 
 
-# Cache: symbol → (timestamp, swing_low, swing_high, levels_list)
-_fib_cache: dict[str, tuple[datetime, float, float, list[tuple[float, float]]]] = {}
+@dataclass
+class FibSeries:
+    """One Fibonacci series with 24 levels."""
+    low: float
+    high: float
+    levels: list[tuple[float, float]]  # (ratio, price)
 
 
-def compute_fibonacci_levels(
-    df: pd.DataFrame,
-    symbol: str = "",
-    depth: int = 0,
-    swing_low_override: Optional[float] = None,
-    swing_high_override: Optional[float] = None,
-) -> list[tuple[float, float]]:
-    """Compute Fibonacci retracement levels from price data.
+@dataclass
+class DualFibSeries:
+    """Dual Fibonacci series: Series 1 (primary) + Series 2 (extended)."""
+    series1: FibSeries
+    series2: FibSeries
+    anchor_low: float
+    anchor_high: float
+    advance_count: int = 0
 
-    Returns list of (fib_ratio, price_level) tuples sorted by price.
 
-    At depth 0, finds swing high/low from data.
-    At depth > 0, uses override values for recursive sub-grids.
+# Cache: symbol → (timestamp, DualFibSeries)
+_fib_cache: dict[str, tuple[datetime, DualFibSeries]] = {}
+
+
+def find_anchor_candle(daily_df: pd.DataFrame) -> Optional[tuple[float, float, str]]:
+    """Find the candle with the lowest Low in the lookback period.
+
+    Returns (low, high, date_str) of that candle, or None if insufficient data.
+    The lookback is FIB_LOOKBACK_YEARS years.
     """
-    if depth == 0 and symbol and symbol in _fib_cache:
-        cached_time, cached_low, cached_high, cached_levels = _fib_cache[symbol]
-        age_hours = (now_utc() - cached_time).total_seconds() / 3600
+    if daily_df.empty or len(daily_df) < 5:
+        return None
 
-        # Check TTL
-        if age_hours < FIB_CACHE_TTL_HOURS:
-            # Invalidate if price exceeded grid top
-            current_price = df["close"].iloc[-1] if len(df) > 0 else 0
-            if current_price <= cached_high * 1.05:  # 5% tolerance
-                return cached_levels
-
-    # Find swing high and low
-    if swing_low_override is not None and swing_high_override is not None:
-        swing_low = swing_low_override
-        swing_high = swing_high_override
+    lookback_days = FIB_LOOKBACK_YEARS * 365
+    if len(daily_df) > lookback_days:
+        df = daily_df.iloc[-lookback_days:]
     else:
-        if len(df) < 5:
-            return []
-        lookback = min(len(df), FIB_LOOKBACK_DAYS)
-        recent = df.iloc[-lookback:]
-        swing_low = recent["low"].min()
-        swing_high = recent["high"].max()
+        df = daily_df
 
-    if swing_high <= swing_low:
-        return []
+    # Find the row with the minimum low
+    min_idx = df["low"].idxmin()
+    anchor_row = df.loc[min_idx]
+    anchor_low = float(anchor_row["low"])
+    anchor_high = float(anchor_row["high"])
+    anchor_date = str(min_idx)[:10] if hasattr(min_idx, 'strftime') else str(min_idx)[:10]
 
-    price_range = swing_high - swing_low
+    if anchor_high <= anchor_low:
+        anchor_high = anchor_low * 1.01  # tiny fallback range
+
+    logger.debug(
+        f"Anchor candle: Low=${anchor_low:.4f} High=${anchor_high:.4f} "
+        f"Date={min_idx}"
+    )
+    return anchor_low, anchor_high, anchor_date
+
+
+def build_series(low: float, high: float) -> FibSeries:
+    """Build a single Fibonacci series with 24 levels from low to high."""
+    price_range = high - low
     levels = []
-
-    for fib_ratio in FIB_LEVELS:
-        price = swing_low + (price_range * fib_ratio)
-        levels.append((fib_ratio, round(price, 4)))
-
-    # Recursive sub-grids for precision
-    if depth < FIB_MAX_RECURSION_DEPTH:
-        current_price = df["close"].iloc[-1] if len(df) > 0 else 0
-        sub_levels = _compute_sub_grids(
-            df, current_price, levels, depth + 1
-        )
-        levels.extend(sub_levels)
-
-    # Sort by price
-    levels.sort(key=lambda x: x[1])
-
-    # Remove duplicates (within tick tolerance)
-    levels = _deduplicate_levels(levels)
-
-    # Cache at top level
-    if depth == 0 and symbol:
-        _fib_cache[symbol] = (now_utc(), swing_low, swing_high, levels)
-        logger.debug(
-            f"Fibonacci {symbol}: {len(levels)} levels, "
-            f"swing ${swing_low:.4f}–${swing_high:.4f}, depth={depth}"
-        )
-
-    return levels
+    for ratio in FIB_LEVELS_24:
+        price = low + (price_range * ratio)
+        levels.append((ratio, round(price, 4)))
+    return FibSeries(low=low, high=high, levels=levels)
 
 
-def _compute_sub_grids(
-    df: pd.DataFrame,
-    current_price: float,
-    parent_levels: list[tuple[float, float]],
-    depth: int,
-) -> list[tuple[float, float]]:
-    """Recursively compute sub-grids between the two Fibonacci levels
-    that bracket the current price."""
-    if current_price <= 0 or not parent_levels:
-        return []
+def build_dual_series(anchor_low: float, anchor_high: float) -> DualFibSeries:
+    """Build both Series 1 and Series 2 from the anchor candle.
 
-    # Find bracketing levels
-    lower_level = None
-    upper_level = None
-    for i, (ratio, price) in enumerate(parent_levels):
-        if price <= current_price:
-            lower_level = (ratio, price)
-        elif upper_level is None and price > current_price:
-            upper_level = (ratio, price)
-            break
+    Series 1: anchor_low → anchor_high
+    Series 2: anchor_low → 4.236 level of Series 1
+    """
+    series1 = build_series(anchor_low, anchor_high)
 
-    if lower_level is None or upper_level is None:
-        return []
+    # Series 2 top = 4.236 level of Series 1
+    s1_range = anchor_high - anchor_low
+    s2_high = anchor_low + (s1_range * 4.236)
+    series2 = build_series(anchor_low, s2_high)
 
-    # Recurse between the bracketing levels
-    return compute_fibonacci_levels(
-        df,
-        symbol="",
-        depth=depth,
-        swing_low_override=lower_level[1],
-        swing_high_override=upper_level[1],
+    return DualFibSeries(
+        series1=series1,
+        series2=series2,
+        anchor_low=anchor_low,
+        anchor_high=anchor_high,
     )
 
 
-def _deduplicate_levels(
-    levels: list[tuple[float, float]], tolerance: float = 0.001
-) -> list[tuple[float, float]]:
-    """Remove levels that are too close together."""
-    if not levels:
-        return []
-    result = [levels[0]]
-    for ratio, price in levels[1:]:
-        _, prev_price = result[-1]
-        if prev_price > 0 and abs(price - prev_price) / prev_price < tolerance:
-            continue
-        result.append((ratio, price))
-    return result
+def advance_series(dual: DualFibSeries) -> DualFibSeries:
+    """Advance the series when price crosses 4.236 of current Series 1.
+
+    New Series 1 = old Series 2
+    New Series 2 = anchor_low → 4.236 of new Series 1
+    """
+    new_s1 = dual.series2
+
+    # New Series 2 top = 4.236 level of new Series 1
+    new_s1_range = new_s1.high - new_s1.low
+    new_s2_high = new_s1.low + (new_s1_range * 4.236)
+    new_s2 = build_series(new_s1.low, new_s2_high)
+
+    advanced = DualFibSeries(
+        series1=new_s1,
+        series2=new_s2,
+        anchor_low=dual.anchor_low,
+        anchor_high=dual.anchor_high,
+        advance_count=dual.advance_count + 1,
+    )
+
+    logger.info(
+        f"Fibonacci auto-advance #{advanced.advance_count}: "
+        f"S1 range ${new_s1.low:.4f}-${new_s1.high:.4f}, "
+        f"S2 top ${new_s2_high:.4f}"
+    )
+    return advanced
 
 
-def find_nearest_support(
-    levels: list[tuple[float, float]], current_price: float
-) -> Optional[tuple[float, float]]:
-    """Find the nearest Fibonacci support level below current price."""
-    supports = [(r, p) for r, p in levels if p < current_price]
-    if not supports:
-        return None
-    return supports[-1]  # sorted ascending, last one below current
-
-
-def find_nearest_resistance(
-    levels: list[tuple[float, float]], current_price: float
-) -> Optional[tuple[float, float]]:
-    """Find the nearest Fibonacci resistance level above current price."""
-    resistances = [(r, p) for r, p in levels if p > current_price]
-    if not resistances:
-        return None
-    return resistances[0]  # sorted ascending, first one above current
-
-
-def is_near_fib_support(
-    levels: list[tuple[float, float]],
+def get_active_levels(
+    daily_df: pd.DataFrame,
     current_price: float,
-    proximity_pct: float = FIB_PROXIMITY_PCT,
-) -> bool:
-    """Check if price is near a Fibonacci support level."""
+    symbol: str = "",
+) -> Optional[DualFibSeries]:
+    """Main entry point: compute or retrieve dual-series Fibonacci levels.
+
+    Auto-advances if current price is above the 4.236 level of Series 1.
+    Results are cached per symbol.
+    """
+    # Check cache
+    if symbol and symbol in _fib_cache:
+        cached_time, cached_dual = _fib_cache[symbol]
+        age_hours = (now_utc() - cached_time).total_seconds() / 3600
+        if age_hours < FIB_CACHE_TTL_HOURS:
+            # Auto-advance if needed
+            s1_4236 = get_fib_level_price(cached_dual.series1.levels, 4.236)
+            if s1_4236 and current_price > s1_4236:
+                cached_dual = advance_series(cached_dual)
+                _fib_cache[symbol] = (now_utc(), cached_dual)
+            return cached_dual
+
+    # Build from scratch
+    anchor = find_anchor_candle(daily_df)
+    if anchor is None:
+        return None
+
+    anchor_low, anchor_high, _anchor_date = anchor
+    dual = build_dual_series(anchor_low, anchor_high)
+
+    # Auto-advance until current price is within Series 1 range
+    while True:
+        s1_4236 = get_fib_level_price(dual.series1.levels, 4.236)
+        if s1_4236 is None or current_price <= s1_4236:
+            break
+        dual = advance_series(dual)
+        if dual.advance_count > 20:  # safety limit
+            break
+
+    # Cache
+    if symbol:
+        _fib_cache[symbol] = (now_utc(), dual)
+        logger.debug(
+            f"Fibonacci {symbol}: anchor ${anchor_low:.4f}-${anchor_high:.4f}, "
+            f"advances={dual.advance_count}, "
+            f"S1=[${dual.series1.low:.4f}-${dual.series1.high:.4f}], "
+            f"S2 top=${dual.series2.high:.4f}"
+        )
+
+    return dual
+
+
+def get_fib_level_price(
+    levels: list[tuple[float, float]], ratio: float
+) -> Optional[float]:
+    """Get the price at a specific Fibonacci ratio from a levels list."""
+    for r, price in levels:
+        if abs(r - ratio) < 0.001:
+            return price
+    return None
+
+
+def get_current_fib_zone(
+    dual: DualFibSeries, current_price: float
+) -> Optional[tuple[float, float, float, float]]:
+    """Find the Fibonacci levels bracketing the current price in Series 1.
+
+    Returns (lower_ratio, lower_price, upper_ratio, upper_price) or None.
+    """
+    levels = dual.series1.levels
+    lower = None
+    upper = None
     for ratio, price in levels:
-        if price >= current_price:
-            continue
-        distance_pct = (current_price - price) / current_price
-        if distance_pct <= proximity_pct:
-            return True
-    return False
+        if price <= current_price:
+            lower = (ratio, price)
+        elif upper is None:
+            upper = (ratio, price)
+            break
+
+    if lower and upper:
+        return lower[0], lower[1], upper[0], upper[1]
+    return None
 
 
 def invalidate_cache(symbol: str) -> None:

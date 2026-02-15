@@ -1,4 +1,7 @@
-"""Trailing stop monitoring — only moves up, never down."""
+"""Trailing stop monitoring — primary exit mechanism, only moves up.
+
+Uses previous candle's low minus buffer as the trailing stop level.
+"""
 
 import asyncio
 import logging
@@ -10,8 +13,8 @@ from broker.order_manager import OrderManager
 from broker.position_manager import PositionManager, Position
 from config.settings import (
     TRAILING_STOP_INITIAL_PCT,
-    TRAILING_STOP_TIGHTEN_PCT,
     TRAILING_STOP_CHECK_INTERVAL,
+    TRAILING_STOP_CANDLE_BUFFER,
 )
 from utils.helpers import round_price
 
@@ -19,7 +22,11 @@ logger = logging.getLogger("trading_bot.trailing_stop")
 
 
 class TrailingStopManager:
-    """Monitors prices and adjusts stop-losses upward."""
+    """Monitors prices and adjusts stop-losses upward.
+
+    Primary exit mechanism — trailing stop below previous candle's low.
+    Also maintains safety stop as a floor.
+    """
 
     def __init__(
         self,
@@ -68,7 +75,7 @@ class TrailingStopManager:
             self._positions.update_highest_price(symbol, current_price)
 
             # Calculate new stop level
-            new_stop = self._calculate_trailing_stop(pos, current_price)
+            new_stop = self._calculate_trailing_stop(pos)
             if new_stop is None:
                 continue
 
@@ -81,23 +88,26 @@ class TrailingStopManager:
                     pos.stop_loss_price = new_stop
                     logger.info(
                         f"Trailing stop {symbol}: "
-                        f"${current_stop:.4f} → ${new_stop:.4f} "
-                        f"(price=${current_price:.4f}, high=${pos.highest_price:.4f})"
+                        f"${current_stop:.4f} -> ${new_stop:.4f} "
+                        f"(high=${pos.highest_price:.4f})"
                     )
 
-    def _calculate_trailing_stop(
-        self, pos: Position, current_price: float
-    ) -> Optional[float]:
-        """Calculate the trailing stop price."""
-        # Tighten after first partial exit
-        trail_pct = (
-            TRAILING_STOP_TIGHTEN_PCT
-            if pos.partial_exits_done > 0
-            else TRAILING_STOP_INITIAL_PCT
-        )
-        # Trail from the highest price seen
-        new_stop = pos.highest_price * (1 - trail_pct)
-        # Never below entry-based stop
+    def _calculate_trailing_stop(self, pos: Position) -> Optional[float]:
+        """Calculate the trailing stop price.
+
+        Uses the position's trailing_stop_price if available (set by
+        candle-low logic in the main loop), otherwise falls back to
+        percentage-based calculation from highest price.
+        """
+        # Use candle-low trailing stop if set on position
+        candle_stop = getattr(pos, 'trailing_stop_price', 0.0)
+        if candle_stop > 0:
+            # Never below the safety stop floor
+            safety_floor = pos.entry_price * (1 - TRAILING_STOP_INITIAL_PCT)
+            return round_price(max(candle_stop, safety_floor))
+
+        # Fallback: percentage-based from highest price
+        new_stop = pos.highest_price * (1 - TRAILING_STOP_INITIAL_PCT)
         initial_stop = pos.entry_price * (1 - TRAILING_STOP_INITIAL_PCT)
         return round_price(max(new_stop, initial_stop))
 

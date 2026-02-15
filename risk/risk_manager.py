@@ -7,10 +7,9 @@ from typing import Optional
 
 from config.settings import (
     STARTING_CAPITAL,
-    MAX_POSITION_SIZE_PCT,
+    POSITION_SIZE_PCT,
     MAX_OPEN_POSITIONS,
     MAX_DAILY_LOSS_PCT,
-    MAX_LOSS_PER_TRADE_PCT,
     PDT_MAX_DAY_TRADES,
     PDT_ROLLING_WINDOW_DAYS,
     COOLDOWN_AFTER_LOSS_SECONDS,
@@ -77,7 +76,7 @@ class RiskManager:
         if self._daily_loss_halt:
             return False, "Daily loss limit reached — trading halted for today"
 
-        # Max positions
+        # Max positions (1 with 90% allocation)
         if open_position_count >= MAX_OPEN_POSITIONS:
             return False, f"Max open positions ({MAX_OPEN_POSITIONS}) reached"
 
@@ -96,33 +95,23 @@ class RiskManager:
 
         return True, "OK"
 
-    def calculate_position_size(
-        self, entry_price: float, stop_price: float
-    ) -> int:
-        """Calculate position size based on risk per trade and price."""
-        if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+    def calculate_position_size(self, entry_price: float) -> int:
+        """Calculate position size: 90% of portfolio value.
+
+        Returns number of whole shares.
+        """
+        if entry_price <= 0:
             return 0
 
-        risk_per_share = entry_price - stop_price
-        max_risk_dollars = self._portfolio_value * MAX_LOSS_PER_TRADE_PCT
-        risk_based_qty = int(max_risk_dollars / risk_per_share)
-
-        # Cap by max position size
-        max_position_dollars = self._portfolio_value * MAX_POSITION_SIZE_PCT
-        cap_based_qty = int(max_position_dollars / entry_price)
-
-        quantity = min(risk_based_qty, cap_based_qty)
-
-        # Ensure at least 1 share if within limits
-        quantity = max(quantity, 1) if quantity > 0 else 0
+        position_dollars = self._portfolio_value * POSITION_SIZE_PCT
+        quantity = int(position_dollars / entry_price)
 
         logger.debug(
-            f"Position sizing: entry=${entry_price:.4f} stop=${stop_price:.4f} "
-            f"risk/share=${risk_per_share:.4f} → {quantity} shares "
-            f"(risk={format_currency(quantity * risk_per_share)}, "
-            f"value={format_currency(quantity * entry_price)})"
+            f"Position sizing: portfolio={format_currency(self._portfolio_value)} "
+            f"× {POSITION_SIZE_PCT:.0%} = {format_currency(position_dollars)} "
+            f"→ {quantity} shares @ ${entry_price:.4f}"
         )
-        return quantity
+        return max(quantity, 1) if quantity > 0 else 0
 
     def _is_pdt_restricted(self) -> bool:
         """Check if we'd exceed PDT day trade limit."""
@@ -131,7 +120,6 @@ class RiskManager:
     def _count_recent_day_trades(self) -> int:
         """Count day trades in the rolling window."""
         cutoff = now_utc() - timedelta(days=PDT_ROLLING_WINDOW_DAYS)
-        # Prune old entries
         while self._day_trade_timestamps and self._day_trade_timestamps[0] < cutoff:
             self._day_trade_timestamps.popleft()
         return len(self._day_trade_timestamps)
@@ -173,4 +161,6 @@ class RiskManager:
             "max_daily_loss": self._portfolio_value * MAX_DAILY_LOSS_PCT,
             "in_cooldown": self._is_in_cooldown(),
             "cooldown_remaining": self._cooldown_remaining(),
+            "position_size_pct": POSITION_SIZE_PCT,
+            "max_positions": MAX_OPEN_POSITIONS,
         }

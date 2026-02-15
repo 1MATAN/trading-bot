@@ -139,15 +139,19 @@ class IBKRConnection:
 
     async def get_account_summary(self) -> dict:
         """Get key account values."""
+        tags = (
+            "NetLiquidation", "TotalCashValue", "BuyingPower",
+            "GrossPositionValue", "UnrealizedPnL", "RealizedPnL",
+        )
         async with _get_msg_semaphore():
-            values = self._ib.accountSummary()
+            values = await self._ib.accountSummaryAsync()
         summary = {}
         for v in values:
-            if v.tag in (
-                "NetLiquidation", "TotalCashValue", "BuyingPower",
-                "GrossPositionValue", "UnrealizedPnL", "RealizedPnL",
-            ):
-                summary[v.tag] = float(v.value)
+            if v.tag in tags:
+                try:
+                    summary[v.tag] = float(v.value)
+                except (ValueError, TypeError):
+                    pass
         return summary
 
     async def get_historical_data(

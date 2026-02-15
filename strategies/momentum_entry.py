@@ -1,18 +1,17 @@
-"""Entry orchestration pipeline: risk check → position size → order → stops."""
+"""Entry pipeline: risk check → position size → order → safety stop."""
 
 import logging
 from typing import Optional
 
-from ib_insync import Contract, Stock
+from ib_insync import Stock
 
 from broker.ibkr_connection import get_connection
 from broker.order_manager import OrderManager
 from broker.position_manager import PositionManager
 from risk.risk_manager import RiskManager
 from risk.trailing_stop import TrailingStopManager
-from strategies.fibonacci_engine import find_nearest_support
-from strategies.signal_scorer import SignalResult
-from config.settings import TRAILING_STOP_INITIAL_PCT
+from strategies.signal_checker import EntrySignal, compute_stop_price
+from config.settings import SAFETY_STOP_PCT
 
 logger = logging.getLogger("trading_bot.momentum")
 
@@ -33,15 +32,15 @@ class MomentumEntry:
         self._trailing = trailing_stop_manager
         self._conn = get_connection()
 
-    async def execute_entry(self, signal: SignalResult) -> bool:
+    async def execute_entry(self, signal: EntrySignal) -> bool:
         """Execute the full entry pipeline for a passing signal.
 
         Pipeline:
         1. Check risk gate
         2. Skip if already in position
-        3. Calculate position size
+        3. Calculate position size (90% of portfolio)
         4. Place market buy
-        5. Place GTC stop-loss
+        5. Place GTC safety stop (10% below entry)
         6. Register with trailing stop manager
 
         Returns True if entry was executed.
@@ -59,20 +58,12 @@ class MomentumEntry:
             logger.debug(f"Already in position for {symbol}, skipping")
             return False
 
-        current_price = signal.details["current_price"]
+        current_price = signal.current_price
         if current_price <= 0:
             return False
 
-        # 3. Calculate stop-loss level and position size
-        stop_price = self._calculate_stop_price(signal, current_price)
-        if stop_price <= 0 or stop_price >= current_price:
-            logger.warning(
-                f"Invalid stop price for {symbol}: "
-                f"stop=${stop_price:.4f} entry=${current_price:.4f}"
-            )
-            return False
-
-        quantity = self._risk.calculate_position_size(current_price, stop_price)
+        # 3. Calculate position size (90% of portfolio)
+        quantity = self._risk.calculate_position_size(current_price)
         if quantity <= 0:
             logger.info(f"Position size 0 for {symbol}, skipping")
             return False
@@ -84,25 +75,38 @@ class MomentumEntry:
             logger.error(f"Failed to qualify contract for {symbol}")
             return False
 
-        # 5. Place market buy
-        buy_trade = await self._orders.place_market_buy(qualified, quantity)
+        # 5. Place buy (market during RTH, limit during extended hours)
+        buy_trade = await self._orders.place_market_buy(
+            qualified, quantity, reference_price=current_price
+        )
         if buy_trade is None:
             logger.error(f"Failed to place buy order for {symbol}")
             return False
 
-        # 6. Place GTC stop-loss (server-side, survives crashes)
+        # 6. Place GTC stop (dynamic: pullback low based, or safety fallback)
+        pullback_low = getattr(signal, 'pullback_low', 0.0)
+        if pullback_low > 0 and pullback_low < float('inf'):
+            stop_price = compute_stop_price(current_price, pullback_low)
+        else:
+            stop_price = round(current_price * (1 - SAFETY_STOP_PCT), 2)
         stop_trade = await self._orders.place_stop_loss(
             qualified, quantity, stop_price
         )
 
         # 7. Register position
+        fib_levels = [
+            ("pullback_low", getattr(signal, 'pullback_low', 0)),
+            ("gap_pct", getattr(signal, 'gap_pct', 0)),
+            ("vwap", getattr(signal, 'vwap', 0)),
+        ]
+
         pos = self._positions.add_position(
             symbol=symbol,
             contract=qualified,
             quantity=quantity,
             entry_price=current_price,
             stop_loss_price=stop_price,
-            fib_levels=signal.fib_levels,
+            fib_levels=fib_levels,
         )
 
         # 8. Register trailing stop
@@ -112,26 +116,6 @@ class MomentumEntry:
 
         logger.info(
             f"ENTRY: {symbol} — {quantity} shares @ ${current_price:.4f}, "
-            f"stop @ ${stop_price:.4f}, "
-            f"risk=${(current_price - stop_price) * quantity:.2f}"
+            f"safety stop @ ${stop_price:.4f}"
         )
         return True
-
-    def _calculate_stop_price(
-        self, signal: SignalResult, current_price: float
-    ) -> float:
-        """Calculate initial stop-loss price.
-
-        Uses Fibonacci support if available, otherwise default percentage.
-        """
-        # Try Fibonacci support level
-        support = find_nearest_support(signal.fib_levels, current_price)
-        if support:
-            fib_stop = support[1] * 0.99  # 1% below support
-            # Ensure stop isn't too far from entry (cap at initial %)
-            max_stop_distance = current_price * TRAILING_STOP_INITIAL_PCT
-            min_stop = current_price - max_stop_distance
-            return max(fib_stop, min_stop)
-
-        # Fallback: percentage-based stop
-        return current_price * (1 - TRAILING_STOP_INITIAL_PCT)

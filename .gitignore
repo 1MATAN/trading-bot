@@ -15,11 +15,8 @@ config/.env
 .env
 
 # Data & Logs
-data/*.db
-data/*.csv
-data/*.json
-data/*.parquet
-logs/*.log
+data/
+logs/
 
 # IDE
 .vscode/

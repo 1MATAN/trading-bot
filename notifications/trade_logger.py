@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS trades (
     stop_price REAL,
     pnl REAL,
     pnl_pct REAL,
-    strategy TEXT DEFAULT 'fibonacci_momentum',
+    strategy TEXT DEFAULT 'momentum_dual_fib',
     entry_time TEXT,
     exit_time TEXT,
     trade_type TEXT,

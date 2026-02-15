@@ -1,8 +1,10 @@
-"""3-layer real-time scanning pipeline using IBKR reqScannerSubscription.
+"""Momentum scanner: IBKR scan + yfinance float filter + VWAP pullback check.
 
-Layer 1: IBKR built-in filter (price, volume, % change)
-Layer 2: Deep analysis (MA200, volume spike, Bollinger)
-Layer 3: Fibonacci confirmation via signal scorer
+Filters:
+- Price <= $20
+- Moved up > 20% intraday
+- Float <= 60M shares (via yfinance)
+- VWAP pullback state machine for entry
 """
 
 import asyncio
@@ -10,56 +12,65 @@ import logging
 from typing import Optional
 
 import pandas as pd
-from ib_insync import (
-    ScannerSubscription, Stock, TagValue,
-)
+import yfinance as yf
+from ib_insync import ScannerSubscription, Stock, TagValue
 
 from broker.ibkr_connection import get_connection
 from strategies.indicators import bars_to_dataframe
-from strategies.signal_scorer import score_signal, SignalResult
+from strategies.signal_checker import (
+    check_entry, EntrySignal, PullbackStateMachine,
+)
 from config.settings import (
-    SCAN_PRICE_MIN,
     SCAN_PRICE_MAX,
-    SCAN_VOLUME_MIN,
-    SCAN_CHANGE_PCT_MIN,
+    SCAN_FLOAT_MAX,
+    SCAN_MOVE_PCT_MIN,
     SCAN_MAX_RESULTS,
     SCAN_INTERVAL_SECONDS,
+    VWAP_WARMUP_BARS,
 )
 
 logger = logging.getLogger("trading_bot.scanner")
 
 
 class RealtimeScanner:
-    """3-layer penny stock scanner."""
+    """Momentum scanner with IBKR + yfinance enrichment."""
 
     def __init__(self) -> None:
         self._conn = get_connection()
         self._running = False
-        self._last_candidates: list[SignalResult] = []
+        self._last_candidates: list[EntrySignal] = []
         self._scan_count = 0
+        self._pullback_states: dict[str, PullbackStateMachine] = {}
 
     @property
-    def last_candidates(self) -> list[SignalResult]:
+    def last_candidates(self) -> list[EntrySignal]:
         return self._last_candidates
 
-    async def scan_once(self) -> list[SignalResult]:
-        """Run one full scan cycle through all 3 layers."""
+    async def scan_once(self) -> list[EntrySignal]:
+        """Run one full scan cycle."""
         self._scan_count += 1
 
-        # Layer 1: IBKR built-in scanner
-        layer1_symbols = await self._layer1_ibkr_scan()
-        if not layer1_symbols:
-            logger.debug("Layer 1: No candidates from IBKR scanner")
+        # Step 1: IBKR scanner (price + gap filters)
+        raw_symbols = await self._ibkr_scan()
+        if not raw_symbols:
+            logger.debug("Scanner: No candidates from IBKR")
             return []
-        logger.info(f"Layer 1: {len(layer1_symbols)} candidates from IBKR scanner")
+        logger.info(f"Scanner step 1: {len(raw_symbols)} candidates from IBKR")
 
-        # Layer 2 & 3: Deep analysis + Fibonacci confirmation
+        # Step 2: Float filter via yfinance
+        filtered = self._filter_by_float(raw_symbols)
+        if not filtered:
+            logger.debug("Scanner: No candidates passed float filter")
+            return []
+        logger.info(f"Scanner step 2: {len(filtered)} passed float filter (<= 60M)")
+
+        # Step 3: Multi-timeframe SMA + Fibonacci analysis
         signals = []
-        for symbol in layer1_symbols:
+        for symbol in filtered:
             try:
-                result = await self._analyze_candidate(symbol)
-                if result and result.passed:
-                    signals.append(result)
+                signal = await self._analyze_candidate(symbol)
+                if signal and signal.passed:
+                    signals.append(signal)
             except Exception as e:
                 logger.error(f"Error analyzing {symbol}: {e}")
 
@@ -67,7 +78,7 @@ class RealtimeScanner:
         if signals:
             symbols_str = ", ".join(s.symbol for s in signals)
             logger.info(
-                f"Scan #{self._scan_count}: {len(signals)} signals passed — {symbols_str}"
+                f"Scan #{self._scan_count}: {len(signals)} signals — {symbols_str}"
             )
         else:
             logger.debug(f"Scan #{self._scan_count}: No signals passed")
@@ -75,11 +86,7 @@ class RealtimeScanner:
         return signals
 
     async def start(self, callback) -> None:
-        """Start continuous scanning loop.
-
-        Args:
-            callback: async function called with list of SignalResults.
-        """
+        """Start continuous scanning loop."""
         self._running = True
         logger.info("Real-time scanner started")
         while self._running:
@@ -95,8 +102,8 @@ class RealtimeScanner:
         self._running = False
         logger.info("Real-time scanner stopped")
 
-    async def _layer1_ibkr_scan(self) -> list[str]:
-        """Layer 1: Use IBKR's built-in market scanner."""
+    async def _ibkr_scan(self) -> list[str]:
+        """IBKR scanner: top % gainers under $20."""
         sub = ScannerSubscription(
             instrument="STK",
             locationCode="STK.US.MAJOR",
@@ -105,54 +112,65 @@ class RealtimeScanner:
         )
 
         tag_values = [
-            TagValue("priceAbove", str(SCAN_PRICE_MIN)),
             TagValue("priceBelow", str(SCAN_PRICE_MAX)),
-            TagValue("volumeAbove", str(SCAN_VOLUME_MIN)),
-            TagValue("changePercAbove", str(SCAN_CHANGE_PCT_MIN)),
+            TagValue("changePercAbove", str(SCAN_MOVE_PCT_MIN)),
         ]
 
         try:
             results = await self._conn.ib.reqScannerDataAsync(sub, [], tag_values)
             if not results:
                 return []
-            symbols = [
+            return [
                 r.contractDetails.contract.symbol
                 for r in results
                 if r.contractDetails
             ]
-            return symbols
         except Exception as e:
             logger.error(f"IBKR scanner request failed: {e}")
             return []
 
-    async def _analyze_candidate(self, symbol: str) -> Optional[SignalResult]:
-        """Layer 2 + 3: Deep analysis and Fibonacci scoring."""
+    def _filter_by_float(self, symbols: list[str]) -> list[str]:
+        """Filter symbols by float <= SCAN_FLOAT_MAX using yfinance."""
+        passed = []
+        for symbol in symbols:
+            try:
+                info = yf.Ticker(symbol).info
+                float_shares = info.get("floatShares") or info.get("sharesOutstanding", 0)
+                if float_shares and float_shares <= SCAN_FLOAT_MAX:
+                    passed.append(symbol)
+                    logger.debug(f"{symbol}: float={float_shares:,.0f} — PASS")
+                else:
+                    logger.debug(
+                        f"{symbol}: float={float_shares:,.0f} — "
+                        f"FAIL (> {SCAN_FLOAT_MAX:,.0f})"
+                    )
+            except Exception as e:
+                logger.warning(f"Float lookup failed for {symbol}: {e}")
+                # Include by default if we can't check (conservative approach)
+                passed.append(symbol)
+        return passed
+
+    async def _analyze_candidate(self, symbol: str) -> Optional[EntrySignal]:
+        """Fetch intraday data and run VWAP pullback state machine."""
         contract = Stock(symbol, "SMART", "USD")
         qualified = await self._conn.qualify_contract(contract)
         if qualified is None:
             return None
 
-        # Fetch daily data (for SMA200, Fibonacci, Bollinger)
-        daily_bars = await self._conn.get_historical_data(
-            qualified,
-            duration="1 Y",
-            bar_size="1 day",
-            what_to_show="TRADES",
-            use_rth=True,
+        # Fetch intraday data (1-min with extended hours)
+        bars_1m = await self._conn.get_historical_data(
+            qualified, duration="1 D", bar_size="1 min",
+            what_to_show="TRADES", use_rth=False,
         )
-        daily_df = bars_to_dataframe(daily_bars)
-        if len(daily_df) < 50:  # need reasonable history
+
+        df_1m = bars_to_dataframe(bars_1m)
+        if len(df_1m) < VWAP_WARMUP_BARS:
             return None
 
-        # Fetch intraday data (for VWAP, volume spike)
-        intraday_bars = await self._conn.get_historical_data(
-            qualified,
-            duration="1 D",
-            bar_size="5 mins",
-            what_to_show="TRADES",
-            use_rth=False,
-        )
-        intraday_df = bars_to_dataframe(intraday_bars)
+        # Get or create per-symbol pullback state
+        if symbol not in self._pullback_states:
+            self._pullback_states[symbol] = PullbackStateMachine()
+        state = self._pullback_states[symbol]
 
-        # Score through all conditions
-        return score_signal(symbol, daily_df, intraday_df)
+        # Run pullback state machine
+        return check_entry(symbol, df_1m, state, gap_pct=SCAN_MOVE_PCT_MIN)
