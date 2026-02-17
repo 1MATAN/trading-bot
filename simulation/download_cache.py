@@ -86,7 +86,7 @@ def _price_filter(symbols: list[str]) -> list[str]:
                 durationStr="5 D",
                 barSizeSetting="1 day",
                 whatToShow="TRADES",
-                useRTH=True,
+                useRTH=False,
             )
             if not bars:
                 continue
@@ -129,7 +129,7 @@ def _detect_gappers(symbols: list[str]) -> tuple[list[dict], pd.DataFrame]:
                 durationStr=f"{FIB_GAP_LOOKBACK_DAYS} D",
                 barSizeSetting="1 day",
                 whatToShow="TRADES",
-                useRTH=True,
+                useRTH=False,
             )
             if not bars or len(bars) < 2:
                 continue

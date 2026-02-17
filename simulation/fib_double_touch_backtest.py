@@ -41,9 +41,11 @@ from config.settings import (
     FIB_DT_MIN_BOUNCE_BARS,
     FIB_DT_MAX_ENTRIES_PER_DAY,
     FIB_DT_GAP_MAX_PCT,
+    FIB_DT_ENTRY_WINDOW_START,
     FIB_DT_ENTRY_WINDOW_END,
     FIB_DT_PREFERRED_RATIOS,
     FIB_DT_USE_RATIO_FILTER,
+    FIB_DT_S1_ONLY,
 )
 from simulation.sim_engine import SimPosition, SimResult
 from strategies.fibonacci_engine import (
@@ -314,8 +316,10 @@ class FibDoubleTouchEngine:
         self._prev_bar_low = 0.0
         self._prev_bar_high = 0.0
 
-        # Pre-compute entry window cutoff (ET)
+        # Pre-compute entry window (ET)
         _et_tz = pytz.timezone("US/Eastern")
+        _sh, _sm = map(int, FIB_DT_ENTRY_WINDOW_START.split(":"))
+        _entry_start = dt_time(_sh, _sm)
         _h, _m = map(int, FIB_DT_ENTRY_WINDOW_END.split(":"))
         _entry_cutoff = dt_time(_h, _m)
 
@@ -446,7 +450,7 @@ class FibDoubleTouchEngine:
                 _bar_et = bar_time.astimezone(_et_tz).time()
             except Exception:
                 _bar_et = bar_time.time() if hasattr(bar_time, 'time') else dt_time(0, 0)
-            if _bar_et >= _entry_cutoff:
+            if _bar_et < _entry_start or _bar_et >= _entry_cutoff:
                 self._prev_bar_low = bar_low
                 self._prev_bar_high = bar_high
                 continue
@@ -488,10 +492,22 @@ class FibDoubleTouchEngine:
                     bars_since_first = i - ts.first_touch_bar
                     if bars_since_first >= FIB_DT_MIN_BOUNCE_BARS:
                         if abs(bar_low - fp) <= proximity:
-                            # Fib ratio filter: only enter on high-WR ratios
+                            # Fib ratio + series filter
+                            fib_key = round(fp, 4)
+                            ratio, _series = fib_price_info.get(fib_key, (None, "?"))
+
+                            # S1-only filter
+                            if FIB_DT_S1_ONLY and _series == "S2":
+                                logger.debug(
+                                    f"  {symbol}: double-touch at fib ${fp:.4f} "
+                                    f"series=S2, skipping (S1 only)"
+                                )
+                                ts.phase = "IDLE"
+                                ts.first_touch_bar = -1
+                                continue
+
+                            # Ratio filter: only enter on high-WR ratios
                             if FIB_DT_USE_RATIO_FILTER:
-                                fib_key = round(fp, 4)
-                                ratio, _series = fib_price_info.get(fib_key, (None, "?"))
                                 if ratio is not None and ratio not in FIB_DT_PREFERRED_RATIOS:
                                     logger.debug(
                                         f"  {symbol}: double-touch at fib ${fp:.4f} "
@@ -779,8 +795,9 @@ class FibDoubleTouchEngine:
         print(f"Fibonacci Double-Touch Backtest (15-sec)")
         print(f"  Double-touch at fib support | {FIB_DT_STOP_PCT:.0%} stop | "
               f"{FIB_DT_TARGET_LEVELS} fib target (50%) + no-new-high exit (50%)")
-        print(f"  Filters: gap<={FIB_DT_GAP_MAX_PCT}% | entries before {FIB_DT_ENTRY_WINDOW_END} ET | "
-              f"ratio filter={'ON' if FIB_DT_USE_RATIO_FILTER else 'OFF'}")
+        print(f"  Filters: gap<={FIB_DT_GAP_MAX_PCT}% | entries {FIB_DT_ENTRY_WINDOW_START}-{FIB_DT_ENTRY_WINDOW_END} ET | "
+              f"ratio filter={'ON' if FIB_DT_USE_RATIO_FILTER else 'OFF'} | "
+              f"S1 only={'ON' if FIB_DT_S1_ONLY else 'OFF'}")
         print(f"{'='*60}")
         print(f"  Gap events:    {len(self._load_gappers())}")
         print(f"  Symbols:       {len(r.symbols_tested)}")

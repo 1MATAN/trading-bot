@@ -50,6 +50,7 @@ class GapScanner:
         self._float_max = float_max      # 0 = no float filter
         self._max_symbols = max_symbols or FIB_LIVE_MAX_SYMBOLS
         self._float_cache: dict[str, float] = {}  # symbol -> float_shares
+        self._failed_symbols: set[str] = set()  # symbols with no data (skip for rest of day)
 
     async def scan_once(self) -> list[GapSignal]:
         """Run one gap scan cycle.
@@ -72,6 +73,8 @@ class GapScanner:
         # Step 2+3: Get prev close, compute gap, filter
         signals = []
         for symbol, contract in raw:
+            if symbol in self._failed_symbols:
+                continue
             try:
                 signal = await self._check_gap(symbol, contract)
                 if signal:
@@ -123,16 +126,18 @@ class GapScanner:
         if qualified is None:
             return None
 
-        # Request 2 daily bars to get previous close
+        # Request 2 daily bars to get previous close (extended hours included)
         bars = await self._conn.get_historical_data(
             qualified,
             duration="2 D",
             bar_size="1 day",
             what_to_show="TRADES",
-            use_rth=True,
+            use_rth=False,
         )
 
         if not bars or len(bars) < 2:
+            self._failed_symbols.add(symbol)
+            logger.debug(f"{symbol}: no historical data, skipping for rest of day")
             return None
 
         prev_close = float(bars[-2].close)

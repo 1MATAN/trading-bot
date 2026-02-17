@@ -33,6 +33,7 @@ from config.settings import (
     FIB_DT_LIVE_GAP_MAX_PCT,
     FIB_DT_LIVE_FLOAT_MAX,
     FIB_DT_LIVE_MAX_SYMBOLS,
+    FIB_DT_LIVE_ENTRY_START,
 )
 from utils.helpers import setup_logging
 from utils.time_utils import (
@@ -1098,6 +1099,15 @@ class FibDoubleTouchTradingBot:
         self._entry_executor = None
         self._trade_logger = None
 
+        # Pre-compute scan-ready time: 15 min before entry window
+        from datetime import time as dt_time
+        h, m = map(int, FIB_DT_LIVE_ENTRY_START.split(":"))
+        m -= 15
+        if m < 0:
+            m += 60
+            h -= 1
+        self._scan_ready_time = dt_time(h, m)
+
     async def start(self) -> None:
         """Initialize and start the fib DT trading loop."""
         logger.info("=" * 60)
@@ -1176,10 +1186,17 @@ class FibDoubleTouchTradingBot:
                 self._check_control_commands()
 
                 if is_any_session_active():
-                    await self._run_cycle()
-                    # EOD cleanup at 15:55 ET
                     t = now_et().time()
                     from datetime import time as dt_time
+
+                    # Don't scan during early pre-market — wait until
+                    # 15 min before entry window to avoid wasting API requests
+                    if t < self._scan_ready_time:
+                        await asyncio.sleep(60)
+                        continue
+
+                    await self._run_cycle()
+                    # EOD cleanup at 15:55 ET
                     if t >= dt_time(15, 55) and t < dt_time(16, 0):
                         await self._eod_cleanup()
                 else:
@@ -1596,6 +1613,8 @@ def main():
     parser.add_argument("--fib-dt", action="store_true", help="Run Fibonacci double-touch live paper trading bot")
     parser.add_argument("--fib-double-touch", action="store_true", help="Run double-touch fib backtest (15-sec bars, IBKR data)")
     parser.add_argument("--optimize", action="store_true", help="Run multi-strategy fibonacci optimizer (72 combos)")
+    parser.add_argument("--build-universe", action="store_true",
+                        help="Build stock universe from IBKR scanner and download backtest data")
     parser.add_argument("--symbols", nargs="*", help="Symbols to simulate (e.g., AAPL TSLA)")
     parser.add_argument("--gap-min", type=float, default=10.0, help="Minimum gap pct for fib backtest (default: 10)")
     parser.add_argument("--sma20", action="store_true", help="Require price above SMA 20 (intraday)")
@@ -1610,6 +1629,14 @@ def main():
     if args.download_cache:
         from simulation.download_cache import download_cache
         download_cache()
+        return
+
+    if args.build_universe:
+        from simulation.build_universe import build_universe
+        build_universe(
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
         return
 
     if args.analyze:
