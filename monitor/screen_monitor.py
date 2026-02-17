@@ -64,6 +64,7 @@ else:
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+GROUP_CHAT_ID = os.getenv("TELEGRAM_GROUP_ID", "")
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 STATE_PATH = DATA_DIR / "monitor_state.json"
@@ -479,17 +480,98 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
     return data
 
 
+def _calc_ma_table(current_price: float,
+                   ma_frames: dict[str, pd.DataFrame | None]) -> list[dict]:
+    """Compute SMA & EMA for periods 9/20/50/100/200 across all timeframes.
+
+    ``ma_frames``: {'1m': df, '5m': df, '15m': df, '1h': df, '2h': df,
+                    '4h': df, 'D': df, 'W': df, 'M': df}
+    Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
+    """
+    periods = [9, 20, 50, 100, 200]
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    rows = []
+    for tf in tf_order:
+        frame = ma_frames.get(tf)
+        if frame is None or len(frame) < 5:
+            for p in periods:
+                rows.append({'tf': tf, 'period': p, 'sma': None, 'ema': None})
+            continue
+        close = frame['close']
+        for p in periods:
+            sma_val = float(close.rolling(p).mean().iloc[-1]) if len(close) >= p else None
+            ema_val = float(close.ewm(span=p, adjust=False).mean().iloc[-1]) if len(close) >= p else None
+            rows.append({'tf': tf, 'period': p, 'sma': sma_val, 'ema': ema_val})
+    return rows
+
+
+def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
+                       ma_type: str, x_start: float, y_start: float):
+    """Render a compact MA table overlay on the chart axes.
+
+    ``ma_type``: 'sma' or 'ema' — which column to display.
+    ``x_start``, ``y_start``: top-left corner in axes coordinates.
+    """
+    green, red, grey = '#26a69a', '#ef5350', '#555'
+    periods = [9, 20, 50, 100, 200]
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+
+    ma_lookup = {}
+    for r in ma_rows:
+        ma_lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
+
+    # Background box
+    from matplotlib.patches import FancyBboxPatch
+    box_w, box_h = 0.30, 0.52
+    bg = FancyBboxPatch((x_start - 0.005, y_start - box_h),
+                        box_w, box_h,
+                        boxstyle="round,pad=0.005",
+                        facecolor='#0e1117', edgecolor='#333',
+                        alpha=0.88, linewidth=0.5,
+                        transform=ax.transAxes, zorder=5)
+    ax.add_patch(bg)
+
+    z = 6  # zorder for text (above bg)
+    y = y_start - 0.015
+    lbl = ma_type.upper()
+    ax.text(x_start + box_w / 2, y, lbl, transform=ax.transAxes,
+            fontsize=7, fontweight='bold', color='#00d4ff',
+            ha='center', va='top', zorder=z)
+
+    # Column headers
+    col_offsets = [0.055, 0.105, 0.155, 0.21, 0.265]
+    y -= 0.025
+    for co, p in zip(col_offsets, periods):
+        ax.text(x_start + co, y, str(p), transform=ax.transAxes,
+                fontsize=5.5, fontweight='bold', color='#888',
+                ha='center', va='top', zorder=z)
+
+    # Data rows
+    key = 0 if ma_type == 'sma' else 1
+    for tf in tf_order:
+        y -= 0.023
+        ax.text(x_start + 0.005, y, tf, transform=ax.transAxes,
+                fontsize=5.5, fontweight='bold', color='#aaa',
+                va='top', zorder=z)
+        for co, p in zip(col_offsets, periods):
+            val = ma_lookup.get((tf, p), (None, None))[key]
+            if val is not None:
+                clr = green if current_price >= val else red
+                ax.text(x_start + co, y, f'{val:.2f}', transform=ax.transAxes,
+                        fontsize=5, color=clr, ha='center', va='top',
+                        fontfamily='monospace', zorder=z)
+            else:
+                ax.text(x_start + co, y, '—', transform=ax.transAxes,
+                        fontsize=5, color=grey, ha='center', va='top', zorder=z)
+
+
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float,
                        ratio_map: dict | None = None,
-                       df_1min: pd.DataFrame | None = None) -> Path | None:
-    """Generate a clean 5-min candlestick chart with Fibonacci levels + SMA overlay.
+                       ma_frames: dict | None = None) -> Path | None:
+    """Generate a 5-min candlestick chart with Fibonacci levels + MA overlays.
 
-    SMAs drawn:
-      - SMA 9  (5-min)  — yellow solid
-      - SMA 200 (5-min) — white solid
-      - SMA 20  (1-min, sampled at 5-min timestamps) — cyan dashed
-      - SMA 200 (1-min, sampled at 5-min timestamps) — magenta dashed
+    Two compact MA tables overlaid on chart: SMA top-left, EMA bottom-left.
 
     Returns path to saved PNG or None on failure.
     """
@@ -500,15 +582,14 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
-        # X-axis as integer indices, labeled with dates/times
+        # ── Candlestick chart ──
         x = np.arange(len(df))
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
-        # Draw candlesticks
         width = 0.6
         for i, (_, row) in enumerate(df.iterrows()):
             o, h, l, c = row['open'], row['high'], row['low'], row['close']
-            color = '#26a69a' if c >= o else '#ef5350'  # green / red
+            color = '#26a69a' if c >= o else '#ef5350'
             ax.plot([i, i], [l, h], color=color, linewidth=0.8)
             body_bottom = min(o, c)
             body_height = abs(c - o)
@@ -516,48 +597,6 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                 body_height = 0.001
             ax.bar(i, body_height, bottom=body_bottom, width=width,
                    color=color, edgecolor=color, linewidth=0.5)
-
-        # ── SMA lines on 5-min candles ──
-        close_5 = df['close'].values
-
-        # SMA 9 (5-min) — yellow solid
-        if len(close_5) >= 9:
-            sma9 = pd.Series(close_5).rolling(9).mean().values
-            ax.plot(x, sma9, color='yellow', linewidth=1.0, alpha=0.9,
-                    label='SMA 9 (5m)')
-
-        # SMA 200 (5-min) — white solid
-        if len(close_5) >= 200:
-            sma200 = pd.Series(close_5).rolling(200).mean().values
-            ax.plot(x, sma200, color='white', linewidth=1.0, alpha=0.9,
-                    label='SMA 200 (5m)')
-
-        # 1-min SMAs sampled at 5-min timestamps
-        if df_1min is not None and len(df_1min) >= 20:
-            close_1 = df_1min['close']
-            dates_1 = pd.to_datetime(df_1min['date']) if 'date' in df_1min.columns else df_1min.index
-            dates_5 = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
-
-            # SMA 20 (1-min)
-            sma20_1m = close_1.rolling(20).mean()
-            sma20_1m.index = dates_1
-            sampled_20 = sma20_1m.reindex(dates_5, method='ffill')
-            ax.plot(x, sampled_20.values, color='cyan', linewidth=1.0,
-                    alpha=0.85, linestyle='--', label='SMA 20 (1m)')
-
-            # SMA 200 (1-min)
-            if len(df_1min) >= 200:
-                sma200_1m = close_1.rolling(200).mean()
-                sma200_1m.index = dates_1
-                sampled_200 = sma200_1m.reindex(dates_5, method='ffill')
-                ax.plot(x, sampled_200.values, color='magenta', linewidth=1.0,
-                        alpha=0.85, linestyle='--', label='SMA 200 (1m)')
-
-        # Compact legend (top-left)
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(loc='upper left', fontsize=8, facecolor='#0e1117',
-                      edgecolor='#444', labelcolor='#ccc', framealpha=0.9)
 
         # Filter fib levels to visible price range (with margin)
         price_min = df['low'].min()
@@ -653,6 +692,42 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         return None
 
 
+def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
+                        ma_type: str) -> str:
+    """Format MA table as a compact Telegram text message.
+
+    ``ma_type``: 'sma' or 'ema'.
+    Green ✅ if price above MA, Red ❌ if below.
+    """
+    periods = [9, 20, 50, 100, 200]
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    key = 0 if ma_type == 'sma' else 1
+
+    lookup = {}
+    for r in ma_rows:
+        lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
+
+    label = ma_type.upper()
+    lines = [f"📈 <b>{sym} — {label}</b>  (${price:.2f})"]
+    # Header
+    hdr = f"<code>{'':>4}" + "".join(f"{p:>8}" for p in periods) + "</code>"
+    lines.append(hdr)
+
+    for tf in tf_order:
+        parts = f"<code>{tf:>4}"
+        for p in periods:
+            val = lookup.get((tf, p), (None, None))[key]
+            if val is not None:
+                icon = "🟢" if price >= val else "🔴"
+                parts += f" {icon}{val:>5.2f}"
+            else:
+                parts += "      —"
+        parts += "</code>"
+        lines.append(parts)
+
+    return "\n".join(lines)
+
+
 def _send_stock_report(sym: str, stock: dict, enriched: dict):
     """Send comprehensive Telegram report for a newly discovered stock."""
     msgs = []
@@ -662,21 +737,7 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         f"🆕 <b>{sym}</b> — ${stock['price']:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume','-')}"
     )
 
-    # 2. Fundamentals
-    eps = enriched.get('eps', '-')
-    try:
-        eps_val = float(str(eps).replace(',', ''))
-        eps_icon = "🟢" if eps_val > 0 else "🔴"
-    except (ValueError, TypeError):
-        eps_icon = "⚪"
-
-    fund_lines = [f"📊 <b>{sym} — נתונים</b>"]
-    fund_lines.append(f"  Float: {enriched['float']}  |  Short: {enriched['short']}")
-    fund_lines.append(f"  {eps_icon} EPS: {eps}  |  Cash: ${enriched['cash']}")
-    fund_lines.append(f"  Income: {enriched['income']}  |  Earnings: {enriched['earnings']}")
-    msgs.append("\n".join(fund_lines))
-
-    # 3. News (Hebrew)
+    # 2. News (Hebrew)
     if enriched['news']:
         news_lines = [f"📰 <b>{sym} — חדשות:</b>"]
         for n in enriched['news']:
@@ -686,18 +747,41 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     for m in msgs:
         send_telegram(m)
 
-    # 4. Fib chart image (5-min candles + SMAs + fib levels)
+    # 3. Fib chart image (5-min candles + fib levels)
     cached = _fib_cache.get(sym)
-    if cached:
-        all_levels = cached[2]
-        ratio_map = cached[3]
-        df_5min = _download_intraday(sym, bar_size='5 mins', duration='3 D')
-        df_1min = _download_intraday(sym, bar_size='1 min', duration='1 D')
-        if df_5min is not None:
-            img = generate_fib_chart(sym, df_5min, all_levels, stock['price'],
-                                     ratio_map=ratio_map, df_1min=df_1min)
-            if img:
-                send_telegram_photo(img, f"📐 {sym} — 5min + Fibonacci ${stock['price']:.2f}")
+    if not cached:
+        return
+
+    all_levels = cached[2]
+    ratio_map = cached[3]
+
+    # Download all timeframes for MA messages
+    ma_frames: dict[str, pd.DataFrame | None] = {}
+    _tf_specs = [
+        ('1m',  '1 min',   '2 D'),
+        ('5m',  '5 mins',  '5 D'),
+        ('15m', '15 mins', '2 W'),
+        ('1h',  '1 hour',  '3 M'),
+        ('2h',  '2 hours', '6 M'),
+        ('4h',  '4 hours', '1 Y'),
+        ('W',   '1 week',  '5 Y'),
+        ('M',   '1 month', '5 Y'),
+    ]
+    for tf_key, bar_size, duration in _tf_specs:
+        ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
+    ma_frames['D'] = _daily_cache.get(sym)
+
+    df_5min = ma_frames.get('5m')
+    if df_5min is not None:
+        img = generate_fib_chart(sym, df_5min, all_levels, stock['price'],
+                                 ratio_map=ratio_map)
+        if img:
+            send_telegram_photo(img, f"📐 {sym} — 5min + Fibonacci ${stock['price']:.2f}")
+
+    # 4. MA tables as text messages
+    ma_rows = _calc_ma_table(stock['price'], ma_frames)
+    send_telegram(_format_ma_telegram(sym, stock['price'], ma_rows, 'sma'))
+    send_telegram(_format_ma_telegram(sym, stock['price'], ma_rows, 'ema'))
 
 
 # ══════════════════════════════════════════════════════════
@@ -963,36 +1047,47 @@ def detect_anomalies(current: dict, previous: dict) -> list[dict]:
 # ══════════════════════════════════════════════════════════
 
 def send_telegram(text: str) -> bool:
+    """Send text message to personal chat and group (if configured)."""
     if not BOT_TOKEN or not CHAT_ID:
         return False
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'},
-            timeout=10,
-        )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram: {e}")
-        return False
+    ok = False
+    for cid in [CHAT_ID, GROUP_CHAT_ID]:
+        if not cid:
+            continue
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={'chat_id': cid, 'text': text, 'parse_mode': 'HTML'},
+                timeout=10,
+            )
+            if cid == CHAT_ID:
+                ok = resp.ok
+        except Exception as e:
+            log.error(f"Telegram ({cid}): {e}")
+    return ok
 
 
 def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
-    """Send a photo to Telegram via multipart upload."""
+    """Send a photo to personal chat and group (if configured)."""
     if not BOT_TOKEN or not CHAT_ID:
         return False
-    try:
-        with open(image_path, 'rb') as photo:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
-                files={'photo': photo},
-                timeout=30,
-            )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram photo: {e}")
-        return False
+    ok = False
+    for cid in [CHAT_ID, GROUP_CHAT_ID]:
+        if not cid:
+            continue
+        try:
+            with open(image_path, 'rb') as photo:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                    data={'chat_id': cid, 'caption': caption, 'parse_mode': 'HTML'},
+                    files={'photo': photo},
+                    timeout=30,
+                )
+            if cid == CHAT_ID:
+                ok = resp.ok
+        except Exception as e:
+            log.error(f"Telegram photo ({cid}): {e}")
+    return ok
 
 
 # ══════════════════════════════════════════════════════════
