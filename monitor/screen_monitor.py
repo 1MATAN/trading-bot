@@ -32,14 +32,12 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import requests
 from ib_insync import IB, Stock, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
-from bidi.algorithm import get_display as _bidi
 from deep_translator import GoogleTranslator
 
 from strategies.fibonacci_engine import (
@@ -101,6 +99,18 @@ def _get_ibkr() -> IB | None:
         _ibkr = IB()
         _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
         log.info("IBKR connection established (monitor)")
+        accts = _ibkr.managedAccounts() or []
+        acct = accts[0] if accts else "?"
+        ok = send_telegram(
+            f"✅ <b>Monitor Online</b>\n"
+            f"  IBKR: מחובר ✓  |  Account: {acct}\n"
+            f"  Telegram: מחובר ✓\n"
+            f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        if ok:
+            log.info("Startup notification sent to Telegram")
+        else:
+            log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
         return _ibkr
     except Exception as e:
         log.warning(f"IBKR connect failed: {e}")
@@ -470,35 +480,27 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
 
 
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
-                       current_price: float, stock: dict | None = None,
-                       enriched: dict | None = None,
-                       ratio_map: dict[float, float] | None = None) -> Path | None:
-    """Generate a candlestick chart with Fibonacci levels overlay.
+                       current_price: float,
+                       ratio_map: dict | None = None,
+                       df_1min: pd.DataFrame | None = None) -> Path | None:
+    """Generate a clean 5-min candlestick chart with Fibonacci levels + SMA overlay.
 
-    When ``stock`` and ``enriched`` are provided, an info panel with
-    fundamentals and news is rendered below the chart.
+    SMAs drawn:
+      - SMA 9  (5-min)  — yellow solid
+      - SMA 200 (5-min) — white solid
+      - SMA 20  (1-min, sampled at 5-min timestamps) — cyan dashed
+      - SMA 200 (1-min, sampled at 5-min timestamps) — magenta dashed
 
     Returns path to saved PNG or None on failure.
     """
     try:
-        # Crop to last ~60 trading days
-        df = df.tail(60).copy()
         if len(df) < 5:
             return None
 
-        has_info = stock is not None and enriched is not None
-
-        if has_info:
-            fig = plt.figure(figsize=(14, 11), facecolor='#0e1117')
-            gs = gridspec.GridSpec(2, 1, height_ratios=[2.8, 1.4], hspace=0.04)
-            ax = fig.add_subplot(gs[0])
-            ax2 = fig.add_subplot(gs[1])
-        else:
-            fig, ax = plt.subplots(figsize=(12, 7), facecolor='#0e1117')
-
+        fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
-        # X-axis as integer indices, labeled with dates
+        # X-axis as integer indices, labeled with dates/times
         x = np.arange(len(df))
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
@@ -507,16 +509,55 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         for i, (_, row) in enumerate(df.iterrows()):
             o, h, l, c = row['open'], row['high'], row['low'], row['close']
             color = '#26a69a' if c >= o else '#ef5350'  # green / red
-
-            # Wick (high-low line)
             ax.plot([i, i], [l, h], color=color, linewidth=0.8)
-            # Body
             body_bottom = min(o, c)
             body_height = abs(c - o)
             if body_height < 0.001:
                 body_height = 0.001
             ax.bar(i, body_height, bottom=body_bottom, width=width,
                    color=color, edgecolor=color, linewidth=0.5)
+
+        # ── SMA lines on 5-min candles ──
+        close_5 = df['close'].values
+
+        # SMA 9 (5-min) — yellow solid
+        if len(close_5) >= 9:
+            sma9 = pd.Series(close_5).rolling(9).mean().values
+            ax.plot(x, sma9, color='yellow', linewidth=1.0, alpha=0.9,
+                    label='SMA 9 (5m)')
+
+        # SMA 200 (5-min) — white solid
+        if len(close_5) >= 200:
+            sma200 = pd.Series(close_5).rolling(200).mean().values
+            ax.plot(x, sma200, color='white', linewidth=1.0, alpha=0.9,
+                    label='SMA 200 (5m)')
+
+        # 1-min SMAs sampled at 5-min timestamps
+        if df_1min is not None and len(df_1min) >= 20:
+            close_1 = df_1min['close']
+            dates_1 = pd.to_datetime(df_1min['date']) if 'date' in df_1min.columns else df_1min.index
+            dates_5 = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
+
+            # SMA 20 (1-min)
+            sma20_1m = close_1.rolling(20).mean()
+            sma20_1m.index = dates_1
+            sampled_20 = sma20_1m.reindex(dates_5, method='ffill')
+            ax.plot(x, sampled_20.values, color='cyan', linewidth=1.0,
+                    alpha=0.85, linestyle='--', label='SMA 20 (1m)')
+
+            # SMA 200 (1-min)
+            if len(df_1min) >= 200:
+                sma200_1m = close_1.rolling(200).mean()
+                sma200_1m.index = dates_1
+                sampled_200 = sma200_1m.reindex(dates_5, method='ffill')
+                ax.plot(x, sampled_200.values, color='magenta', linewidth=1.0,
+                        alpha=0.85, linestyle='--', label='SMA 200 (1m)')
+
+        # Compact legend (top-left)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc='upper left', fontsize=8, facecolor='#0e1117',
+                      edgecolor='#444', labelcolor='#ccc', framealpha=0.9)
 
         # Filter fib levels to visible price range (with margin)
         price_min = df['low'].min()
@@ -527,17 +568,42 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
-        # Draw fib levels — color per ratio
+        # Draw fib levels — S1 labels right, S2 labels left, skip overlaps
         _default_color = '#888888'
+        price_span = vis_max - vis_min
+        min_label_gap = price_span * 0.018
+        last_y_right = -999.0
+        last_y_left = -999.0
+
         for lv in visible_levels:
-            ratio = ratio_map.get(round(lv, 4)) if ratio_map else None
+            info = ratio_map.get(round(lv, 4)) if ratio_map else None
+            if isinstance(info, tuple):
+                ratio, series = info
+            elif info is not None:
+                ratio, series = info, "S1"
+            else:
+                ratio, series = None, "S1"
+
             color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
-            label = f' ${lv:.4f}'
-            if ratio is not None:
-                label = f' {ratio}  ${lv:.4f}'
             ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.8, linestyle='-')
-            ax.text(len(df) - 0.5, lv, label, color=color,
-                    fontsize=7, va='center', ha='left', fontweight='bold')
+
+            if ratio is not None:
+                label = f'{ratio}  ${lv:.4f}'
+            else:
+                label = f'${lv:.4f}'
+
+            if series == "S2":
+                if abs(lv - last_y_left) < min_label_gap:
+                    continue
+                ax.text(-0.5, lv, f'{label} ', color=color,
+                        fontsize=7, va='center', ha='right', fontweight='bold')
+                last_y_left = lv
+            else:
+                if abs(lv - last_y_right) < min_label_gap:
+                    continue
+                ax.text(len(df) - 0.5, lv, f' {label}', color=color,
+                        fontsize=7, va='center', ha='left', fontweight='bold')
+                last_y_right = lv
 
         # Current price line
         ax.axhline(y=current_price, color='white', linewidth=1.2,
@@ -547,7 +613,7 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                 fontweight='bold', bbox=dict(boxstyle='round,pad=0.2',
                 facecolor='#0e1117', edgecolor='white', alpha=0.8))
 
-        # X-axis date labels
+        # X-axis date/time labels
         tick_step = max(1, len(df) // 10)
         tick_positions = list(range(0, len(df), tick_step))
         tick_labels = []
@@ -555,11 +621,11 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         for pos in tick_positions:
             d = date_list[pos]
             if hasattr(d, 'strftime'):
-                tick_labels.append(d.strftime('%m/%d'))
+                tick_labels.append(d.strftime('%m/%d %H:%M'))
             else:
-                tick_labels.append(str(d)[:5])
+                tick_labels.append(str(d)[:11])
         ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, color='#888', fontsize=8)
+        ax.set_xticklabels(tick_labels, color='#888', fontsize=7, rotation=30, ha='right')
 
         # Styling
         ax.set_ylim(vis_min, vis_max)
@@ -570,59 +636,9 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         ax.spines['bottom'].set_color('#333')
         ax.spines['left'].set_color('#333')
         ax.yaxis.label.set_color('#888')
-        ax.set_title(f'{sym} — Fibonacci (${current_price:.2f})',
+        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
                      color='white', fontsize=14, fontweight='bold', pad=12)
         ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
-
-        # ── Info panel (fundamentals + news) ──
-        if has_info:
-            ax2.set_facecolor('#0e1117')
-            ax2.set_xlim(0, 1)
-            ax2.set_ylim(0, 1)
-            ax2.axis('off')
-
-            pct = stock.get('pct', 0)
-            vol = stock.get('volume', '-')
-            header = f"{sym} \u2014 ${stock['price']:.2f}  {pct:+.1f}%  Vol:{vol}"
-
-            eps = enriched.get('eps', '-')
-            fund_line = (
-                f"Float: {enriched.get('float', '-')}  |  "
-                f"Short: {enriched.get('short', '-')}  |  "
-                f"EPS: {eps}  |  "
-                f"Cash: ${enriched.get('cash', '-')}"
-            )
-            fund_line2 = (
-                f"Income: {enriched.get('income', '-')}  |  "
-                f"Earnings: {enriched.get('earnings', '-')}"
-            )
-
-            sep = "\u2500" * 46
-
-            lines = [header, sep, fund_line, fund_line2]
-
-            news = enriched.get('news', [])
-            if news:
-                lines.append(sep)
-                for n in news[:3]:
-                    title = n.get('title_he', '')
-                    if len(title) > 70:
-                        title = title[:67] + "..."
-                    date = n.get('date', '')
-                    lines.append(f"  \u2022 {_bidi(title)}  ({date})")
-
-            info_text = "\n".join(lines)
-            ax2.text(
-                0.03, 0.95, info_text,
-                transform=ax2.transAxes,
-                fontsize=13,
-                fontfamily='DejaVu Sans',
-                fontweight='bold',
-                color='white',
-                verticalalignment='top',
-                horizontalalignment='left',
-                linespacing=1.7,
-            )
 
         out_path = Path(f'/tmp/fib_{sym}.png')
         fig.savefig(out_path, dpi=100, bbox_inches='tight',
@@ -667,31 +683,21 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
             news_lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
         msgs.append("\n".join(news_lines))
 
-    # 4. Fib levels
-    below = enriched.get('fib_below', [])
-    above = enriched.get('fib_above', [])
-    if below or above:
-        fib_lines = [f"📐 <b>{sym} — פיבונאצ'י</b>  (${stock['price']:.2f})"]
-        if above:
-            fib_lines.append(f"  ⬆️ מעל: {'  '.join(f'${p:.4f}' for p in above)}")
-        if below:
-            fib_lines.append(f"  ⬇️ מתחת: {'  '.join(f'${p:.4f}' for p in below)}")
-        msgs.append("\n".join(fib_lines))
-
     for m in msgs:
         send_telegram(m)
 
-    # 5. Fib chart image
-    df = _daily_cache.get(sym)
+    # 4. Fib chart image (5-min candles + SMAs + fib levels)
     cached = _fib_cache.get(sym)
-    if df is not None and cached:
+    if cached:
         all_levels = cached[2]
         ratio_map = cached[3]
-        img = generate_fib_chart(sym, df, all_levels, stock['price'],
-                                     stock=stock, enriched=enriched,
-                                     ratio_map=ratio_map)
-        if img:
-            send_telegram_photo(img, f"📐 {sym} — Fibonacci ${stock['price']:.2f}")
+        df_5min = _download_intraday(sym, bar_size='5 mins', duration='3 D')
+        df_1min = _download_intraday(sym, bar_size='1 min', duration='1 D')
+        if df_5min is not None:
+            img = generate_fib_chart(sym, df_5min, all_levels, stock['price'],
+                                     ratio_map=ratio_map, df_1min=df_1min)
+            if img:
+                send_telegram_photo(img, f"📐 {sym} — 5min + Fibonacci ${stock['price']:.2f}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -699,7 +705,8 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
 # ══════════════════════════════════════════════════════════
 
 # Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted, ratio_map)}
-_fib_cache: dict[str, tuple[float, float, list[float], dict[float, float]]] = {}
+# ratio_map: {price: (ratio, "S1"|"S2")}
+_fib_cache: dict[str, tuple[float, float, list[float], dict]] = {}
 
 # Cache daily DataFrames for chart generation (filled by _download_daily)
 _daily_cache: dict[str, pd.DataFrame] = {}
@@ -729,6 +736,33 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
     return None
 
 
+def _download_intraday(symbol: str, bar_size: str = '5 mins',
+                       duration: str = '3 D') -> pd.DataFrame | None:
+    """Download intraday bars from IBKR.
+
+    Returns DataFrame with OHLCV columns, or None on failure.
+    """
+    ib = _get_ibkr()
+    if not ib:
+        log.error(f"No IBKR connection for {symbol} intraday download")
+        return None
+    try:
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr=duration,
+            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False,
+        )
+        if bars:
+            df = ib_util.df(bars)
+            if len(df) >= 5:
+                log.info(f"IBKR: {symbol} {len(df)} intraday bars ({bar_size})")
+                return df
+    except Exception as e:
+        log.warning(f"IBKR intraday {symbol}: {e}")
+    return None
+
+
 def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], list[float]]:
     """Calculate Fibonacci levels using dual-series recursive method.
 
@@ -750,15 +784,17 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
 
         dual = build_dual_series(anchor_low, anchor_high)
         all_levels = set()
-        ratio_map: dict[float, float] = {}  # price → fib ratio
+        ratio_map: dict[float, tuple[float, str]] = {}  # price → (ratio, series)
 
         for _ in range(25):
             for ratio, price in dual.series1.levels:
                 all_levels.add(price)
-                ratio_map[round(price, 4)] = ratio
+                ratio_map[round(price, 4)] = (ratio, "S1")
             for ratio, price in dual.series2.levels:
                 all_levels.add(price)
-                ratio_map[round(price, 4)] = ratio
+                pk = round(price, 4)
+                if pk not in ratio_map:  # S1 takes priority
+                    ratio_map[pk] = (ratio, "S2")
 
             # Advance when price crosses 4.236 of S1 (the lower series)
             s1_4236 = dual.series1.low + 4.236 * (dual.series1.high - dual.series1.low)
