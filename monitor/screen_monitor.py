@@ -737,7 +737,21 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         f"🆕 <b>{sym}</b> — ${stock['price']:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume','-')}"
     )
 
-    # 2. News (Hebrew)
+    # 2. Fundamentals
+    eps = enriched.get('eps', '-')
+    try:
+        eps_val = float(str(eps).replace(',', ''))
+        eps_icon = "🟢" if eps_val > 0 else "🔴"
+    except (ValueError, TypeError):
+        eps_icon = "⚪"
+
+    fund_lines = [f"📊 <b>{sym} — נתונים</b>"]
+    fund_lines.append(f"  Float: {enriched['float']}  |  Short: {enriched['short']}")
+    fund_lines.append(f"  {eps_icon} EPS: {eps}  |  Cash: ${enriched['cash']}")
+    fund_lines.append(f"  Income: {enriched['income']}  |  Earnings: {enriched['earnings']}")
+    msgs.append("\n".join(fund_lines))
+
+    # 3. News (Hebrew)
     if enriched['news']:
         news_lines = [f"📰 <b>{sym} — חדשות:</b>"]
         for n in enriched['news']:
