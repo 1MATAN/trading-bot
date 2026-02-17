@@ -34,9 +34,12 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import xml.etree.ElementTree as ET
+from ib_insync import IB, Stock, util as ib_util
 
 from config.settings import (
+    IBKR_HOST,
+    IBKR_PORT,
     STARTING_CAPITAL,
     POSITION_SIZE_PCT,
     SCAN_PRICE_MIN,
@@ -77,6 +80,25 @@ from notifications.trade_logger import TradeLogger
 from utils.time_utils import now_utc
 
 logger = logging.getLogger("trading_bot.simulation")
+
+# ── IBKR Connection Helper ──────────────────────────────
+
+_ib: IB | None = None
+_IBKR_SIM_CLIENT = 12
+
+
+def _get_ib() -> IB | None:
+    global _ib
+    if _ib and _ib.isConnected():
+        return _ib
+    try:
+        _ib = IB()
+        _ib.connect(IBKR_HOST, IBKR_PORT, clientId=_IBKR_SIM_CLIENT, timeout=10)
+        return _ib
+    except Exception as e:
+        logger.error(f"IBKR connect failed: {e}")
+        _ib = None
+        return None
 
 
 # ── Order State Machine ──────────────────────────────────
@@ -253,18 +275,23 @@ class SimulationEngine:
     # ── Symbol Scanning ──────────────────────────────────
 
     def _scan_for_candidates(self) -> list[str]:
-        """Find stocks that match scanner criteria via yfinance.
+        """Find stocks that match scanner criteria via IBKR.
 
         Look for stocks under $20 with float <= 60M that moved up >= 20%
         intraday (high vs previous close) at some point in the last 30 days.
 
-        Strategy to avoid rate-limiting:
-          1. Batch download daily data for ALL symbols in one call
-          2. Filter by price and intraday move from the batch data
-          3. Only fetch float (.info) for symbols that passed price+move filter
-             with a delay between each call
+        Strategy:
+          1. Loop through universe, qualify contract, request 30-day daily bars
+          2. Filter by price and intraday move from the daily data
+          3. Only fetch float (reqFundamentalData) for symbols that passed
+             price+move filter, with a delay between each call
         """
-        logger.info("Scanning for qualifying symbols via yfinance...")
+        logger.info("Scanning for qualifying symbols via IBKR...")
+
+        ib = _get_ib()
+        if ib is None:
+            logger.error("Cannot scan: IBKR not connected")
+            return []
 
         # Small cap / momentum universe ($1-$20 range)
         universe = [
@@ -285,46 +312,37 @@ class SimulationEngine:
             "DNA", "IOVA", "CRSP", "BEAM", "NTLA",
         ]
 
-        # Step 1: Batch download 30d daily data for all symbols at once
-        logger.info(f"  Batch downloading daily data for {len(universe)} symbols...")
-        try:
-            batch = yf.download(universe, period="30d", interval="1d",
-                                group_by="ticker", progress=False, threads=True)
-        except Exception as e:
-            logger.error(f"Batch download failed: {e}")
-            return []
-
-        if batch.empty:
-            logger.warning("Batch download returned no data")
-            return []
-
-        # Step 2: Filter by price and intraday move (high vs prev close >= 20%)
+        # Step 1+2: Download 30-day daily bars per symbol, filter by price & move
+        logger.info(f"  Downloading daily data for {len(universe)} symbols via IBKR...")
         move_candidates = []
         for sym in universe:
             try:
-                # Extract per-symbol dataframe from multi-index columns
-                if isinstance(batch.columns, pd.MultiIndex):
-                    if sym not in batch.columns.get_level_values(0):
-                        continue
-                    df_sym = batch[sym].dropna(how="all")
-                else:
-                    df_sym = batch.dropna(how="all")
+                contract = Stock(sym, "SMART", "USD")
+                ib.qualifyContracts(contract)
+                _time.sleep(0.5)  # rate limiting
 
-                if len(df_sym) < 2:
+                bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr="30 D",
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=False,
+                )
+                if not bars or len(bars) < 2:
                     continue
 
-                # Normalize column names
-                cols = {c.lower(): c for c in df_sym.columns}
-                close_col = cols.get("close", "Close")
-                high_col = cols.get("high", "High")
+                df_sym = ib_util.df(bars)
+                if df_sym.empty or len(df_sym) < 2:
+                    continue
 
-                last_price = float(df_sym[close_col].iloc[-1])
+                last_price = float(df_sym["close"].iloc[-1])
                 if last_price < SCAN_PRICE_MIN or last_price > SCAN_PRICE_MAX:
                     continue
 
                 # Check for intraday move >= 20% (high vs prev close)
-                prev_closes = df_sym[close_col].shift(1)
-                moves = (df_sym[high_col] - prev_closes) / prev_closes * 100
+                prev_closes = df_sym["close"].shift(1)
+                moves = (df_sym["high"] - prev_closes) / prev_closes * 100
                 max_move = float(moves.max())
                 if max_move >= SCAN_MOVE_PCT_MIN:
                     move_candidates.append((sym, last_price, max_move))
@@ -333,7 +351,7 @@ class SimulationEngine:
                         f"max_move={max_move:.1f}%"
                     )
             except Exception as e:
-                logger.debug(f"Batch filter failed for {sym}: {e}")
+                logger.debug(f"Daily data failed for {sym}: {e}")
 
         if not move_candidates:
             logger.info("No symbols passed price + move filter")
@@ -344,28 +362,31 @@ class SimulationEngine:
             f"checking float..."
         )
 
-        # Step 3: Check float for candidates (with rate-limit delay)
+        # Step 3: Check float for candidates via reqFundamentalData
         passed = []
         for sym, price, max_move in move_candidates:
             try:
-                _time.sleep(1.5)  # rate-limit: 1.5s between .info calls
-                ticker = yf.Ticker(sym)
+                _time.sleep(0.5)  # rate limiting
+                contract = Stock(sym, "SMART", "USD")
+                ib.qualifyContracts(contract)
 
-                # Try fast_info first (lighter API call), fall back to info
                 float_shares = 0
                 try:
-                    fi = ticker.fast_info
-                    float_shares = getattr(fi, "shares", 0) or 0
+                    xml_data = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
+                    if xml_data:
+                        root = ET.fromstring(xml_data)
+                        # Look for SharesOut in the XML
+                        for elem in root.iter("SharesOut"):
+                            val = elem.text or elem.get("TotalFloat", "0")
+                            float_shares = float(val) * 1e6  # typically in millions
+                            break
+                        if float_shares == 0:
+                            for elem in root.iter("SharesOutstanding"):
+                                float_shares = float(elem.text or "0")
+                                break
                 except Exception:
-                    pass
-
-                if float_shares == 0:
-                    try:
-                        info = ticker.info or {}
-                        float_shares = info.get("floatShares") or info.get("sharesOutstanding", 0)
-                    except Exception:
-                        logger.debug(f"  {sym}: cannot fetch float data, skipping")
-                        continue
+                    logger.debug(f"  {sym}: cannot fetch fundamental data, skipping")
+                    continue
 
                 if float_shares and float_shares <= SCAN_FLOAT_MAX:
                     passed.append(sym)
@@ -1022,47 +1043,99 @@ class SimulationEngine:
     # ── Data Download ────────────────────────────────────
 
     def _download_daily(self, symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        """Download daily OHLCV including extended hours."""
-        df = yf.download(symbol, start=start, end=end, progress=False)
-        if df.empty or len(df) < 20:
-            logger.warning(f"{symbol}: insufficient daily data ({len(df)} rows)")
+        """Download daily OHLCV including extended hours via IBKR."""
+        ib = _get_ib()
+        if ib is None:
+            logger.warning(f"{symbol}: IBKR not connected for daily download")
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0].lower() for col in df.columns]
-        else:
-            df.columns = [c.lower() for c in df.columns]
+
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+
+        # Calculate duration in days from start to end
+        start_dt = datetime.strptime(start, "%Y-%m-%d")
+        end_dt = datetime.strptime(end, "%Y-%m-%d")
+        duration_days = (end_dt - start_dt).days + 1
+        duration_str = f"{duration_days} D"
+
+        # Format endDateTime for IBKR (yyyyMMdd HH:mm:ss)
+        end_datetime = end_dt.strftime("%Y%m%d 23:59:59")
+
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime=end_datetime,
+                durationStr=duration_str,
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=False,
+            )
+        except Exception as e:
+            logger.warning(f"{symbol}: IBKR daily download failed: {e}")
+            return None
+
+        if not bars or len(bars) < 20:
+            logger.warning(f"{symbol}: insufficient daily data ({len(bars) if bars else 0} rows)")
+            return None
+
+        df = ib_util.df(bars)
+        df.columns = [c.lower() for c in df.columns]
+        # Set date index
+        if "date" in df.columns:
+            df.set_index("date", inplace=True)
         return df
 
     def _download_intraday(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Download intraday data WITH extended hours (prepost=True).
+        """Download intraday data WITH extended hours via IBKR.
 
-        Always uses 2-min (60 days) to maximize overlap with gap days.
-        Yahoo limits 1-min to 7 days which misses most gap events.
+        Uses 2-min bars with 30-day duration (IBKR limit for 2-min bars).
+        Includes outside regular trading hours data.
         """
-        ticker = yf.Ticker(symbol)
+        ib = _get_ib()
+        if ib is None:
+            logger.warning(f"{symbol}: IBKR not connected for intraday download")
+            return None
 
-        # Use 2-min data (60 days available — best overlap with gap days)
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+
+        # Use 2-min data (IBKR allows up to ~30 days for 2-min bars)
         try:
-            df = ticker.history(period="60d", interval="2m", prepost=True)
-            if not df.empty and len(df) > VWAP_WARMUP_BARS + 20:
-                logger.info(f"{symbol}: 2-min data — {len(df)} bars over 60 days")
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="30 D",
+                barSizeSetting="2 mins",
+                whatToShow="TRADES",
+                useRTH=False,
+            )
+            if bars and len(bars) > VWAP_WARMUP_BARS + 20:
+                df = ib_util.df(bars)
                 df.columns = [c.lower() for c in df.columns]
-                for col in ["dividends", "stock splits", "capital gains"]:
-                    if col in df.columns:
-                        df.drop(columns=[col], inplace=True)
+                # Set date index
+                if "date" in df.columns:
+                    df.set_index("date", inplace=True)
+                logger.info(f"{symbol}: 2-min data -- {len(df)} bars over 30 days")
                 return df
         except Exception as e:
             logger.debug(f"{symbol}: 2-min download failed: {e}")
 
-        # Fallback to 1-min (7 days only)
+        # Fallback to 1-min (IBKR allows ~7 days for 1-min bars)
         try:
-            df = ticker.history(period="7d", interval="1m", prepost=True)
-            if not df.empty and len(df) > VWAP_WARMUP_BARS + 20:
-                logger.info(f"{symbol}: falling back to 1-min data ({len(df)} bars, 7 days)")
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="7 D",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=False,
+            )
+            if bars and len(bars) > VWAP_WARMUP_BARS + 20:
+                df = ib_util.df(bars)
                 df.columns = [c.lower() for c in df.columns]
-                for col in ["dividends", "stock splits", "capital gains"]:
-                    if col in df.columns:
-                        df.drop(columns=[col], inplace=True)
+                if "date" in df.columns:
+                    df.set_index("date", inplace=True)
+                logger.info(f"{symbol}: falling back to 1-min data ({len(df)} bars, 7 days)")
                 return df
         except Exception:
             pass

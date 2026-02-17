@@ -19,7 +19,9 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import xml.etree.ElementTree as ET
+
+from ib_insync import IB, Stock, util as ib_util
 
 from config.settings import (
     STARTING_CAPITAL,
@@ -38,6 +40,8 @@ from config.settings import (
     FIB_LOOKBACK_YEARS,
     FIB_GAP_LOOKBACK_DAYS,
     FIB_CHARTS_DIR,
+    IBKR_HOST,
+    IBKR_PORT,
 )
 from simulation.sim_engine import SimPosition, SimTrade, SimResult
 from strategies.fibonacci_engine import (
@@ -50,6 +54,26 @@ from notifications.trade_logger import TradeLogger
 from utils.time_utils import now_utc
 
 logger = logging.getLogger("trading_bot.fib_reversal")
+
+# ── IBKR connection helper ────────────────────────────────
+_ib: IB | None = None
+_IBKR_FIB_CLIENT = 13
+
+
+def _get_ib() -> IB | None:
+    global _ib
+    if _ib and _ib.isConnected():
+        return _ib
+    try:
+        _ib = IB()
+        _ib.connect(IBKR_HOST, IBKR_PORT, clientId=_IBKR_FIB_CLIENT, timeout=10)
+        logger.info("IBKR fib backtest connection established")
+        return _ib
+    except Exception as e:
+        logger.error(f"IBKR connect failed: {e}")
+        _ib = None
+        return None
+
 
 # ── Strategy settings ──────────────────────────────────────
 GAP_MIN_PCT = 20.0                # minimum gap to qualify (hot gappers)
@@ -267,39 +291,36 @@ class FibReversalEngine:
             except Exception as e:
                 logger.debug(f"Failed to load cached gappers: {e}")
 
-        # Scan remaining symbols via yfinance
+        # Scan remaining symbols via IBKR
         remaining = [s for s in self._symbols if s not in cached_symbols]
         if not remaining:
             return
-        logger.info(f"Scanning {len(remaining)} symbols for gappers (>={GAP_MIN_PCT:.0f}%) via yfinance...")
-        try:
-            batch = yf.download(
-                remaining, period=f"{FIB_GAP_LOOKBACK_DAYS}d", interval="1d",
-                group_by="ticker", progress=False, threads=True,
-            )
-        except Exception as e:
-            logger.error(f"Batch daily download failed: {e}")
-            return
-        if batch.empty:
+        logger.info(f"Scanning {len(remaining)} symbols for gappers (>={GAP_MIN_PCT:.0f}%) via IBKR...")
+
+        ib = _get_ib()
+        if ib is None:
+            logger.error("Cannot scan gappers: IBKR not connected")
             return
 
-        single_symbol = len(remaining) == 1
         for sym in remaining:
             try:
-                if single_symbol:
-                    df_sym = batch.copy()
-                elif isinstance(batch.columns, pd.MultiIndex):
-                    if sym not in batch.columns.get_level_values(0):
-                        continue
-                    df_sym = batch[sym].dropna(how="all")
-                else:
-                    df_sym = batch.dropna(how="all")
-                if len(df_sym) < 2:
+                contract = Stock(sym, "SMART", "USD")
+                ib.qualifyContracts(contract)
+                bars = ib.reqHistoricalData(
+                    contract,
+                    endDateTime="",
+                    durationStr=f"{FIB_GAP_LOOKBACK_DAYS} D",
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=False,
+                )
+                if not bars or len(bars) < 2:
+                    _time.sleep(0.5)
                     continue
-                if isinstance(df_sym.columns, pd.MultiIndex):
-                    df_sym.columns = [c[0].lower() for c in df_sym.columns]
-                else:
-                    df_sym.columns = [c.lower() for c in df_sym.columns]
+
+                df_sym = ib_util.df(bars)
+                df_sym.set_index("date", inplace=True)
+                df_sym.columns = [c.lower() for c in df_sym.columns]
 
                 prev_closes = df_sym["close"].shift(1)
                 for idx in range(1, len(df_sym)):
@@ -330,6 +351,7 @@ class FibReversalEngine:
                         })
             except Exception as e:
                 logger.debug(f"Gapper scan failed for {sym}: {e}")
+            _time.sleep(0.5)
 
         logger.info(
             f"Gapper Scan: found {len(self._gappers)} events (>={GAP_MIN_PCT:.0f}%) "
@@ -368,11 +390,23 @@ class FibReversalEngine:
                         return self._float_cache[symbol]
                 except Exception:
                     pass
+        ib = _get_ib()
+        if ib is None:
+            self._float_cache[symbol] = 0
+            return 0
         try:
-            info = yf.Ticker(symbol).info
-            flt = float(info.get("floatShares", 0) or 0)
-            self._float_cache[symbol] = flt
-            return flt
+            contract = Stock(symbol, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            xml_data = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
+            if xml_data:
+                root = ET.fromstring(xml_data)
+                shares_out_el = root.find(".//SharesOut")
+                if shares_out_el is not None and shares_out_el.text:
+                    flt = float(shares_out_el.text)
+                    self._float_cache[symbol] = flt
+                    return flt
+            self._float_cache[symbol] = 0
+            return 0
         except Exception:
             self._float_cache[symbol] = 0
             return 0
@@ -811,15 +845,27 @@ class FibReversalEngine:
             except Exception:
                 pass
 
+        ib = _get_ib()
+        if ib is None:
+            logger.error(f"  {symbol}: IBKR not connected for 5y download")
+            return None
         try:
-            df = yf.download(symbol, period=f"{FIB_LOOKBACK_YEARS}y", interval="1d", progress=False)
-            if df.empty or len(df) < 20:
+            contract = Stock(symbol, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=f"{FIB_LOOKBACK_YEARS} Y",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=False,
+            )
+            if not bars or len(bars) < 20:
                 return None
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0].lower() for c in df.columns]
-            else:
-                df.columns = [c.lower() for c in df.columns]
-            logger.info(f"  {symbol}: {len(df)} daily bars (yfinance)")
+            df = ib_util.df(bars)
+            df.set_index("date", inplace=True)
+            df.columns = [c.lower() for c in df.columns]
+            logger.info(f"  {symbol}: {len(df)} daily bars (IBKR)")
             return df
         except Exception as e:
             logger.error(f"  {symbol}: 5y download failed: {e}")
@@ -836,15 +882,26 @@ class FibReversalEngine:
             except Exception:
                 pass
 
-        ticker = yf.Ticker(symbol)
+        ib = _get_ib()
+        if ib is None:
+            logger.error(f"  {symbol}: IBKR not connected for intraday download")
+            return None
         try:
-            df = ticker.history(period=f"{FIB_GAP_LOOKBACK_DAYS}d", interval="2m", prepost=True)
-            if not df.empty and len(df) > 50:
-                logger.info(f"  {symbol}: {len(df)} 2m bars (yfinance)")
+            contract = Stock(symbol, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="30 D",
+                barSizeSetting="2 mins",
+                whatToShow="TRADES",
+                useRTH=False,
+            )
+            if bars and len(bars) > 50:
+                df = ib_util.df(bars)
+                df.set_index("date", inplace=True)
                 df.columns = [c.lower() for c in df.columns]
-                for col in ["dividends", "stock splits", "capital gains"]:
-                    if col in df.columns:
-                        df.drop(columns=[col], inplace=True)
+                logger.info(f"  {symbol}: {len(df)} 2m bars (IBKR)")
                 return df
         except Exception as e:
             logger.debug(f"  {symbol}: 2m download failed: {e}")

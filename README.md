@@ -158,7 +158,7 @@ trading-bot/
 │   ├── trade_logger.py        # SQLite + CSV logging
 │   └── telegram_bot.py        # Telegram alerts
 ├── backtesting/
-│   ├── data_downloader.py     # yfinance + parquet caching
+│   ├── data_downloader.py     # IBKR + parquet caching
 │   ├── backtest_engine.py     # Event-driven backtester
 │   └── report_generator.py    # Plotly HTML reports
 ├── dashboard/

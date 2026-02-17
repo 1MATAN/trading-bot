@@ -23,7 +23,7 @@
 
 מקורות מידע:
 - סורק IBKR: מחיר + אחוז שינוי (TOP_PERC_GAIN)
-- yfinance: נתוני Float (כי IBKR לא מספק את זה ישירות)
+- IBKR: נתוני Float (כי IBKR לא מספק את זה ישירות)
 - נתונים היסטוריים מ-IBKR: SMA על כל הטיימפריימים (use_rth=False)
 
 --- מערכת פיבונאצ'י כפולה (Dual Series) ---
@@ -224,7 +224,7 @@
 --- איך הסימולציה עובדת ---
 
 1. סריקת מועמדים:
-   - 48 מניות small-cap נבדקות דרך yfinance
+   - 48 מניות small-cap נבדקות דרך IBKR
    - סינון: מחיר <= $20, float <= 60M, gap >= 7% ב-30 הימים האחרונים
 
 2. הורדת נתונים לכל מניה:
@@ -357,7 +357,7 @@ strategies/fibonacci_engine.py
   - שכתוב מלא: מערכת כפולה עם Auto-Advance (ללא שינוי בגרסה 2)
 
 scanner/realtime_scanner.py
-  - שכתוב: IBKR + yfinance float + SMA מרובה-טיימפריימים (ללא שינוי בגרסה 2)
+  - שכתוב: IBKR + IBKR float + SMA מרובה-טיימפריימים (ללא שינוי בגרסה 2)
 
 strategies/momentum_entry.py
   - עדכון (גרסה 2): מעביר reference_price ל-order_manager לתמיכה ב-limit orders

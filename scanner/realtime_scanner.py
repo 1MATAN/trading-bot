@@ -1,9 +1,9 @@
-"""Momentum scanner: IBKR scan + yfinance float filter + VWAP pullback check.
+"""Momentum scanner: IBKR scan + float filter + VWAP pullback check.
 
 Filters:
 - Price <= $20
 - Moved up > 20% intraday
-- Float <= 60M shares (via yfinance)
+- Float <= 60M shares (via IBKR fundamental data)
 - VWAP pullback state machine for entry
 """
 
@@ -12,7 +12,6 @@ import logging
 from typing import Optional
 
 import pandas as pd
-import yfinance as yf
 from ib_insync import ScannerSubscription, Stock, TagValue
 
 from broker.ibkr_connection import get_connection
@@ -33,7 +32,7 @@ logger = logging.getLogger("trading_bot.scanner")
 
 
 class RealtimeScanner:
-    """Momentum scanner with IBKR + yfinance enrichment."""
+    """Momentum scanner with IBKR enrichment."""
 
     def __init__(self) -> None:
         self._conn = get_connection()
@@ -57,8 +56,8 @@ class RealtimeScanner:
             return []
         logger.info(f"Scanner step 1: {len(raw_symbols)} candidates from IBKR")
 
-        # Step 2: Float filter via yfinance
-        filtered = self._filter_by_float(raw_symbols)
+        # Step 2: Float filter via IBKR fundamental data
+        filtered = await self._filter_by_float(raw_symbols)
         if not filtered:
             logger.debug("Scanner: No candidates passed float filter")
             return []
@@ -129,14 +128,22 @@ class RealtimeScanner:
             logger.error(f"IBKR scanner request failed: {e}")
             return []
 
-    def _filter_by_float(self, symbols: list[str]) -> list[str]:
-        """Filter symbols by float <= SCAN_FLOAT_MAX using yfinance."""
+    async def _filter_by_float(self, symbols: list[str]) -> list[str]:
+        """Filter symbols by float <= SCAN_FLOAT_MAX using IBKR fundamental data."""
         passed = []
         for symbol in symbols:
             try:
-                info = yf.Ticker(symbol).info
-                float_shares = info.get("floatShares") or info.get("sharesOutstanding", 0)
-                if float_shares and float_shares <= SCAN_FLOAT_MAX:
+                contract = Stock(symbol, "SMART", "USD")
+                qualified = await self._conn.qualify_contract(contract)
+                if qualified is None:
+                    passed.append(symbol)
+                    continue
+
+                float_shares = await self._get_float_ibkr(symbol, qualified)
+                if float_shares is None or float_shares == 0:
+                    # Include by default if we can't check (conservative approach)
+                    passed.append(symbol)
+                elif float_shares <= SCAN_FLOAT_MAX:
                     passed.append(symbol)
                     logger.debug(f"{symbol}: float={float_shares:,.0f} — PASS")
                 else:
@@ -146,9 +153,25 @@ class RealtimeScanner:
                     )
             except Exception as e:
                 logger.warning(f"Float lookup failed for {symbol}: {e}")
-                # Include by default if we can't check (conservative approach)
                 passed.append(symbol)
         return passed
+
+    async def _get_float_ibkr(self, symbol: str, contract) -> Optional[float]:
+        """Get float shares from IBKR fundamental data."""
+        try:
+            import xml.etree.ElementTree as ET
+
+            xml_data = await self._conn.ib.reqFundamentalDataAsync(
+                contract, reportType="ReportSnapshot"
+            )
+            if xml_data:
+                root = ET.fromstring(xml_data)
+                for item in root.iter("SharesOut"):
+                    val = item.text or item.get("TotalFloat", "0")
+                    return float(val) * 1_000_000
+        except Exception as e:
+            logger.debug(f"IBKR float check failed for {symbol}: {e}")
+        return None
 
     async def _analyze_candidate(self, symbol: str) -> Optional[EntrySignal]:
         """Fetch intraday data and run VWAP pullback state machine."""

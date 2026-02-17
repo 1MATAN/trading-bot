@@ -16,10 +16,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import xml.etree.ElementTree as ET
+
+from ib_insync import IB, Stock, util as ib_util
 
 from config.settings import (
     BACKTEST_DATA_DIR,
+    IBKR_HOST,
+    IBKR_PORT,
     SCAN_PRICE_MIN,
     SCAN_PRICE_MAX,
     FIB_LOOKBACK_YEARS,
@@ -30,7 +34,25 @@ from simulation.fib_reversal_backtest import GAP_MIN_PCT
 logger = logging.getLogger("trading_bot.download_cache")
 
 CACHE_DIR = BACKTEST_DATA_DIR
-RATE_LIMIT_SLEEP = 0.5  # seconds between yfinance calls
+RATE_LIMIT_SLEEP = 0.5  # seconds between IBKR calls
+
+_ib: IB | None = None
+_IBKR_CACHE_CLIENT = 14
+
+
+def _get_ib() -> IB | None:
+    global _ib
+    if _ib and _ib.isConnected():
+        return _ib
+    try:
+        _ib = IB()
+        _ib.connect(IBKR_HOST, IBKR_PORT, clientId=_IBKR_CACHE_CLIENT, timeout=10)
+        logger.info("IBKR cache downloader connection established")
+        return _ib
+    except Exception as e:
+        logger.error(f"IBKR connect failed: {e}")
+        _ib = None
+        return None
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,28 +69,29 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 def _price_filter(symbols: list[str]) -> list[str]:
     """Keep only symbols with last close in $1-$20 range."""
     logger.info(f"Price-filtering {len(symbols)} symbols ($1-$20)...")
-    try:
-        batch = yf.download(
-            symbols, period="5d", interval="1d",
-            group_by="ticker", progress=False, threads=True,
-        )
-    except Exception as e:
-        logger.error(f"Price filter download failed: {e}")
-        return symbols
-
-    if batch.empty:
+    ib = _get_ib()
+    if not ib:
+        logger.error("No IBKR connection for price filter")
         return symbols
 
     passed = []
     for sym in symbols:
         try:
-            if isinstance(batch.columns, pd.MultiIndex):
-                if sym not in batch.columns.get_level_values(0):
-                    continue
-                df_sym = batch[sym].dropna(how="all")
-            else:
-                df_sym = batch.dropna(how="all")
-            if len(df_sym) < 1:
+            contract = Stock(sym, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            _time.sleep(RATE_LIMIT_SLEEP)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="5 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+            )
+            if not bars:
+                continue
+            df_sym = ib_util.df(bars)
+            if df_sym.empty or len(df_sym) < 1:
                 continue
             df_sym = _clean_columns(df_sym)
             last_price = float(df_sym["close"].iloc[-1])
@@ -82,39 +105,37 @@ def _price_filter(symbols: list[str]) -> list[str]:
 
 
 def _detect_gappers(symbols: list[str]) -> tuple[list[dict], pd.DataFrame]:
-    """Batch download daily data and detect gap events >= 10% and >= 20%.
+    """Download daily data per symbol and detect gap events >= 10% and >= 20%.
 
-    Returns (gapper_list, batch_df).
+    Returns (gapper_list, combined_df).
     """
     logger.info(f"Downloading {FIB_GAP_LOOKBACK_DAYS}d daily for {len(symbols)} symbols (gapper detection)...")
-    try:
-        batch = yf.download(
-            symbols, period=f"{FIB_GAP_LOOKBACK_DAYS}d", interval="1d",
-            group_by="ticker", progress=False, threads=True,
-        )
-    except Exception as e:
-        logger.error(f"Batch daily download failed: {e}")
-        return [], pd.DataFrame()
-
-    if batch.empty:
+    ib = _get_ib()
+    if not ib:
+        logger.error("No IBKR connection for gapper detection")
         return [], pd.DataFrame()
 
     gappers = []
-    single_symbol = len(symbols) == 1
+    all_frames = []
 
     for sym in symbols:
         try:
-            if single_symbol:
-                df_sym = batch.copy()
-            elif isinstance(batch.columns, pd.MultiIndex):
-                if sym not in batch.columns.get_level_values(0):
-                    continue
-                df_sym = batch[sym].dropna(how="all")
-            else:
-                df_sym = batch.dropna(how="all")
-            if len(df_sym) < 2:
+            contract = Stock(sym, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            _time.sleep(RATE_LIMIT_SLEEP)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=f"{FIB_GAP_LOOKBACK_DAYS} D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+            )
+            if not bars or len(bars) < 2:
                 continue
+            df_sym = ib_util.df(bars)
             df_sym = _clean_columns(df_sym)
+            all_frames.append(df_sym)
 
             prev_closes = df_sym["close"].shift(1)
             for idx in range(1, len(df_sym)):
@@ -145,7 +166,8 @@ def _detect_gappers(symbols: list[str]) -> tuple[list[dict], pd.DataFrame]:
         except Exception as e:
             logger.debug(f"Gapper scan failed for {sym}: {e}")
 
-    return gappers, batch
+    combined = pd.concat(all_frames) if all_frames else pd.DataFrame()
+    return gappers, combined
 
 
 def _save_gappers_csv(gappers: list[dict]) -> None:
@@ -170,11 +192,25 @@ def _save_gappers_csv(gappers: list[dict]) -> None:
 def _download_daily_5y(symbol: str) -> bool:
     """Download 5y daily OHLCV and save as parquet. Returns True on success."""
     out_path = CACHE_DIR / f"{symbol}_daily_5y.parquet"
+    ib = _get_ib()
+    if not ib:
+        logger.error(f"  {symbol}: no IBKR connection for daily 5y")
+        return False
     try:
-        df = yf.download(symbol, period=f"{FIB_LOOKBACK_YEARS}y", interval="1d", progress=False)
-        if df.empty or len(df) < 20:
-            logger.warning(f"  {symbol}: daily 5y — insufficient data ({len(df)} bars)")
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=f"{FIB_LOOKBACK_YEARS} Y",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=False,
+        )
+        if not bars or len(bars) < 20:
+            logger.warning(f"  {symbol}: daily 5y — insufficient data ({len(bars) if bars else 0} bars)")
             return False
+        df = ib_util.df(bars)
         df = _clean_columns(df)
         df.to_parquet(out_path)
         logger.info(f"  {symbol}: {len(df)} daily bars → {out_path.name}")
@@ -187,12 +223,25 @@ def _download_daily_5y(symbol: str) -> bool:
 def _download_intraday_2m(symbol: str) -> bool:
     """Download 30d 2m intraday OHLCV and save as parquet. Returns True on success."""
     out_path = CACHE_DIR / f"{symbol}_intraday_2m.parquet"
+    ib = _get_ib()
+    if not ib:
+        logger.error(f"  {symbol}: no IBKR connection for intraday 2m")
+        return False
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=f"{FIB_GAP_LOOKBACK_DAYS}d", interval="2m", prepost=True)
-        if df.empty or len(df) < 50:
-            logger.warning(f"  {symbol}: intraday 2m — insufficient data ({len(df)} bars)")
+        contract = Stock(symbol, "SMART", "USD")
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr="30 D",
+            barSizeSetting="2 mins",
+            whatToShow="TRADES",
+            useRTH=False,
+        )
+        if not bars or len(bars) < 50:
+            logger.warning(f"  {symbol}: intraday 2m — insufficient data ({len(bars) if bars else 0} bars)")
             return False
+        df = ib_util.df(bars)
         df.columns = [c.lower() for c in df.columns]
         for col in ["dividends", "stock splits", "capital gains"]:
             if col in df.columns:
@@ -206,12 +255,24 @@ def _download_intraday_2m(symbol: str) -> bool:
 
 
 def _fetch_float_shares(symbols: list[str]) -> dict[str, float]:
-    """Fetch float shares for all symbols and save to JSON."""
+    """Fetch float shares for all symbols via IBKR fundamental data and save to JSON."""
+    ib = _get_ib()
     float_cache: dict[str, float] = {}
     for sym in symbols:
         try:
-            info = yf.Ticker(sym).info
-            flt = float(info.get("floatShares", 0) or 0)
+            if not ib:
+                float_cache[sym] = 0
+                continue
+            contract = Stock(sym, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            xml_data = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
+            flt = 0.0
+            if xml_data:
+                root = ET.fromstring(xml_data)
+                for item in root.iter("SharesOut"):
+                    val = item.text or item.get("TotalFloat", "0")
+                    flt = float(val) * 1_000_000  # IBKR reports in millions
+                    break
             float_cache[sym] = flt
         except Exception:
             float_cache[sym] = 0

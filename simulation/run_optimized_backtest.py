@@ -7,7 +7,7 @@ Settings:
   - Stop: 3% below fib (proven)
   - Target: 50% at 3rd fib level + 50% no-new-high trailing
   - 15-second bars
-  - Float filter: <= 500M (via yfinance, post-filter)
+  - Float filter: <= 500M (via IBKR, post-filter)
 """
 import sys
 sys.path.insert(0, "/home/matan-shaar/trading-bot")
@@ -27,7 +27,34 @@ settings.FIB_DT_USE_RATIO_FILTER = True
 from simulation.fib_double_touch_backtest import FibDoubleTouchEngine
 import pandas as pd
 import pytz
-import yfinance as yf
+from ib_insync import IB, Stock, util as ib_util
+from config.settings import IBKR_HOST, IBKR_PORT
+import xml.etree.ElementTree as ET
+
+
+def _get_ib() -> IB:
+    """Connect to IBKR TWS (clientId=15) and return the IB instance."""
+    ib = IB()
+    ib.connect(IBKR_HOST, IBKR_PORT, clientId=15)
+    return ib
+
+
+def _get_float_shares(ib: IB, symbol: str) -> int:
+    """Fetch SharesOut from IBKR fundamental data (ReportSnapshot XML)."""
+    contract = Stock(symbol, "SMART", "USD")
+    ib.qualifyContracts(contract)
+    xml_str = ib.reqFundamentalData(contract, "ReportSnapshot")
+    if not xml_str:
+        return 0
+    root = ET.fromstring(xml_str)
+    # SharesOut is typically in <SharesOut> inside <CoGeneralInfo> or similar
+    for node in root.iter("SharesOut"):
+        try:
+            # IBKR returns shares in millions; convert to actual shares
+            return int(float(node.text) * 1_000_000)
+        except (ValueError, TypeError):
+            pass
+    return 0
 
 print("=" * 70)
 print("OPTIMIZED BACKTEST: Double Touch (15-sec)")
@@ -82,12 +109,14 @@ if result.trades:
 
     symbols = list(set(t["symbol"] for t in result.trades))
     float_data = {}
+    ib = _get_ib()
     for sym in symbols:
         try:
-            fs = yf.Ticker(sym).info.get("floatShares") or 0
+            fs = _get_float_shares(ib, sym)
             float_data[sym] = fs
-        except:
+        except Exception:
             float_data[sym] = 0
+    ib.disconnect()
 
     # Show all trades with float
     et = pytz.timezone("US/Eastern")

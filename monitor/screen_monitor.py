@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 import pytesseract
 import requests
 from ib_insync import IB, Stock, util as ib_util
-import yfinance as yf
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
 
@@ -347,40 +346,26 @@ def _get_ibkr_fib() -> IB | None:
 
 
 def _download_daily(symbol: str) -> pd.DataFrame | None:
-    """Download 5 years daily data. IBKR first, yfinance fallback."""
-    # Try IBKR
+    """Download 5 years daily data from IBKR."""
     ib = _get_ibkr_fib()
-    if ib:
-        try:
-            contract = Stock(symbol, 'SMART', 'USD')
-            ib.qualifyContracts(contract)
-            bars = ib.reqHistoricalData(
-                contract, endDateTime='', durationStr='5 Y',
-                barSizeSetting='1 day', whatToShow='TRADES', useRTH=False,
-            )
-            if bars:
-                df = ib_util.df(bars)
-                if len(df) >= 5:
-                    log.info(f"IBKR: {symbol} {len(df)} daily bars")
-                    return df
-        except Exception as e:
-            log.warning(f"IBKR download {symbol}: {e}")
-
-    # Fallback: yfinance
-    try:
-        df = yf.download(symbol, period='5y', interval='1d', prepost=True,
-                         progress=False, timeout=10)
-        if df.empty or len(df) < 5:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0].lower() for c in df.columns]
-        else:
-            df.columns = [c.lower() for c in df.columns]
-        log.info(f"yfinance fallback: {symbol} {len(df)} daily bars")
-        return df
-    except Exception as e:
-        log.error(f"yfinance download {symbol}: {e}")
+    if not ib:
+        log.error(f"No IBKR connection for {symbol} daily download")
         return None
+    try:
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='5 Y',
+            barSizeSetting='1 day', whatToShow='TRADES', useRTH=False,
+        )
+        if bars:
+            df = ib_util.df(bars)
+            if len(df) >= 5:
+                log.info(f"IBKR: {symbol} {len(df)} daily bars")
+                return df
+    except Exception as e:
+        log.warning(f"IBKR download {symbol}: {e}")
+    return None
 
 
 def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], list[float]]:

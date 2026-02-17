@@ -13,8 +13,7 @@ plotly==5.24.1
 # Notifications
 python-telegram-bot==21.9
 
-# Backtesting data
-yfinance==0.2.51
+# Data caching
 pyarrow==18.1.0
 
 # Utilities

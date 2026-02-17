@@ -57,7 +57,7 @@ class GapScanner:
         1. IBKR scanner: Top % Gainers, $1-$20
         2. Get previous close from daily bars
         3. Filter by gap_pct >= gap_min_pct (and <= gap_max_pct if set)
-        4. Filter by float <= float_max (if set, via yfinance)
+        4. Filter by float <= float_max (if set, via IBKR fundamental data)
         5. Return top N sorted by gap %
         """
         self._scan_count += 1
@@ -159,10 +159,10 @@ class GapScanner:
         if not (SCAN_PRICE_MIN <= current_price <= SCAN_PRICE_MAX):
             return None
 
-        # Float filter (after gap check to minimize yfinance calls)
+        # Float filter via IBKR fundamental data
         float_shares = 0.0
         if self._float_max > 0:
-            float_shares = await self._check_float(symbol)
+            float_shares = await self._check_float(symbol, qualified)
             if float_shares > 0 and float_shares > self._float_max:
                 logger.debug(
                     f"{symbol}: float {float_shares/1e6:.1f}M > max {self._float_max/1e6:.1f}M, skipping"
@@ -178,22 +178,27 @@ class GapScanner:
             float_shares=float_shares,
         )
 
-    async def _check_float(self, symbol: str) -> float:
-        """Get float shares via yfinance (cached per day)."""
+    async def _check_float(self, symbol: str, contract: Contract) -> float:
+        """Get float shares via IBKR fundamental data (cached per session)."""
         if symbol in self._float_cache:
             return self._float_cache[symbol]
 
         try:
-            import asyncio
-            import yfinance as yf
+            import xml.etree.ElementTree as ET
 
-            loop = asyncio.get_event_loop()
-            ticker = yf.Ticker(symbol)
-            info = await loop.run_in_executor(None, lambda: ticker.info)
-            float_shares = float(info.get("floatShares", 0) or 0)
-            self._float_cache[symbol] = float_shares
-            return float_shares
+            xml_data = await self._conn.ib.reqFundamentalDataAsync(
+                contract, reportType="ReportSnapshot"
+            )
+            if xml_data:
+                root = ET.fromstring(xml_data)
+                # Look for SharesOut in IBKR fundamental XML
+                for item in root.iter("SharesOut"):
+                    val = item.text or item.get("TotalFloat", "0")
+                    float_shares = float(val) * 1_000_000  # IBKR reports in millions
+                    self._float_cache[symbol] = float_shares
+                    return float_shares
         except Exception as e:
             logger.debug(f"Float check failed for {symbol}: {e}")
-            self._float_cache[symbol] = 0.0
-            return 0.0
+
+        self._float_cache[symbol] = 0.0
+        return 0.0

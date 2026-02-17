@@ -10,7 +10,7 @@ Penny stock trading bot using IBKR TWS API (`ib_insync`), recursive Fibonacci mo
 - `pandas` / `numpy` for data
 - `streamlit` for dashboard (separate subprocess)
 - `plotly` for charts
-- `yfinance` for backtest data
+- IBKR TWS for all market data (live + backtest)
 - SQLite for trade storage, JSON for IPC
 
 ## Key Conventions
@@ -48,5 +48,5 @@ Penny stock trading bot using IBKR TWS API (`ib_insync`), recursive Fibonacci mo
 - IBKR TWS must be running with API enabled on port 7497 (paper)
 - Never deploy to live trading without extensive paper testing
 - PDT tracking is independent (don't rely solely on IBKR enforcement)
-- Float filter supplemented by yfinance (IBKR scanner lacks direct float filter)
+- Float filter via IBKR fundamental data (reqFundamentalData ReportSnapshot)
 - Fibonacci cache: 24h TTL, invalidated when price exceeds grid top

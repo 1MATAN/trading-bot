@@ -1603,7 +1603,6 @@ def main():
     parser.add_argument("--float-max", type=float, default=0, help="Max float in millions (e.g., 60 for 60M)")
     parser.add_argument("--rvol", action="store_true", help="Require unusual volume vs 14-day average")
     parser.add_argument("--bar-size", type=str, default="2m", help="Bar size: 1m or 2m (default: 2m)")
-    parser.add_argument("--yfinance", action="store_true", help="Use yfinance only (skip IBKR)")
     parser.add_argument("--start-date", type=str, help="Simulation start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="Simulation end date (YYYY-MM-DD)")
     args = parser.parse_args()
@@ -1716,7 +1715,6 @@ def main():
             float_max=args.float_max * 1e6 if args.float_max else 0,
             require_rvol=args.rvol,
             bar_size=args.bar_size,
-            yfinance_only=args.yfinance,
         ))
         # Summary already printed by engine; show quick recap
         if result.total_trades > 0:

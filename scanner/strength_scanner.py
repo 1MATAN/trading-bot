@@ -3,7 +3,7 @@
 Filters:
 - IBKR Top % Gainers, $1-$20, all sessions (use_rth=False)
 - Gain >= 20% (FIB_CONFIRM_GAIN_MIN_PCT)
-- Float <= 60M shares via yfinance
+- Float <= 60M shares via IBKR fundamental data
 - RVOL >= 1.5x vs 14-day average (skipped before 6 AM ET)
 """
 
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import time as dt_time
 from typing import Optional
 
-import yfinance as yf
 from ib_insync import Contract, ScannerSubscription, Stock, TagValue
 
 from broker.ibkr_connection import get_connection
@@ -29,7 +28,7 @@ from utils.time_utils import now_et
 
 logger = logging.getLogger("trading_bot.strength_scanner")
 
-# Cache yfinance float lookups for the session
+# Cache IBKR float lookups for the session
 _float_cache: dict[str, Optional[float]] = {}
 
 
@@ -46,7 +45,7 @@ class StrengthSignal:
 
 
 class StrengthScanner:
-    """Scan for strong stocks in extended hours via IBKR + yfinance."""
+    """Scan for strong stocks in extended hours via IBKR."""
 
     def __init__(self) -> None:
         self._conn = get_connection()
@@ -57,7 +56,7 @@ class StrengthScanner:
 
         1. IBKR scanner: Top % Gainers, $1-$20, all sessions
         2. Filter: gain >= 20%
-        3. yfinance float filter: <= 60M shares (cached)
+        3. IBKR float filter: <= 60M shares (cached)
         4. RVOL filter: >= 1.5x (skipped before 6 AM ET)
         5. Sort by gain_pct desc, limit to max symbols
         """
@@ -164,8 +163,8 @@ class StrengthScanner:
         if not (SCAN_PRICE_MIN <= current_price <= SCAN_PRICE_MAX):
             return None
 
-        # Step 3: Float filter (cached)
-        float_shares = self._get_float(symbol)
+        # Step 3: Float filter (cached, via IBKR fundamental data)
+        float_shares = await self._get_float(symbol, qualified)
         if float_shares is not None and float_shares > FIB_CONFIRM_FLOAT_MAX:
             logger.debug(
                 f"{symbol}: float={float_shares:,.0f} — "
@@ -195,22 +194,31 @@ class StrengthScanner:
             prev_close=round(prev_close, 4),
         )
 
-    def _get_float(self, symbol: str) -> Optional[float]:
-        """Get float shares from yfinance (cached per session)."""
+    async def _get_float(self, symbol: str, contract: Contract) -> Optional[float]:
+        """Get float shares from IBKR fundamental data (cached per session)."""
         if symbol in _float_cache:
             return _float_cache[symbol]
 
         try:
-            info = yf.Ticker(symbol).info
-            float_shares = info.get("floatShares") or info.get("sharesOutstanding")
-            _float_cache[symbol] = float_shares
-            if float_shares:
-                logger.debug(f"{symbol}: float={float_shares:,.0f}")
-            return float_shares
+            import xml.etree.ElementTree as ET
+
+            xml_data = await self._conn.ib.reqFundamentalDataAsync(
+                contract, reportType="ReportSnapshot"
+            )
+            if xml_data:
+                root = ET.fromstring(xml_data)
+                for item in root.iter("SharesOut"):
+                    val = item.text or item.get("TotalFloat", "0")
+                    float_shares = float(val) * 1_000_000
+                    _float_cache[symbol] = float_shares
+                    if float_shares:
+                        logger.debug(f"{symbol}: float={float_shares:,.0f}")
+                    return float_shares
         except Exception as e:
             logger.warning(f"Float lookup failed for {symbol}: {e}")
-            _float_cache[symbol] = None
-            return None
+
+        _float_cache[symbol] = None
+        return None
 
     async def _compute_rvol(self, contract: Contract) -> float:
         """Compute relative volume: today's vol / avg(14 daily bars).
