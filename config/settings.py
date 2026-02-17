@@ -194,6 +194,17 @@ FIB_CONFIRM_SMA_LONG = 200             # long SMA period for gate
 BB_PERIOD = 20                    # SMA period for middle band
 BB_STD = 2.0                      # standard deviations for upper/lower bands
 
+# ── Fibonacci Double-Touch Backtest ────────────────────
+FIB_DT_STOP_PCT = 0.03             # 3% below fib level
+FIB_DT_TARGET_LEVELS = 3           # exit 50% at 3rd fib level above
+FIB_DT_PROXIMITY_PCT = 0.008       # 0.8% proximity to fib level
+FIB_DT_MIN_BOUNCE_BARS = 3         # min bars between first and second touch
+FIB_DT_MAX_ENTRIES_PER_DAY = 3     # max entries per gap day
+FIB_DT_GAP_MAX_PCT = 50.0             # skip gaps > 50% (poor performance)
+FIB_DT_ENTRY_WINDOW_END = "13:00"     # no entries after 1 PM ET (edge disappears)
+FIB_DT_PREFERRED_RATIOS = {0.382, 0.5, 0.618, 0.764, 0.88, 1.414, 2.272, 2.414, 3.272, 3.414, 3.618}
+FIB_DT_USE_RATIO_FILTER = True        # only enter on preferred fib ratios
+
 # ── Logging ────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FORMAT = "%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s"

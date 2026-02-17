@@ -1076,12 +1076,13 @@ def main():
     parser.add_argument("--fib-backtest", action="store_true", help="Run Fibonacci support backtest on gappers")
     parser.add_argument("--fib-live", action="store_true", help="Run Fibonacci live paper trading bot")
     parser.add_argument("--fib-confirm", action="store_true", help="Run Fibonacci confirmation paper trading bot")
-    parser.add_argument("--fib-strength", action="store_true", help="Run multi-TF fib strength backtest (gap>=20%, SMA gates, vol/float)")
+    parser.add_argument("--fib-strength", action="store_true", help="Run multi-TF fib strength backtest (gap>=20%%, SMA gates, vol/float)")
     parser.add_argument("--download-cache", action="store_true", help="Download and cache all backtest data (daily, intraday, float)")
     parser.add_argument("--fib-reversal", action="store_true", help="Run fib retracement + trend reversal backtest (3-candle confirm)")
+    parser.add_argument("--fib-double-touch", action="store_true", help="Run double-touch fib backtest (15-sec bars, IBKR data)")
     parser.add_argument("--optimize", action="store_true", help="Run multi-strategy fibonacci optimizer (72 combos)")
     parser.add_argument("--symbols", nargs="*", help="Symbols to simulate (e.g., AAPL TSLA)")
-    parser.add_argument("--gap-min", type=float, default=10.0, help="Minimum gap %% for fib backtest (default: 10)")
+    parser.add_argument("--gap-min", type=float, default=10.0, help="Minimum gap pct for fib backtest (default: 10)")
     parser.add_argument("--sma20", action="store_true", help="Require price above SMA 20 (intraday)")
     parser.add_argument("--sma200", action="store_true", help="Require price above SMA 200 (intraday)")
     parser.add_argument("--float-max", type=float, default=0, help="Max float in millions (e.g., 60 for 60M)")
@@ -1133,6 +1134,43 @@ def main():
         from simulation.fib_reversal_backtest import run_fib_reversal_backtest
         result = asyncio.run(run_fib_reversal_backtest())
         if result.total_trades > 0:
+            wr = result.winning_trades / result.total_trades * 100
+            print(f"\nQuick recap: {result.total_trades} trades, "
+                  f"{wr:.1f}% WR, net P&L ${result.total_pnl_net:+,.2f}")
+        else:
+            print("\nNo trades were generated.")
+        return
+
+    if args.fib_double_touch:
+        # Step 1: Download 15-sec data from IBKR (if TWS running and cache incomplete)
+        try:
+            from simulation.ibkr_data_downloader import download_15s_data
+            print("Step 1: Downloading 15-sec bars from IBKR...")
+            dl_results = asyncio.run(download_15s_data())
+            if dl_results:
+                print(f"  Downloaded {len(dl_results)} new gap events")
+            else:
+                print("  All data already cached (or IBKR not available)")
+        except Exception as e:
+            print(f"  Download skipped: {e}")
+            print("  (Will use existing cached data)")
+
+        # Step 2: Run backtest
+        print("\nStep 2: Running double-touch backtest...")
+        from simulation.fib_double_touch_backtest import FibDoubleTouchEngine
+        engine = FibDoubleTouchEngine()
+        result = engine.run()
+
+        # Step 3: Generate charts
+        if result.total_trades > 0:
+            print("\nStep 3: Generating charts...")
+            try:
+                from simulation.fib_double_touch_charts import generate_double_touch_report
+                chart_data = engine.get_chart_data()
+                generate_double_touch_report(chart_data, result)
+            except Exception as e:
+                print(f"  Chart generation failed: {e}")
+
             wr = result.winning_trades / result.total_trades * 100
             print(f"\nQuick recap: {result.total_trades} trades, "
                   f"{wr:.1f}% WR, net P&L ${result.total_pnl_net:+,.2f}")
