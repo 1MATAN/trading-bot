@@ -1,6 +1,9 @@
 """
-Screen Monitor — Silent screen capture, OCR, anomaly detection.
-Only alerts via Telegram when something unusual happens.
+IBKR Scanner Monitor — Real-time stock scanner via IBKR API with anomaly
+detection, Fibonacci levels, and Telegram alerts.
+
+Replaces the old OCR-based screen capture pipeline with direct
+``reqScannerData`` calls for clean, reliable data.
 
 Usage:
     python monitor/screen_monitor.py
@@ -14,62 +17,60 @@ _PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import asyncio
 import csv
 import json
 import logging
 import os
-import re
-import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
 from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+import numpy as np
 import pandas as pd
-from PIL import Image, ImageGrab, ImageTk
 from dotenv import load_dotenv
-import pytesseract
 import requests
-from ib_insync import IB, Stock, util as ib_util
+from ib_insync import IB, Stock, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
+from bidi.algorithm import get_display as _bidi
 from deep_translator import GoogleTranslator
 
 from strategies.fibonacci_engine import (
     find_anchor_candle, build_dual_series, advance_series,
 )
-from config.settings import FIB_LEVELS_24, IBKR_HOST, IBKR_PORT
+from config.settings import (
+    FIB_LEVELS_24, IBKR_HOST, IBKR_PORT,
+    MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_MAX_RESULTS,
+    MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
+    MONITOR_DEFAULT_ALERT_PCT,
+)
 
 # ── Config ────────────────────────────────────────────────
 _config_dir = Path(__file__).parent / "config"
 _env_path = _config_dir / ".env"
-load_dotenv(_env_path) if _env_path.exists() else load_dotenv()
+_project_env = _PROJECT_ROOT / "config" / ".env"
+# Try monitor-local .env first, then project-level config/.env, then default
+if _env_path.exists():
+    load_dotenv(_env_path)
+elif _project_env.exists():
+    load_dotenv(_project_env)
+else:
+    load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-CROP_PATH = DATA_DIR / "monitor_crop.png"
 STATE_PATH = DATA_DIR / "monitor_state.json"
 LOG_CSV = DATA_DIR / "monitor_log.csv"
 LOG_TXT = DATA_DIR / "monitor_log.txt"
-
-TICKER_RE = re.compile(r'\b([A-Z]{1,5})\b')
-PCT_RE = re.compile(r'([+-]?\s*\d{1,4}\.?\d{0,2})\s*%')
-NUM_MK_RE = re.compile(r'(\d{1,6}\.?\d{0,2})\s*([MmKk™])')
-
-NOT_TICKERS = {
-    'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL',
-    'CAN', 'HAD', 'HER', 'WAS', 'ONE', 'OUR', 'OUT', 'HAS',
-    'BUY', 'ASK', 'BID', 'VOL', 'AVG', 'CHG', 'PCT', 'MKT',
-    'USD', 'ETF', 'IPO', 'EPS', 'CEO', 'SEC', 'NYSE', 'HIGH',
-    'LOW', 'OPEN', 'CLOSE', 'LAST', 'PREV', 'NET', 'DAY',
-    'PRE', 'POST', 'TOP', 'NEW', 'SYM', 'TIME', 'DATE', 'EST',
-    'PM', 'AM', 'MIN', 'MAX', 'AVE', 'SUM', 'NUM', 'QTY',
-}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,106 +80,121 @@ log = logging.getLogger("monitor")
 
 
 # ══════════════════════════════════════════════════════════
-#  Silent Screenshot
+#  IBKR Connection (single synchronous IB instance)
 # ══════════════════════════════════════════════════════════
 
-_SCROT_PATH = "/tmp/_monitor_cap.png"
+_ibkr: IB | None = None
 
 
-def take_screenshot(bbox: tuple[int,int,int,int] | None = None) -> Image.Image | None:
-    """Silent screenshot. If bbox given, capture only that region via scrot."""
+def _get_ibkr() -> IB | None:
+    """Get/create a dedicated IBKR connection for the monitor."""
+    global _ibkr
+    if _ibkr and _ibkr.isConnected():
+        return _ibkr
     try:
-        if bbox:
-            x, y, x2, y2 = bbox
-            w, h = x2 - x, y2 - y
-            r = subprocess.run(
-                ["scrot", "-a", f"{x},{y},{w},{h}", _SCROT_PATH, "-o"],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode == 0:
-                return Image.open(_SCROT_PATH)
-        # Full screen fallback (for region selector)
-        r = subprocess.run(
-            ["scrot", _SCROT_PATH, "-o"],
-            capture_output=True, timeout=5,
-        )
-        if r.returncode == 0:
-            return Image.open(_SCROT_PATH)
-    except Exception:
-        pass
-    # Last resort
-    try:
-        img = ImageGrab.grab()
-        if bbox:
-            return img.crop(bbox)
-        return img
+        # Ensure an asyncio event loop exists in this thread
+        # (ib_insync needs one; non-main threads don't get one by default)
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        _ibkr = IB()
+        _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
+        log.info("IBKR connection established (monitor)")
+        return _ibkr
     except Exception as e:
-        log.error(f"Screenshot failed: {e}")
+        log.warning(f"IBKR connect failed: {e}")
+        _ibkr = None
         return None
 
 
 # ══════════════════════════════════════════════════════════
-#  OCR & Parsing
+#  IBKR Scanner — replaces screenshot + OCR + parse
 # ══════════════════════════════════════════════════════════
 
-def ocr_image(img: Image.Image) -> str:
-    w, h = img.size
-    img = img.resize((w * 2, h * 2), Image.LANCZOS)
-    gray = img.convert('L')
+def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
+                   price_max: float = MONITOR_PRICE_MAX) -> dict:
+    """Run IBKR scanner and enrich each symbol with historical data.
+
+    Returns dict in the same format as the old ``parse_scanner_data()``:
+        {symbol: {'price': float, 'pct': float, 'volume': str, 'float': str}}
+    """
+    ib = _get_ibkr()
+    if not ib:
+        return {}
+
+    sub = ScannerSubscription(
+        instrument="STK",
+        locationCode="STK.US.MAJOR",
+        scanCode=MONITOR_SCAN_CODE,
+        numberOfRows=MONITOR_SCAN_MAX_RESULTS,
+        abovePrice=price_min,
+        belowPrice=price_max,
+    )
+
     try:
-        return pytesseract.image_to_string(gray, config='--psm 6')
+        results = ib.reqScannerData(sub)
     except Exception as e:
-        log.error(f"OCR: {e}")
-        return ""
+        log.error(f"reqScannerData failed: {e}")
+        return {}
 
+    stocks: dict[str, dict] = {}
 
-def parse_scanner_data(text: str) -> dict:
-    stocks = {}
-    for line in text.strip().split('\n'):
-        if not line.strip():
-            continue
-        tickers = [t for t in TICKER_RE.findall(line)
-                    if t not in NOT_TICKERS and len(t) >= 2]
-        if not tickers:
+    for item in results:
+        contract = item.contractDetails.contract
+        sym = contract.symbol
+        if not sym or not sym.isalpha() or len(sym) > 5:
             continue
 
-        symbol = tickers[0]
+        # Enrich with 2-day historical data for price, change%, volume
+        try:
+            stock_contract = Stock(sym, "SMART", "USD")
+            ib.qualifyContracts(stock_contract)
+            bars = ib.reqHistoricalData(
+                stock_contract,
+                endDateTime="",
+                durationStr="2 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+            )
+            if not bars:
+                continue
 
-        # Percentage
-        pct = 0.0
-        pcts = PCT_RE.findall(line)
-        if pcts:
-            try:
-                pct = float(pcts[0].replace(' ', ''))
-            except ValueError:
-                pass
+            last_bar = bars[-1]
+            price = last_bar.close
+            volume = last_bar.volume
 
-        # Price — remove %, M/K numbers, then find decimal or integer
-        line_clean = re.sub(r'[+-]?\s*\d{1,4}\.?\d{0,2}\s*%', '', line)
-        line_clean = re.sub(r'\d{1,6}\.?\d{0,2}\s*[MmKk™]', '', line_clean)
-        line_clean = re.sub(r'\b[A-Z]{1,5}\b', '', line_clean)
-
-        price_candidates = re.findall(r'(\d{1,5}\.\d{1,4})', line_clean)
-        if price_candidates:
-            price = float(price_candidates[0])
-        else:
-            int_candidates = re.findall(r'\b(\d{3,5})\b', line_clean)
-            if int_candidates:
-                raw = int_candidates[0]
-                price = float(raw[0] + '.' + raw[1:]) if len(raw) == 4 else float('0.' + raw) if len(raw) == 3 else float(raw) / 100
+            # Calculate change% from previous close
+            if len(bars) >= 2:
+                prev_close = bars[-2].close
+                pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
             else:
-                price = 0.0
+                pct = 0.0
 
-        # Volume & Float (M/K numbers)
-        mk = NUM_MK_RE.findall(line)
-        volume = f"{mk[0][0]}{mk[0][1].upper().replace('™','M')}" if len(mk) > 0 else ''
-        free_float = f"{mk[1][0]}{mk[1][1].upper().replace('™','M')}" if len(mk) > 1 else ''
+            # Format volume (e.g. 2.3M, 890K)
+            if volume >= 1_000_000:
+                vol_str = f"{volume / 1_000_000:.1f}M"
+            elif volume >= 1_000:
+                vol_str = f"{volume / 1_000:.0f}K"
+            else:
+                vol_str = str(int(volume))
 
-        stocks[symbol] = {
-            'price': price, 'pct': pct,
-            'volume': volume, 'float': free_float,
-            'raw': line.strip(),
-        }
+            stocks[sym] = {
+                "price": round(price, 2),
+                "pct": round(pct, 1),
+                "volume": vol_str,
+                "volume_raw": int(volume),
+                "float": "",
+            }
+
+        except Exception as e:
+            log.debug(f"Enrich {sym} failed: {e}")
+            continue
+
+        time.sleep(0.05)  # light rate-limit between historical requests
+
+    log.info(f"Scanner: {len(results)} raw → {len(stocks)} enriched symbols")
     return stocks
 
 
@@ -289,7 +305,6 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
 def format_stock_info(symbol: str, info: dict) -> str:
     """Format fundamentals + news for Telegram (Hebrew)."""
     f = info.get('fundamentals', {})
-    news = info.get('news', [])
 
     # Earnings indicator
     eps = f.get('eps', '-')
@@ -318,36 +333,373 @@ def format_news_only(symbol: str, news: list[dict]) -> str:
 
 
 # ══════════════════════════════════════════════════════════
+#  Milestone Alerts (+5% steps for stocks ≥20%)
+# ══════════════════════════════════════════════════════════
+
+MILESTONE_START_PCT = 20.0  # only track stocks above this %
+MILESTONE_STEP_PCT = 5.0    # alert every 5% step
+
+# {symbol: last milestone alerted (e.g. 25, 30, 35...)}
+_milestone_alerted: dict[str, float] = {}
+
+
+def check_milestone(sym: str, pct: float) -> str | None:
+    """Check if stock crossed the next +5% milestone.
+
+    Returns alert message or None.
+    E.g. stock at +27% → milestone 25. If last alerted was 20 → alert for 25.
+    """
+    if pct < MILESTONE_START_PCT:
+        return None
+
+    current_milestone = int(pct // MILESTONE_STEP_PCT) * MILESTONE_STEP_PCT
+    last = _milestone_alerted.get(sym, MILESTONE_START_PCT - MILESTONE_STEP_PCT)
+
+    if current_milestone > last:
+        _milestone_alerted[sym] = current_milestone
+        return (
+            f"📈 <b>{sym}</b> חצה +{current_milestone:.0f}%!\n"
+            f"  נוכחי: {pct:+.1f}%"
+        )
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+#  Volume Anomaly Detection
+# ══════════════════════════════════════════════════════════
+
+HIGH_TURNOVER_PCT = 10.0  # volume > 10% of float = unusual
+
+# {symbol} — already alerted for high volume this session
+_vol_alerted: set[str] = set()
+
+
+def _parse_float_to_shares(flt_str: str) -> float:
+    """Parse Finviz float string like '2.14M' or '120.5K' to share count."""
+    if not flt_str or flt_str == '-':
+        return 0
+    flt_str = flt_str.strip().upper()
+    try:
+        if flt_str.endswith('B'):
+            return float(flt_str[:-1]) * 1_000_000_000
+        if flt_str.endswith('M'):
+            return float(flt_str[:-1]) * 1_000_000
+        if flt_str.endswith('K'):
+            return float(flt_str[:-1]) * 1_000
+        return float(flt_str)
+    except (ValueError, TypeError):
+        return 0
+
+
+def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
+    """Check if volume is unusually high relative to float.
+
+    Returns alert message or None. Only alerts once per symbol per session.
+    """
+    if sym in _vol_alerted:
+        return None
+
+    float_shares = _parse_float_to_shares(enrich.get('float', '-'))
+    if float_shares <= 0 or volume_raw <= 0:
+        return None
+
+    turnover_pct = (volume_raw / float_shares) * 100
+
+    if turnover_pct >= HIGH_TURNOVER_PCT:
+        _vol_alerted.add(sym)
+        return (
+            f"🔥 <b>{sym}</b> — ווליום חריג!\n"
+            f"  Vol: {volume_raw:,.0f}  |  Float: {enrich['float']}\n"
+            f"  Turnover: {turnover_pct:.0f}% מהפלוט"
+        )
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+#  Stock Enrichment Cache (Finviz + Fib)
+# ══════════════════════════════════════════════════════════
+
+# {symbol: {float, short, eps, income, earnings, cash, fib_below, fib_above, news}}
+_enrichment: dict[str, dict] = {}
+
+
+def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
+    """Fetch Finviz fundamentals + Fib levels for a stock. Cached.
+
+    Returns enrichment dict and sends Telegram alert with full report.
+    """
+    if sym in _enrichment:
+        return _enrichment[sym]
+
+    data = {
+        'float': '-', 'short': '-', 'eps': '-',
+        'income': '-', 'earnings': '-', 'cash': '-',
+        'fib_below': [], 'fib_above': [], 'news': [],
+    }
+
+    # ── Finviz fundamentals + news ──
+    if on_status:
+        on_status(f"Enriching {sym}... (Finviz)")
+    try:
+        info = fetch_stock_info(sym)
+        f = info.get('fundamentals', {})
+        data['float'] = f.get('float', '-')
+        data['short'] = f.get('short_float', '-')
+        data['eps'] = f.get('eps', '-')
+        data['income'] = f.get('income', '-')
+        data['earnings'] = f.get('earnings_date', '-')
+        data['cash'] = f.get('cash_per_share', '-')
+        data['news'] = info.get('news', [])
+    except Exception as e:
+        log.error(f"Finviz {sym}: {e}")
+
+    # ── Fibonacci levels ──
+    if price > 0:
+        if on_status:
+            on_status(f"Enriching {sym}... (Fib)")
+        try:
+            below, above = calc_fib_levels(sym, price)
+            data['fib_below'] = below
+            data['fib_above'] = above
+        except Exception as e:
+            log.error(f"Fib {sym}: {e}")
+
+    _enrichment[sym] = data
+    log.info(f"Enriched {sym}: float={data['float']} short={data['short']} fib={len(data['fib_below'])}↓{len(data['fib_above'])}↑")
+    return data
+
+
+def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
+                       current_price: float, stock: dict | None = None,
+                       enriched: dict | None = None) -> Path | None:
+    """Generate a candlestick chart with Fibonacci levels overlay.
+
+    When ``stock`` and ``enriched`` are provided, an info panel with
+    fundamentals and news is rendered below the chart.
+
+    Returns path to saved PNG or None on failure.
+    """
+    try:
+        # Crop to last ~60 trading days
+        df = df.tail(60).copy()
+        if len(df) < 5:
+            return None
+
+        has_info = stock is not None and enriched is not None
+
+        if has_info:
+            fig = plt.figure(figsize=(14, 11), facecolor='#0e1117')
+            gs = gridspec.GridSpec(2, 1, height_ratios=[2.8, 1.4], hspace=0.04)
+            ax = fig.add_subplot(gs[0])
+            ax2 = fig.add_subplot(gs[1])
+        else:
+            fig, ax = plt.subplots(figsize=(12, 7), facecolor='#0e1117')
+
+        ax.set_facecolor('#0e1117')
+
+        # X-axis as integer indices, labeled with dates
+        x = np.arange(len(df))
+        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
+
+        # Draw candlesticks
+        width = 0.6
+        for i, (_, row) in enumerate(df.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = '#26a69a' if c >= o else '#ef5350'  # green / red
+
+            # Wick (high-low line)
+            ax.plot([i, i], [l, h], color=color, linewidth=0.8)
+            # Body
+            body_bottom = min(o, c)
+            body_height = abs(c - o)
+            if body_height < 0.001:
+                body_height = 0.001
+            ax.bar(i, body_height, bottom=body_bottom, width=width,
+                   color=color, edgecolor=color, linewidth=0.5)
+
+        # Filter fib levels to visible price range (with margin)
+        price_min = df['low'].min()
+        price_max = df['high'].max()
+        margin = (price_max - price_min) * 0.15
+        vis_min = price_min - margin
+        vis_max = price_max + margin
+
+        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
+
+        # Draw fib levels
+        for lv in visible_levels:
+            color = '#2196F3' if lv <= current_price else '#FF9800'  # blue below, orange above
+            ax.axhline(y=lv, color=color, linewidth=0.7, alpha=0.7, linestyle='-')
+            ax.text(len(df) - 0.5, lv, f' ${lv:.4f}', color=color,
+                    fontsize=7, va='center', ha='left', fontweight='bold')
+
+        # Current price line
+        ax.axhline(y=current_price, color='white', linewidth=1.2,
+                    linestyle='--', alpha=0.9)
+        ax.text(0, current_price, f' ${current_price:.2f} ',
+                color='white', fontsize=8, va='bottom', ha='left',
+                fontweight='bold', bbox=dict(boxstyle='round,pad=0.2',
+                facecolor='#0e1117', edgecolor='white', alpha=0.8))
+
+        # X-axis date labels
+        tick_step = max(1, len(df) // 10)
+        tick_positions = list(range(0, len(df), tick_step))
+        tick_labels = []
+        date_list = list(dates)
+        for pos in tick_positions:
+            d = date_list[pos]
+            if hasattr(d, 'strftime'):
+                tick_labels.append(d.strftime('%m/%d'))
+            else:
+                tick_labels.append(str(d)[:5])
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, color='#888', fontsize=8)
+
+        # Styling
+        ax.set_ylim(vis_min, vis_max)
+        ax.set_xlim(-1, len(df) + 3)
+        ax.tick_params(colors='#888', labelsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color('#333')
+        ax.spines['left'].set_color('#333')
+        ax.yaxis.label.set_color('#888')
+        ax.set_title(f'{sym} — Fibonacci (${current_price:.2f})',
+                     color='white', fontsize=14, fontweight='bold', pad=12)
+        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
+
+        # ── Info panel (fundamentals + news) ──
+        if has_info:
+            ax2.set_facecolor('#0e1117')
+            ax2.set_xlim(0, 1)
+            ax2.set_ylim(0, 1)
+            ax2.axis('off')
+
+            pct = stock.get('pct', 0)
+            vol = stock.get('volume', '-')
+            header = f"{sym} \u2014 ${stock['price']:.2f}  {pct:+.1f}%  Vol:{vol}"
+
+            eps = enriched.get('eps', '-')
+            fund_line = (
+                f"Float: {enriched.get('float', '-')}  |  "
+                f"Short: {enriched.get('short', '-')}  |  "
+                f"EPS: {eps}  |  "
+                f"Cash: ${enriched.get('cash', '-')}"
+            )
+            fund_line2 = (
+                f"Income: {enriched.get('income', '-')}  |  "
+                f"Earnings: {enriched.get('earnings', '-')}"
+            )
+
+            sep = "\u2500" * 46
+
+            lines = [header, sep, fund_line, fund_line2]
+
+            news = enriched.get('news', [])
+            if news:
+                lines.append(sep)
+                for n in news[:3]:
+                    title = n.get('title_he', '')
+                    if len(title) > 70:
+                        title = title[:67] + "..."
+                    date = n.get('date', '')
+                    lines.append(f"  \u2022 {_bidi(title)}  ({date})")
+
+            info_text = "\n".join(lines)
+            ax2.text(
+                0.03, 0.95, info_text,
+                transform=ax2.transAxes,
+                fontsize=13,
+                fontfamily='DejaVu Sans',
+                fontweight='bold',
+                color='white',
+                verticalalignment='top',
+                horizontalalignment='left',
+                linespacing=1.7,
+            )
+
+        out_path = Path(f'/tmp/fib_{sym}.png')
+        fig.savefig(out_path, dpi=100, bbox_inches='tight',
+                    facecolor='#0e1117', edgecolor='none')
+        plt.close(fig)
+        log.info(f"Fib chart saved: {out_path}")
+        return out_path
+
+    except Exception as e:
+        log.error(f"generate_fib_chart {sym}: {e}")
+        plt.close('all')
+        return None
+
+
+def _send_stock_report(sym: str, stock: dict, enriched: dict):
+    """Send comprehensive Telegram report for a newly discovered stock."""
+    msgs = []
+
+    # 1. Alert line
+    msgs.append(
+        f"🆕 <b>{sym}</b> — ${stock['price']:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume','-')}"
+    )
+
+    # 2. Fundamentals
+    eps = enriched.get('eps', '-')
+    try:
+        eps_val = float(str(eps).replace(',', ''))
+        eps_icon = "🟢" if eps_val > 0 else "🔴"
+    except (ValueError, TypeError):
+        eps_icon = "⚪"
+
+    fund_lines = [f"📊 <b>{sym} — נתונים</b>"]
+    fund_lines.append(f"  Float: {enriched['float']}  |  Short: {enriched['short']}")
+    fund_lines.append(f"  {eps_icon} EPS: {eps}  |  Cash: ${enriched['cash']}")
+    fund_lines.append(f"  Income: {enriched['income']}  |  Earnings: {enriched['earnings']}")
+    msgs.append("\n".join(fund_lines))
+
+    # 3. News (Hebrew)
+    if enriched['news']:
+        news_lines = [f"📰 <b>{sym} — חדשות:</b>"]
+        for n in enriched['news']:
+            news_lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
+        msgs.append("\n".join(news_lines))
+
+    # 4. Fib levels
+    below = enriched.get('fib_below', [])
+    above = enriched.get('fib_above', [])
+    if below or above:
+        fib_lines = [f"📐 <b>{sym} — פיבונאצ'י</b>  (${stock['price']:.2f})"]
+        if above:
+            fib_lines.append(f"  ⬆️ מעל: {'  '.join(f'${p:.4f}' for p in above)}")
+        if below:
+            fib_lines.append(f"  ⬇️ מתחת: {'  '.join(f'${p:.4f}' for p in below)}")
+        msgs.append("\n".join(fib_lines))
+
+    for m in msgs:
+        send_telegram(m)
+
+    # 5. Fib chart image
+    df = _daily_cache.get(sym)
+    cached = _fib_cache.get(sym)
+    if df is not None and cached:
+        all_levels = cached[2]
+        img = generate_fib_chart(sym, df, all_levels, stock['price'],
+                                     stock=stock, enriched=enriched)
+        if img:
+            send_telegram_photo(img, f"📐 {sym} — Fibonacci ${stock['price']:.2f}")
+
+
+# ══════════════════════════════════════════════════════════
 #  Fibonacci Levels (WTS Method)
 # ══════════════════════════════════════════════════════════
 
 # Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted)}
 _fib_cache: dict[str, tuple[float, float, list[float]]] = {}
 
-
-_ibkr_fib: IB | None = None
-_IBKR_FIB_CLIENT = 10
-
-
-def _get_ibkr_fib() -> IB | None:
-    """Get/create a dedicated IBKR connection for Fibonacci data."""
-    global _ibkr_fib
-    if _ibkr_fib and _ibkr_fib.isConnected():
-        return _ibkr_fib
-    try:
-        _ibkr_fib = IB()
-        _ibkr_fib.connect(IBKR_HOST, IBKR_PORT, clientId=_IBKR_FIB_CLIENT, timeout=5)
-        log.info("IBKR Fib connection established")
-        return _ibkr_fib
-    except Exception as e:
-        log.warning(f"IBKR Fib connect failed: {e}")
-        _ibkr_fib = None
-        return None
+# Cache daily DataFrames for chart generation (filled by _download_daily)
+_daily_cache: dict[str, pd.DataFrame] = {}
 
 
 def _download_daily(symbol: str) -> pd.DataFrame | None:
     """Download 5 years daily data from IBKR."""
-    ib = _get_ibkr_fib()
+    ib = _get_ibkr()
     if not ib:
         log.error(f"No IBKR connection for {symbol} daily download")
         return None
@@ -362,6 +714,7 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
             df = ib_util.df(bars)
             if len(df) >= 5:
                 log.info(f"IBKR: {symbol} {len(df)} daily bars")
+                _daily_cache[symbol] = df
                 return df
     except Exception as e:
         log.warning(f"IBKR download {symbol}: {e}")
@@ -577,6 +930,24 @@ def send_telegram(text: str) -> bool:
         return False
 
 
+def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
+    """Send a photo to Telegram via multipart upload."""
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
+    try:
+        with open(image_path, 'rb') as photo:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
+                files={'photo': photo},
+                timeout=30,
+            )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram photo: {e}")
+        return False
+
+
 # ══════════════════════════════════════════════════════════
 #  File Logger
 # ══════════════════════════════════════════════════════════
@@ -587,13 +958,12 @@ class FileLogger:
             with open(LOG_CSV, 'w', newline='') as f:
                 csv.writer(f).writerow(['timestamp', 'event', 'symbol', 'price', 'pct', 'volume', 'float', 'detail'])
 
-    def log_scan(self, ts, stocks, raw_text):
+    def log_scan(self, ts, stocks):
         with open(LOG_TXT, 'a', encoding='utf-8') as f:
             f.write(f"\n{'='*60}\n")
             f.write(f"SCAN: {ts}  |  {len(stocks)} symbols\n")
             for sym, d in sorted(stocks.items()):
                 f.write(f"  {sym:<6} {d['pct']:>+7.1f}%  ${d['price']:<8.2f}  Vol:{d.get('volume',''):>8}  Float:{d.get('float','')}\n")
-            f.write(f"OCR: {raw_text[:200]}...\n")
 
     def log_alert(self, ts, alert):
         with open(LOG_TXT, 'a', encoding='utf-8') as f:
@@ -612,76 +982,20 @@ file_logger = FileLogger()
 
 
 # ══════════════════════════════════════════════════════════
-#  Window Tracker (wmctrl)
+#  Scanner Thread (replaces MonitorThread)
 # ══════════════════════════════════════════════════════════
 
-def list_windows() -> list[dict]:
-    """List all open windows with geometry via wmctrl."""
-    try:
-        r = subprocess.run(['wmctrl', '-lG'], capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            return []
-    except Exception:
-        return []
-
-    windows = []
-    for line in r.stdout.strip().split('\n'):
-        if not line.strip():
-            continue
-        parts = line.split(None, 7)
-        if len(parts) < 8:
-            continue
-        wid = parts[0]
-        x, y, w, h = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
-        title = parts[7]
-
-        if 'Screen Monitor' in title:
-            continue
-
-        windows.append({
-            'wid': wid,
-            'x': x, 'y': y, 'w': w, 'h': h,
-            'title': title,
-        })
-
-    return windows
-
-
-def get_window_bbox(wid: str) -> tuple[int,int,int,int] | None:
-    """Get current bbox (x, y, x2, y2) for a window. None if gone/minimized."""
-    try:
-        r = subprocess.run(['wmctrl', '-lG'], capture_output=True, text=True, timeout=5)
-        for line in r.stdout.strip().split('\n'):
-            parts = line.split(None, 7)
-            if len(parts) >= 6 and parts[0] == wid:
-                x, y, w, h = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
-                if w > 10 and h > 10 and x >= 0 and y >= 0:
-                    return (x, y, x + w, y + h)
-    except Exception:
-        pass
-    return None
-
-
-def find_window_by_title(title: str) -> dict | None:
-    """Find a window by title substring (for reconnecting after restart)."""
-    for w in list_windows():
-        if title in w['title']:
-            return w
-    return None
-
-
-# ══════════════════════════════════════════════════════════
-#  Monitor Thread
-# ══════════════════════════════════════════════════════════
-
-class MonitorThread(threading.Thread):
-    def __init__(self, tracked_windows: list[dict], freq: int, on_status=None):
+class ScannerThread(threading.Thread):
+    def __init__(self, freq: int, price_min: float, price_max: float,
+                 on_status=None, on_stocks=None):
         super().__init__(daemon=True)
-        self.tracked = tracked_windows  # [{'wid': ..., 'title': ...}, ...]
         self.freq = freq
+        self.price_min = price_min
+        self.price_max = price_max
         self.on_status = on_status
+        self.on_stocks = on_stocks  # callback(dict) to update GUI table
         self.running = False
-        self.previous = {}
+        self.previous: dict = {}
         self.count = 0
 
     def stop(self):
@@ -689,51 +1003,24 @@ class MonitorThread(threading.Thread):
 
     def run(self):
         self.running = True
-        titles = [w['title'][:30] for w in self.tracked]
-        log.info(f"Monitoring {len(self.tracked)} windows: {titles}")
+        log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
         while self.running:
             try:
                 self._cycle()
             except Exception as e:
-                log.error(f"Error: {e}")
+                log.error(f"Scanner cycle error: {e}")
+                if self.on_status:
+                    self.on_status(f"Error: {e}")
             for _ in range(self.freq):
-                if not self.running: break
+                if not self.running:
+                    break
                 time.sleep(1)
 
-    def _capture_windows(self) -> tuple[dict, str]:
-        """Capture all tracked windows, OCR each, merge stocks."""
-        all_stocks = {}
-        all_text = ""
-        captured = 0
-
-        for tw in self.tracked:
-            bbox = get_window_bbox(tw['wid'])
-            if not bbox:
-                # Window might have restarted — try to find by title
-                found = find_window_by_title(tw['title'])
-                if found:
-                    tw['wid'] = found['wid']
-                    bbox = (found['x'], found['y'],
-                            found['x'] + found['w'], found['y'] + found['h'])
-                else:
-                    continue
-
-            crop = take_screenshot(bbox=bbox)
-            if not crop:
-                continue
-
-            captured += 1
-            text = ocr_image(crop)
-            all_text += text + "\n"
-            stocks = parse_scanner_data(text)
-            all_stocks.update(stocks)
-
-        log.debug(f"Captured {captured}/{len(self.tracked)} windows, {len(all_stocks)} stocks")
-        return all_stocks, all_text
-
     def _cycle(self):
-        current, raw_text = self._capture_windows()
+        current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
+            if self.on_status:
+                self.on_status("No data from scanner")
             return
 
         self.count += 1
@@ -742,70 +1029,123 @@ class MonitorThread(threading.Thread):
         for sym, d in current.items():
             stock_history.record(sym, d['price'], d['pct'])
 
-        file_logger.log_scan(ts, current, raw_text)
+        file_logger.log_scan(ts, current)
 
-        active = sum(1 for tw in self.tracked if get_window_bbox(tw['wid']))
-        status = f"#{self.count}  {active}/{len(self.tracked)} win  {len(current)} sym"
+        # ── Immediate GUI update with scan data + any cached enrichment ──
+        merged = {}
+        for sym, d in current.items():
+            merged[sym] = dict(d)
+            if sym in _enrichment:
+                merged[sym]['enrich'] = _enrichment[sym]
+        if self.on_stocks and merged:
+            self.on_stocks(merged)
 
-        if self.previous and current:
+        status = f"#{self.count}  {len(current)} stocks"
+
+        is_baseline = not self.previous
+
+        # ── Determine which stocks need enrichment ──
+        if is_baseline:
+            # First scan: enrich ALL for GUI, but NO Telegram flood
+            new_syms = list(current.keys())
+        else:
+            # Subsequent: only truly new stocks
+            new_syms = list(set(current) - set(self.previous))
+
+        # ── Enrich stocks (Finviz + Fib) ──
+        enriched_count = 0
+        for sym in new_syms:
+            if sym in _enrichment:
+                continue
+            d = current[sym]
+            if self.on_status:
+                self.on_status(f"#{self.count}  Enriching {sym}... ({enriched_count+1}/{len(new_syms)})")
+            _enrich_stock(sym, d['price'], on_status=self.on_status)
+
+            if not is_baseline:
+                # Only send Telegram for NEW stocks after baseline
+                _send_stock_report(sym, d, _enrichment[sym])
+                file_logger.log_alert(ts, {
+                    'type': 'new', 'symbol': sym,
+                    'price': d['price'], 'pct': d['pct'],
+                    'volume': d.get('volume', ''),
+                    'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
+                })
+
+            enriched_count += 1
+            # Live-update GUI after each enrichment
+            if self.on_stocks:
+                merged = {}
+                for s, dd in current.items():
+                    merged[s] = dict(dd)
+                    if s in _enrichment:
+                        merged[s]['enrich'] = _enrichment[s]
+                self.on_stocks(merged)
+            if not self.running:
+                return
+
+        if enriched_count:
+            status += f"  +{enriched_count} enriched"
+
+        # ── Baseline: send single summary to Telegram ──
+        if is_baseline and current:
+            top5 = sorted(current.items(), key=lambda x: x[1]['pct'], reverse=True)[:5]
+            summary_lines = [f"📡 <b>Scanner started</b> — {len(current)} stocks"]
+            for sym, d in top5:
+                e = _enrichment.get(sym, {})
+                flt = e.get('float', '-')
+                short = e.get('short', '-')
+                summary_lines.append(
+                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
+                )
+            if len(current) > 5:
+                summary_lines.append(f"  ... +{len(current)-5} more")
+            send_telegram("\n".join(summary_lines))
+
+        # ── Anomaly detection (only after baseline) ──
+        if not is_baseline and current:
             alerts = detect_anomalies(current, self.previous)
-            if alerts:
+            # Filter: only price/pct jumps (new stocks handled above)
+            jump_alerts = [a for a in alerts if a['type'] != 'new']
+            if jump_alerts:
                 header = f"🔔 <b>Alert</b> — {datetime.now().strftime('%H:%M:%S')}\n"
-                alert_lines = []
-                news_msgs = []
-
-                for a in alerts:
+                lines = []
+                for a in jump_alerts:
                     sym = a.get('symbol', '')
                     line = a['msg']
-
                     mom = stock_history.format_momentum(sym)
                     if mom:
                         line += f"\n   📊 {mom}"
-                    alert_lines.append(line)
-
-                    if a.get('fetch_news'):
-                        price = a.get('price', 0)
-                        try:
-                            info = fetch_stock_info(sym)
-                            # Order: Fundamentals → News → Fib
-                            if info['fundamentals']:
-                                news_msgs.append(format_stock_info(sym, info))
-                            if info['news']:
-                                nm = format_news_only(sym, info['news'])
-                                if nm:
-                                    news_msgs.append(nm)
-                        except Exception as e:
-                            log.error(f"Finviz error {sym}: {e}")
-                        if price > 0:
-                            try:
-                                below, above = calc_fib_levels(sym, price)
-                                if below or above:
-                                    news_msgs.append(format_fib_levels(sym, price, below, above))
-                            except Exception as e:
-                                log.error(f"Fib error {sym}: {e}")
-
+                    lines.append(line)
                     file_logger.log_alert(ts, a)
-
-                send_telegram(header + "\n".join(alert_lines))
-                for nm in news_msgs:
-                    send_telegram(nm)
-
-                status += f"  🔔 {len(alerts)}"
+                send_telegram(header + "\n".join(lines))
+                status += f"  🔔{len(jump_alerts)}"
             else:
                 status += "  ✓"
-        elif current:
-            status += "  (baseline)"
 
-        # Check fib touches for all known stocks
+        # ── Milestone alerts (+5% steps) ──
         for sym, d in current.items():
-            if d['price'] > 0:
-                try:
-                    touch_msg = check_fib_touch(sym, d['price'])
-                    if touch_msg:
-                        send_telegram(touch_msg)
-                        status += f"  📐{sym}"
-                except Exception as e:
-                    log.error(f"Fib touch {sym}: {e}")
+            ms_msg = check_milestone(sym, d['pct'])
+            if ms_msg:
+                send_telegram(ms_msg)
+                status += f"  📈{sym}"
+
+        # ── Volume anomaly checks ──
+        for sym, d in current.items():
+            if sym in _enrichment and d.get('volume_raw', 0) > 0:
+                vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
+                if vol_msg:
+                    send_telegram(vol_msg)
+                    status += f"  🔥{sym}"
+
+        # ── Merge enrichment into stock data for GUI ──
+        merged = {}
+        for sym, d in current.items():
+            merged[sym] = dict(d)  # copy
+            if sym in _enrichment:
+                merged[sym]['enrich'] = _enrichment[sym]
+        if self.on_stocks and merged:
+            self.on_stocks(merged)
 
         self.previous = current
         if self.on_status:
@@ -824,48 +1164,58 @@ class App:
     GREEN = "#00c853"
     RED = "#ff1744"
     ROW_BG = "#2d2d44"
+    ROW_ALT = "#1a1a2e"
 
     def __init__(self):
-        self.monitor = None
-        self.windows = []       # [{wid, title, w, h, ...}, ...]
-        self.check_vars = []    # [BooleanVar, ...]
+        self.scanner = None
+        self._stock_data: dict = {}  # current scan results for table display
 
         self.root = tk.Tk()
-        self.root.title("Screen Monitor")
-        self.root.geometry("520x500")
+        self.root.title("IBKR Scanner Monitor")
+        self.root.geometry("680x620")
         self.root.attributes('-topmost', True)
         self.root.configure(bg=self.BG, highlightbackground=self.ACCENT,
                             highlightcolor=self.ACCENT, highlightthickness=3)
         self.root.resizable(False, False)
 
         # Header
-        tk.Label(self.root, text="SCREEN MONITOR", font=("Helvetica", 18, "bold"),
+        tk.Label(self.root, text="IBKR SCANNER MONITOR", font=("Helvetica", 18, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(pady=(10, 0))
-        tk.Label(self.root, text="Window Tracker  |  Anomaly  |  Fib  |  Telegram",
+        tk.Label(self.root, text="Scanner  |  Anomaly  |  Fib  |  Telegram",
                  font=("Helvetica", 9), bg=self.BG, fg="#888").pack()
 
         tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=8)
 
-        # Window list header
-        fh = tk.Frame(self.root, bg=self.BG)
-        fh.pack(fill='x', padx=12)
-        tk.Label(fh, text="Windows:", font=("Helvetica", 11, "bold"),
-                 bg=self.BG, fg=self.FG).pack(side='left')
-        tk.Button(fh, text="Refresh", command=self._refresh_windows,
-                  bg=self.ROW_BG, fg=self.ACCENT, font=("Helvetica", 9, "bold"),
-                  relief='flat', padx=8, activebackground="#3d3d55").pack(side='right')
+        # Connection status
+        self.conn_var = tk.StringVar(value="IBKR: Checking...")
+        self.conn_label = tk.Label(self.root, textvariable=self.conn_var,
+                                   font=("Courier", 10, "bold"), bg=self.BG, fg="#888")
+        self.conn_label.pack(padx=12, anchor='w')
 
-        # Scrollable window list
+        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=12, pady=4)
+
+        # Stock table header
+        tk.Label(self.root, text="Tracked Stocks:", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.FG).pack(padx=12, anchor='w')
+
+        # Column headers
+        hdr_frame = tk.Frame(self.root, bg=self.BG)
+        hdr_frame.pack(fill='x', padx=12)
+        for text, w in [("SYM", 6), ("PRICE", 8), ("CHG%", 8), ("VOL", 7), ("FLOAT", 9), ("SHORT", 7)]:
+            tk.Label(hdr_frame, text=text, font=("Courier", 9, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+
+        # Scrollable stock list
         list_frame = tk.Frame(self.root, bg=self.BG)
-        list_frame.pack(fill='both', expand=True, padx=12, pady=4)
+        list_frame.pack(fill='both', expand=True, padx=12, pady=2)
 
-        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=220)
+        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=250)
         scrollbar = tk.Scrollbar(list_frame, orient='vertical', command=self.canvas.yview)
-        self.win_frame = tk.Frame(self.canvas, bg=self.BG)
+        self.stock_frame = tk.Frame(self.canvas, bg=self.BG)
 
-        self.win_frame.bind('<Configure>',
+        self.stock_frame.bind('<Configure>',
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.create_window((0, 0), window=self.win_frame, anchor='nw')
+        self.canvas.create_window((0, 0), window=self.stock_frame, anchor='nw')
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
         self.canvas.pack(side='left', fill='both', expand=True)
@@ -873,23 +1223,41 @@ class App:
 
         tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=6)
 
-        # Settings row
-        fs = tk.Frame(self.root, bg=self.BG)
-        fs.pack(fill='x', padx=12, pady=2)
+        # Settings row 1: Freq + Alert %
+        fs1 = tk.Frame(self.root, bg=self.BG)
+        fs1.pack(fill='x', padx=12, pady=2)
 
-        tk.Label(fs, text="Freq (s):", font=("Helvetica", 10),
+        tk.Label(fs1, text="Freq (s):", font=("Helvetica", 10),
                  bg=self.BG, fg=self.FG).pack(side='left')
-        self.freq = tk.IntVar(value=60)
-        tk.Spinbox(fs, from_=10, to=600, increment=10, textvariable=self.freq,
+        self.freq = tk.IntVar(value=MONITOR_DEFAULT_FREQ)
+        tk.Spinbox(fs1, from_=10, to=600, increment=10, textvariable=self.freq,
                    width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(2, 15))
 
-        tk.Label(fs, text="Alert %:", font=("Helvetica", 10),
+        tk.Label(fs1, text="Alert %:", font=("Helvetica", 10),
                  bg=self.BG, fg=self.FG).pack(side='left')
-        self.thresh = tk.DoubleVar(value=5.0)
-        tk.Spinbox(fs, from_=1, to=50, increment=1, textvariable=self.thresh,
+        self.thresh = tk.DoubleVar(value=MONITOR_DEFAULT_ALERT_PCT)
+        tk.Spinbox(fs1, from_=1, to=50, increment=1, textvariable=self.thresh,
                    width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=2)
+
+        # Settings row 2: Price Min + Max
+        fs2 = tk.Frame(self.root, bg=self.BG)
+        fs2.pack(fill='x', padx=12, pady=2)
+
+        tk.Label(fs2, text="Price Min:", font=("Helvetica", 10),
+                 bg=self.BG, fg=self.FG).pack(side='left')
+        self.price_min = tk.DoubleVar(value=MONITOR_PRICE_MIN)
+        tk.Spinbox(fs2, from_=0.01, to=100, increment=0.5, textvariable=self.price_min,
+                   width=6, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(2, 15))
+
+        tk.Label(fs2, text="Price Max:", font=("Helvetica", 10),
+                 bg=self.BG, fg=self.FG).pack(side='left')
+        self.price_max = tk.DoubleVar(value=MONITOR_PRICE_MAX)
+        tk.Spinbox(fs2, from_=1, to=500, increment=1, textvariable=self.price_max,
+                   width=6, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=2)
 
         # Start/Stop
         self.btn = tk.Button(self.root, text="START", font=("Helvetica", 14, "bold"),
@@ -898,95 +1266,146 @@ class App:
         self.btn.pack(fill='x', padx=12, ipady=5, pady=(6, 0))
 
         # Status
-        self.status = tk.StringVar(value="Refreshing windows...")
+        self.status = tk.StringVar(value="Ready")
         tk.Label(self.root, textvariable=self.status, font=("Courier", 9),
-                 bg=self.BG, fg="#888", wraplength=490, justify='left'
+                 bg=self.BG, fg="#888", wraplength=650, justify='left'
                  ).pack(padx=12, pady=6, anchor='w')
 
         self._load()
-        self.root.after(300, self._refresh_windows)
+        self.root.after(500, self._check_connection)
 
-    def _refresh_windows(self):
-        """Scan for open windows and display as checkboxes."""
-        saved_titles = self._load_selected_titles()
+    def _check_connection(self):
+        """Check IBKR connection status (read-only, never creates connection).
 
-        for w in self.win_frame.winfo_children():
+        The scanner thread owns the IB connection — creating it from the
+        main/tkinter thread would break ib_insync's event loop threading.
+        """
+        if _ibkr and _ibkr.isConnected():
+            self.conn_var.set("IBKR: Connected ✓")
+            self.conn_label.config(fg=self.GREEN)
+        elif _ibkr:
+            self.conn_var.set("IBKR: Disconnected ✗")
+            self.conn_label.config(fg=self.RED)
+        else:
+            self.conn_var.set("IBKR: Not connected")
+            self.conn_label.config(fg="#888")
+        # Re-check every 5 seconds
+        self.root.after(5_000, self._check_connection)
+
+    def _update_stock_table(self, stocks: dict):
+        """Update the stock table in the GUI (called from scanner thread)."""
+        self._stock_data = stocks
+        self.root.after(0, self._render_stock_table)
+
+    def _render_stock_table(self):
+        """Render the stock table from self._stock_data.
+
+        Each stock gets two lines:
+          Line 1: SYM  $PRICE  +CHG%  VOL  FLOAT  SHORT%
+          Line 2:   Fib ⬆ $X.XX  $X.XX  $X.XX  |  Fib ⬇ $X.XX  $X.XX
+        """
+        for w in self.stock_frame.winfo_children():
             w.destroy()
-        self.windows = list_windows()
-        self.check_vars = []
 
-        if not self.windows:
-            tk.Label(self.win_frame, text="No windows found",
+        if not self._stock_data:
+            tk.Label(self.stock_frame, text="No stocks yet",
                      bg=self.BG, fg="#666", font=("Helvetica", 10)).pack(pady=10)
             return
 
-        for i, win in enumerate(self.windows):
-            var = tk.BooleanVar(value=win['title'] in saved_titles)
-            self.check_vars.append(var)
+        # Sort by change% descending
+        sorted_stocks = sorted(self._stock_data.items(),
+                               key=lambda x: x[1]['pct'], reverse=True)
 
-            row = tk.Frame(self.win_frame, bg=self.ROW_BG if i % 2 == 0 else self.BG)
-            row.pack(fill='x', pady=1)
+        for i, (sym, d) in enumerate(sorted_stocks):
+            bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+            enrich = d.get('enrich', {})
 
-            cb = tk.Checkbutton(row, variable=var, bg=row['bg'],
-                                activebackground=row['bg'], selectcolor=self.BG,
-                                fg=self.ACCENT)
-            cb.pack(side='left', padx=4)
+            # Check if volume is unusually high
+            vol_raw = d.get('volume_raw', 0)
+            float_shares = _parse_float_to_shares(enrich.get('float', '-')) if enrich else 0
+            turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+            is_hot = turnover >= HIGH_TURNOVER_PCT
 
-            short_title = win['title'][:40]
-            size_str = f"{win['w']}x{win['h']}"
-            tk.Label(row, text=f"{short_title}", font=("Helvetica", 10),
-                     bg=row['bg'], fg=self.FG, anchor='w').pack(side='left', fill='x', expand=True)
-            tk.Label(row, text=size_str, font=("Courier", 9),
-                     bg=row['bg'], fg="#888").pack(side='right', padx=6)
+            # ── Line 1: SYM  PRICE  CHG%  VOL  FLOAT  SHORT ──
+            row1 = tk.Frame(self.stock_frame, bg=bg)
+            row1.pack(fill='x', pady=0)
 
-        n = len(self.windows)
-        sel = sum(1 for v in self.check_vars if v.get())
-        self.status.set(f"{n} windows found, {sel} selected")
+            sym_text = f"🔥{sym}" if is_hot else sym
+            tk.Label(row1, text=sym_text, font=("Courier", 10, "bold"),
+                     bg=bg, fg="#ff6600" if is_hot else self.FG, width=8, anchor='w').pack(side='left')
 
-    def _get_selected(self) -> list[dict]:
-        """Return list of selected windows."""
-        return [self.windows[i] for i, v in enumerate(self.check_vars) if v.get()]
+            tk.Label(row1, text=f"${d['price']:.2f}", font=("Courier", 10),
+                     bg=bg, fg=self.FG, width=8, anchor='w').pack(side='left')
 
-    def _load_selected_titles(self) -> set[str]:
-        """Load previously selected window titles from state."""
-        if not STATE_PATH.exists():
-            return set()
-        try:
-            s = json.load(open(STATE_PATH))
-            return set(s.get('titles', []))
-        except Exception:
-            return set()
+            pct = d['pct']
+            pct_color = self.GREEN if pct > 0 else self.RED if pct < 0 else self.FG
+            tk.Label(row1, text=f"{pct:+.1f}%", font=("Courier", 10, "bold"),
+                     bg=bg, fg=pct_color, width=8, anchor='w').pack(side='left')
+
+            vol_color = "#ff6600" if is_hot else "#aaa"
+            vol_text = d.get('volume', '')
+            if is_hot:
+                vol_text += f" ({turnover:.0f}%)"
+            tk.Label(row1, text=vol_text, font=("Courier", 9),
+                     bg=bg, fg=vol_color, width=12, anchor='w').pack(side='left')
+
+            # Float + Short from enrichment
+            flt = enrich.get('float', '') if enrich else ''
+            short = enrich.get('short', '') if enrich else ''
+            tk.Label(row1, text=flt, font=("Courier", 9),
+                     bg=bg, fg="#cca0ff", width=8, anchor='w').pack(side='left')
+            tk.Label(row1, text=short, font=("Courier", 9),
+                     bg=bg, fg="#ffaa00", width=7, anchor='w').pack(side='left')
+
+            # ── Line 2: Fib levels (if enriched) ──
+            if enrich and (enrich.get('fib_above') or enrich.get('fib_below')):
+                row2 = tk.Frame(self.stock_frame, bg=bg)
+                row2.pack(fill='x', pady=0)
+
+                fib_parts = []
+                above = enrich.get('fib_above', [])
+                below = enrich.get('fib_below', [])
+                if above:
+                    fib_parts.append("⬆" + " ".join(f"${p:.3f}" for p in above))
+                if below:
+                    fib_parts.append("⬇" + " ".join(f"${p:.3f}" for p in below))
+
+                fib_text = "  📐 " + "  |  ".join(fib_parts)
+                tk.Label(row2, text=fib_text, font=("Courier", 8),
+                         bg=bg, fg="#66cccc", anchor='w').pack(side='left', padx=(12, 0))
 
     def _toggle(self):
-        if self.monitor and self.monitor.running:
-            self.monitor.stop()
-            self.monitor = None
+        if self.scanner and self.scanner.running:
+            self.scanner.stop()
+            self.scanner = None
             self.btn.config(text="START", bg=self.GREEN)
             self.status.set("Stopped.")
         else:
-            selected = self._get_selected()
-            if not selected:
-                self.status.set("Select at least one window!")
-                return
             global PCT_JUMP_THRESHOLD, PRICE_JUMP_THRESHOLD
             PCT_JUMP_THRESHOLD = self.thresh.get()
             PRICE_JUMP_THRESHOLD = self.thresh.get()
-            self._save(selected)
-            self.monitor = MonitorThread(selected, self.freq.get(), self._st)
-            self.monitor.start()
+            self._save()
+            self.scanner = ScannerThread(
+                freq=self.freq.get(),
+                price_min=self.price_min.get(),
+                price_max=self.price_max.get(),
+                on_status=self._st,
+                on_stocks=self._update_stock_table,
+            )
+            self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
-            self.status.set(f"Tracking {len(selected)} windows...")
+            self.status.set("Scanner running...")
 
     def _st(self, msg):
         self.root.after(0, lambda: self.status.set(msg))
 
-    def _save(self, selected: list[dict]):
-        titles = [w['title'] for w in selected]
+    def _save(self):
         with open(STATE_PATH, 'w') as f:
             json.dump({
-                'titles': titles,
                 'freq': self.freq.get(),
                 'thresh': self.thresh.get(),
+                'price_min': self.price_min.get(),
+                'price_max': self.price_max.get(),
             }, f)
 
     def _load(self):
@@ -994,15 +1413,17 @@ class App:
             return
         try:
             s = json.load(open(STATE_PATH))
-            self.freq.set(s.get('freq', 60))
-            self.thresh.set(s.get('thresh', 5.0))
+            self.freq.set(s.get('freq', MONITOR_DEFAULT_FREQ))
+            self.thresh.set(s.get('thresh', MONITOR_DEFAULT_ALERT_PCT))
+            self.price_min.set(s.get('price_min', MONITOR_PRICE_MIN))
+            self.price_max.set(s.get('price_max', MONITOR_PRICE_MAX))
         except Exception:
             pass
 
     def run(self):
         self.root.mainloop()
-        if self.monitor:
-            self.monitor.stop()
+        if self.scanner:
+            self.scanner.stop()
 
 
 if __name__ == "__main__":
