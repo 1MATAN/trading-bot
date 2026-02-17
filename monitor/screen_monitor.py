@@ -33,7 +33,6 @@ from tkinter import messagebox
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -1345,6 +1344,8 @@ class ScannerThread(threading.Thread):
             positions = {}
             # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
             for item in ib.portfolio():
+                if item.position == 0:
+                    continue  # skip closed positions
                 s = item.contract.symbol
                 positions[s] = (
                     int(item.position),
@@ -1356,6 +1357,16 @@ class ScannerThread(threading.Thread):
             self.on_account(net_liq, buying_power, positions)
         except Exception as e:
             log.debug(f"Account fetch: {e}")
+
+    @staticmethod
+    def _merge_stocks(current: dict) -> dict:
+        """Merge scan data with cached enrichment for GUI display."""
+        merged = {}
+        for sym, d in current.items():
+            merged[sym] = dict(d)
+            if sym in _enrichment:
+                merged[sym]['enrich'] = _enrichment[sym]
+        return merged
 
     def _cycle(self):
         current = _run_ibkr_scan(self.price_min, self.price_max)
@@ -1373,11 +1384,7 @@ class ScannerThread(threading.Thread):
         file_logger.log_scan(ts, current)
 
         # ── Immediate GUI update with scan data + any cached enrichment ──
-        merged = {}
-        for sym, d in current.items():
-            merged[sym] = dict(d)
-            if sym in _enrichment:
-                merged[sym]['enrich'] = _enrichment[sym]
+        merged = self._merge_stocks(current)
         if self.on_stocks and merged:
             self.on_stocks(merged)
 
@@ -1416,12 +1423,7 @@ class ScannerThread(threading.Thread):
             enriched_count += 1
             # Live-update GUI after each enrichment
             if self.on_stocks:
-                merged = {}
-                for s, dd in current.items():
-                    merged[s] = dict(dd)
-                    if s in _enrichment:
-                        merged[s]['enrich'] = _enrichment[s]
-                self.on_stocks(merged)
+                self.on_stocks(self._merge_stocks(current))
             if not self.running:
                 return
 
@@ -1479,12 +1481,8 @@ class ScannerThread(threading.Thread):
                     send_telegram(vol_msg)
                     status += f"  🔥{sym}"
 
-        # ── Merge enrichment into stock data for GUI ──
-        merged = {}
-        for sym, d in current.items():
-            merged[sym] = dict(d)  # copy
-            if sym in _enrichment:
-                merged[sym]['enrich'] = _enrichment[sym]
+        # ── Final GUI update with all enrichment ──
+        merged = self._merge_stocks(current)
         if self.on_stocks and merged:
             self.on_stocks(merged)
 
@@ -1855,6 +1853,21 @@ class App:
 
     # ── Portfolio Panel ─────────────────────────────────────
 
+    def _portfolio_row_data(self, sym: str, pos: tuple, idx: int) -> dict:
+        """Compute display values for a portfolio row."""
+        qty, avg = pos[0], pos[1]
+        mkt_price = pos[2] if len(pos) >= 3 else 0.0
+        pnl = pos[3] if len(pos) >= 4 else 0.0
+        cost = abs(qty * avg) if avg > 0 else 1
+        pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
+        is_selected = (sym == self._selected_symbol_name)
+        bg = self.SELECTED_BG if is_selected else (self.ROW_BG if idx % 2 == 0 else self.ROW_ALT)
+        pnl_fg = self.GREEN if pnl >= 0 else self.RED
+        return {
+            'qty': qty, 'avg': avg, 'mkt_price': mkt_price,
+            'pnl': pnl, 'pnl_pct': pnl_pct, 'bg': bg, 'pnl_fg': pnl_fg,
+        }
+
     def _render_portfolio(self):
         """Render portfolio positions with P&L. Uses in-place updates."""
         positions = self._cached_positions
@@ -1870,26 +1883,17 @@ class App:
         if new_order == self._portfolio_order:
             # Fast path — in-place update
             for i, sym in enumerate(new_order):
-                pos = positions[sym]
-                qty, avg = pos[0], pos[1]
-                mkt_price = pos[2] if len(pos) >= 3 else 0.0
-                pnl = pos[3] if len(pos) >= 4 else 0.0
-                cost = abs(qty * avg) if avg > 0 else 1
-                pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
-                is_selected = (sym == self._selected_symbol_name)
-                bg = self.SELECTED_BG if is_selected else (self.ROW_BG if i % 2 == 0 else self.ROW_ALT)
-                pnl_fg = self.GREEN if pnl >= 0 else self.RED
-
+                rd = self._portfolio_row_data(sym, positions[sym], i)
                 w = self._portfolio_widgets.get(sym)
                 if not w:
                     continue
-                w['row'].config(bg=bg)
-                w['sym_lbl'].config(bg=bg)
-                w['qty_lbl'].config(text=str(qty), bg=bg)
-                w['avg_lbl'].config(text=f"${avg:.2f}", bg=bg)
-                w['price_lbl'].config(text=f"${mkt_price:.2f}", bg=bg)
-                w['pnl_lbl'].config(text=f"${pnl:+,.2f}", fg=pnl_fg, bg=bg)
-                w['pnl_pct_lbl'].config(text=f"{pnl_pct:+.1f}%", fg=pnl_fg, bg=bg)
+                w['row'].config(bg=rd['bg'])
+                w['sym_lbl'].config(bg=rd['bg'])
+                w['qty_lbl'].config(text=str(rd['qty']), bg=rd['bg'])
+                w['avg_lbl'].config(text=f"${rd['avg']:.2f}", bg=rd['bg'])
+                w['price_lbl'].config(text=f"${rd['mkt_price']:.2f}", bg=rd['bg'])
+                w['pnl_lbl'].config(text=f"${rd['pnl']:+,.2f}", fg=rd['pnl_fg'], bg=rd['bg'])
+                w['pnl_pct_lbl'].config(text=f"{rd['pnl_pct']:+.1f}%", fg=rd['pnl_fg'], bg=rd['bg'])
         else:
             # Full rebuild
             for w in self._portfolio_frame.winfo_children():
@@ -1898,44 +1902,35 @@ class App:
             self._portfolio_order = new_order
 
             for i, sym in enumerate(new_order):
-                pos = positions[sym]
-                qty, avg = pos[0], pos[1]
-                mkt_price = pos[2] if len(pos) >= 3 else 0.0
-                pnl = pos[3] if len(pos) >= 4 else 0.0
-                cost = abs(qty * avg) if avg > 0 else 1
-                pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
-                is_selected = (sym == self._selected_symbol_name)
-                bg = self.SELECTED_BG if is_selected else (self.ROW_BG if i % 2 == 0 else self.ROW_ALT)
-                pnl_fg = self.GREEN if pnl >= 0 else self.RED
-
+                rd = self._portfolio_row_data(sym, positions[sym], i)
                 _click = lambda e, s=sym: self._select_stock(s)
 
-                row = tk.Frame(self._portfolio_frame, bg=bg)
+                row = tk.Frame(self._portfolio_frame, bg=rd['bg'])
                 row.pack(fill='x', pady=0)
                 row.bind('<Button-1>', _click)
 
                 sym_lbl = tk.Label(row, text=sym, font=("Courier", 18, "bold"),
-                                   bg=bg, fg=self.FG, width=6, anchor='w')
+                                   bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
 
-                qty_lbl = tk.Label(row, text=str(qty), font=("Courier", 18),
-                                   bg=bg, fg=self.FG, width=6, anchor='w')
+                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 18),
+                                   bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
 
-                avg_lbl = tk.Label(row, text=f"${avg:.2f}", font=("Courier", 18),
-                                   bg=bg, fg="#aaa", width=8, anchor='w')
+                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 18),
+                                   bg=rd['bg'], fg="#aaa", width=8, anchor='w')
                 avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
 
-                price_lbl = tk.Label(row, text=f"${mkt_price:.2f}", font=("Courier", 18),
-                                     bg=bg, fg=self.FG, width=8, anchor='w')
+                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 18),
+                                     bg=rd['bg'], fg=self.FG, width=8, anchor='w')
                 price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
 
-                pnl_lbl = tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 18, "bold"),
-                                   bg=bg, fg=pnl_fg, width=10, anchor='w')
+                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 18, "bold"),
+                                   bg=rd['bg'], fg=rd['pnl_fg'], width=10, anchor='w')
                 pnl_lbl.pack(side='left'); pnl_lbl.bind('<Button-1>', _click)
 
-                pnl_pct_lbl = tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 18, "bold"),
-                                       bg=bg, fg=pnl_fg, width=7, anchor='w')
+                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 18, "bold"),
+                                       bg=rd['bg'], fg=rd['pnl_fg'], width=7, anchor='w')
                 pnl_pct_lbl.pack(side='left'); pnl_pct_lbl.bind('<Button-1>', _click)
 
                 self._portfolio_widgets[sym] = {
@@ -2020,13 +2015,16 @@ class App:
         """Handle stock row click — populate trading panel fields."""
         self._selected_symbol_name = sym
         self._selected_sym.set(sym)
-        # Look up price from current stock data
+        # Look up price from scanner data first, then portfolio
         d = self._stock_data.get(sym)
         if d:
             self._trade_price.set(f"{d['price']:.2f}")
+        elif sym in self._cached_positions and len(self._cached_positions[sym]) >= 3:
+            self._trade_price.set(f"{self._cached_positions[sym][2]:.2f}")
         self._update_position_display()
         # Re-render table to update highlight
         self._render_stock_table()
+        self._render_portfolio()
 
     def _update_position_display(self):
         """Update position label for the currently selected symbol."""
@@ -2057,9 +2055,11 @@ class App:
         self._cached_net_liq = net_liq
         self._cached_buying_power = buying_power
         self._cached_positions = positions
-        self.root.after(0, self._update_account_display)
-        self.root.after(0, self._update_position_display)
-        self.root.after(0, self._render_portfolio)
+        def _refresh():
+            self._update_account_display()
+            self._update_position_display()
+            self._render_portfolio()
+        self.root.after(0, _refresh)
 
     def _on_order_result(self, msg: str, success: bool):
         """Callback from ScannerThread with order result."""
@@ -2072,7 +2072,7 @@ class App:
         """Validate and queue a BUY or SELL order."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.")
+            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
             return
 
         try:
@@ -2080,28 +2080,31 @@ class App:
             if price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.")
+            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
         if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.")
+            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
             return
 
         if action == 'BUY':
             bp = self._cached_buying_power
             if bp <= 0:
-                messagebox.showwarning("No Data", "Waiting for account data...")
+                messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
                 return
             qty = int(bp * pct / price)
             if qty <= 0:
-                messagebox.showwarning("Qty Too Low", f"Not enough buying power for {pct*100:.0f}%.")
+                messagebox.showwarning("Qty Too Low",
+                                       f"Not enough buying power for {pct*100:.0f}%.",
+                                       parent=self.root)
                 return
         else:  # SELL
             pos = self._cached_positions.get(sym)
-            if not pos or pos[0] <= 0:
-                messagebox.showwarning("No Position", f"No position in {sym}.")
+            if not pos or pos[0] == 0:
+                messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
                 return
-            qty = max(1, int(pos[0] * pct))
+            # abs() handles both long (positive) and short (negative) positions
+            qty = max(1, int(abs(pos[0]) * pct))
 
         # Confirmation dialog
         confirm = messagebox.askokcancel(
@@ -2109,7 +2112,8 @@ class App:
             f"{action} {qty} {sym} @ ${price:.2f}\n"
             f"Total: ${qty * price:,.2f}\n\n"
             f"outsideRth=True (pre/post market OK)\n"
-            f"Continue?"
+            f"Continue?",
+            parent=self.root,
         )
         if not confirm:
             return
@@ -2124,7 +2128,7 @@ class App:
         """Validate and queue a Fib Double-Touch split-exit bracket order."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.")
+            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
             return
 
         try:
@@ -2132,28 +2136,32 @@ class App:
             if entry_price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.")
+            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
         if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.")
+            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
             return
 
         # Look up fib levels
         cached = _fib_cache.get(sym)
         if not cached:
-            messagebox.showwarning("No Fib Data", f"No Fibonacci data for {sym}.\nWait for enrichment.")
+            messagebox.showwarning("No Fib Data",
+                                   f"No Fibonacci data for {sym}.\nWait for enrichment.",
+                                   parent=self.root)
             return
 
         _anchor_low, _anchor_high, all_levels, _ratio_map = cached
         if not all_levels:
-            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.")
+            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.",
+                                   parent=self.root)
             return
 
         # Nearest support fib = max level <= entry_price
         supports = [lv for lv in all_levels if lv <= entry_price]
         if not supports:
-            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.")
+            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.",
+                                   parent=self.root)
             return
         nearest_support = supports[-1]  # all_levels is sorted
 
@@ -2165,18 +2173,19 @@ class App:
         if len(above_levels) < FIB_DT_LIVE_TARGET_LEVELS:
             messagebox.showwarning("Not Enough Levels",
                                    f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
-                                   f"only {len(above_levels)} available.")
+                                   f"only {len(above_levels)} available.",
+                                   parent=self.root)
             return
         target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
 
         # Qty = 100% of buying power
         bp = self._cached_buying_power
         if bp <= 0:
-            messagebox.showwarning("No Data", "Waiting for account data...")
+            messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
             return
         qty = int(bp / entry_price)
         if qty <= 0:
-            messagebox.showwarning("Qty Too Low", "Not enough buying power.")
+            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
             return
 
         half = qty // 2
@@ -2194,7 +2203,8 @@ class App:
             f"  OCA half: {half} shares (stop + target)\n"
             f"  Standalone stop: {other_half} shares\n\n"
             f"outsideRth=True\n"
-            f"Continue?"
+            f"Continue?",
+            parent=self.root,
         )
         if not confirm:
             return
@@ -2258,7 +2268,8 @@ class App:
         if not STATE_PATH.exists():
             return
         try:
-            s = json.load(open(STATE_PATH))
+            with open(STATE_PATH) as f:
+                s = json.load(f)
             self.freq.set(s.get('freq', MONITOR_DEFAULT_FREQ))
             self.thresh.set(s.get('thresh', MONITOR_DEFAULT_ALERT_PCT))
             self.price_min.set(s.get('price_min', MONITOR_PRICE_MIN))
