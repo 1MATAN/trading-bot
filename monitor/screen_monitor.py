@@ -46,7 +46,7 @@ from strategies.fibonacci_engine import (
     find_anchor_candle, build_dual_series, advance_series,
 )
 from config.settings import (
-    FIB_LEVELS_24, IBKR_HOST, IBKR_PORT,
+    FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
     MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT,
@@ -471,7 +471,8 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
 
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float, stock: dict | None = None,
-                       enriched: dict | None = None) -> Path | None:
+                       enriched: dict | None = None,
+                       ratio_map: dict[float, float] | None = None) -> Path | None:
     """Generate a candlestick chart with Fibonacci levels overlay.
 
     When ``stock`` and ``enriched`` are provided, an info panel with
@@ -526,11 +527,16 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
-        # Draw fib levels
+        # Draw fib levels — color per ratio
+        _default_color = '#888888'
         for lv in visible_levels:
-            color = '#2196F3' if lv <= current_price else '#FF9800'  # blue below, orange above
-            ax.axhline(y=lv, color=color, linewidth=0.7, alpha=0.7, linestyle='-')
-            ax.text(len(df) - 0.5, lv, f' ${lv:.4f}', color=color,
+            ratio = ratio_map.get(round(lv, 4)) if ratio_map else None
+            color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
+            label = f' ${lv:.4f}'
+            if ratio is not None:
+                label = f' {ratio}  ${lv:.4f}'
+            ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.8, linestyle='-')
+            ax.text(len(df) - 0.5, lv, label, color=color,
                     fontsize=7, va='center', ha='left', fontweight='bold')
 
         # Current price line
@@ -680,8 +686,10 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     cached = _fib_cache.get(sym)
     if df is not None and cached:
         all_levels = cached[2]
+        ratio_map = cached[3]
         img = generate_fib_chart(sym, df, all_levels, stock['price'],
-                                     stock=stock, enriched=enriched)
+                                     stock=stock, enriched=enriched,
+                                     ratio_map=ratio_map)
         if img:
             send_telegram_photo(img, f"📐 {sym} — Fibonacci ${stock['price']:.2f}")
 
@@ -690,8 +698,8 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
 #  Fibonacci Levels (WTS Method)
 # ══════════════════════════════════════════════════════════
 
-# Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted)}
-_fib_cache: dict[str, tuple[float, float, list[float]]] = {}
+# Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted, ratio_map)}
+_fib_cache: dict[str, tuple[float, float, list[float], dict[float, float]]] = {}
 
 # Cache daily DataFrames for chart generation (filled by _download_daily)
 _daily_cache: dict[str, pd.DataFrame] = {}
@@ -728,7 +736,7 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     Auto-advances when price > 4.236 of the LOWER series (S1).
     """
     if symbol in _fib_cache:
-        anchor_low, anchor_high, all_levels = _fib_cache[symbol]
+        anchor_low, anchor_high, all_levels, _ratio_map = _fib_cache[symbol]
     else:
         df = _download_daily(symbol)
         if df is None:
@@ -742,12 +750,15 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
 
         dual = build_dual_series(anchor_low, anchor_high)
         all_levels = set()
+        ratio_map: dict[float, float] = {}  # price → fib ratio
 
         for _ in range(25):
-            for _, price in dual.series1.levels:
+            for ratio, price in dual.series1.levels:
                 all_levels.add(price)
-            for _, price in dual.series2.levels:
+                ratio_map[round(price, 4)] = ratio
+            for ratio, price in dual.series2.levels:
                 all_levels.add(price)
+                ratio_map[round(price, 4)] = ratio
 
             # Advance when price crosses 4.236 of S1 (the lower series)
             s1_4236 = dual.series1.low + 4.236 * (dual.series1.high - dual.series1.low)
@@ -763,7 +774,7 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
                 deduped.append(lv)
         all_levels = deduped
 
-        _fib_cache[symbol] = (anchor_low, anchor_high, all_levels)
+        _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map)
 
     below = [l for l in all_levels if l <= current_price][-3:]
     above = [l for l in all_levels if l > current_price][:3]
@@ -811,7 +822,7 @@ def check_fib_touch(symbol: str, price: float) -> str | None:
     if symbol not in _fib_cache:
         return None
 
-    _, _, all_levels = _fib_cache[symbol]
+    _, _, all_levels, _ = _fib_cache[symbol]
     if symbol not in _fib_alerted:
         _fib_alerted[symbol] = set()
 

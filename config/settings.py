@@ -64,7 +64,7 @@ COOLDOWN_AFTER_MAX_DAILY_LOSS = 86400  # rest of day (24h fallback)
 
 # ── Scanner Filters ───────────────────────────────────
 SCAN_PRICE_MIN = 0.10  # minimum $0.10
-SCAN_PRICE_MAX = 15.00
+SCAN_PRICE_MAX = 18.00
 SCAN_FLOAT_MAX = 60_000_000  # 60M shares
 SCAN_MOVE_PCT_MIN = 20.0  # start watching once stock moves 20%+ intraday
 SCAN_MAX_RESULTS = 50
@@ -99,6 +99,34 @@ FIB_LEVELS_24 = [
     1.272, 1.414, 1.618, 2, 2.272, 2.414, 2.618, 3,
     3.272, 3.414, 3.618, 4, 4.236, 4.414, 4.618, 4.764,
 ]
+
+# Color per fib ratio (matches TradingView preset)
+FIB_LEVEL_COLORS = {
+    0:     '#808080',  # gray
+    0.236: '#ef5350',  # red
+    0.382: '#00bcd4',  # cyan
+    0.5:   '#ff9800',  # orange
+    0.618: '#ffffff',  # white
+    0.764: '#ef5350',  # red
+    0.88:  '#2196f3',  # blue
+    1:     '#4caf50',  # green
+    1.272: '#b388ff',  # purple
+    1.414: '#2196f3',  # blue
+    1.618: '#cccccc',  # light gray
+    2:     '#4caf50',  # green
+    2.272: '#b388ff',  # purple
+    2.414: '#2196f3',  # blue
+    2.618: '#cccccc',  # light gray
+    3:     '#4caf50',  # green
+    3.272: '#4caf50',  # green
+    3.414: '#2196f3',  # blue
+    3.618: '#cccccc',  # light gray
+    4:     '#4caf50',  # green
+    4.236: '#4caf50',  # green
+    4.414: '#2196f3',  # blue
+    4.618: '#cccccc',  # light gray
+    4.764: '#ef5350',  # red
+}
 
 # ── Pre-Market Gapper Scanner ────────────────────────
 PM_VOLUME_MIN = 50_000           # minimum cumulative volume before entry
@@ -195,15 +223,17 @@ BB_PERIOD = 20                    # SMA period for middle band
 BB_STD = 2.0                      # standard deviations for upper/lower bands
 
 # ── Fibonacci Double-Touch Backtest ────────────────────
-FIB_DT_STOP_PCT = 0.03             # 3% below fib level
+FIB_DT_STOP_PCT = 0.04             # 4% below fib level (was 3%, too tight)
 FIB_DT_TARGET_LEVELS = 3           # exit 50% at 3rd fib level above
 FIB_DT_PROXIMITY_PCT = 0.008       # 0.8% proximity to fib level
 FIB_DT_MIN_BOUNCE_BARS = 3         # min bars between first and second touch
 FIB_DT_MAX_ENTRIES_PER_DAY = 3     # max entries per gap day
 FIB_DT_GAP_MAX_PCT = 50.0             # skip gaps > 50% (poor performance)
-FIB_DT_ENTRY_WINDOW_END = "13:00"     # no entries after 1 PM ET (edge disappears)
-FIB_DT_PREFERRED_RATIOS = {0.382, 0.5, 0.618, 0.764, 0.88, 1.414, 2.272, 2.414, 3.272, 3.414, 3.618}
+FIB_DT_ENTRY_WINDOW_START = "08:00"   # no entries before 8 AM ET (pre-market noise)
+FIB_DT_ENTRY_WINDOW_END = "12:00"     # no entries after 12 PM ET
+FIB_DT_PREFERRED_RATIOS = {0.382, 0.618, 2.272, 2.414, 3.272, 3.414, 3.618}
 FIB_DT_USE_RATIO_FILTER = True        # only enter on preferred fib ratios
+FIB_DT_S1_ONLY = True                 # only use S1 series (S2 has poor WR)
 
 # ── Fibonacci Double-Touch LIVE Trading ──────────────
 FIB_DT_LIVE_SCAN_INTERVAL = 15           # 15-sec cycle (match bar size)
@@ -221,6 +251,15 @@ FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
 FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
 FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
 FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
+
+# ── Screen Monitor (IBKR Scanner) ────────────────────
+MONITOR_IBKR_CLIENT_ID = 10
+MONITOR_SCAN_CODE = "TOP_PERC_GAIN"
+MONITOR_SCAN_MAX_RESULTS = 50
+MONITOR_PRICE_MIN = 0.10
+MONITOR_PRICE_MAX = 18.00
+MONITOR_DEFAULT_FREQ = 30
+MONITOR_DEFAULT_ALERT_PCT = 5.0
 
 # ── Logging ────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
