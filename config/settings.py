@@ -64,7 +64,7 @@ COOLDOWN_AFTER_MAX_DAILY_LOSS = 86400  # rest of day (24h fallback)
 
 # ── Scanner Filters ───────────────────────────────────
 SCAN_PRICE_MIN = 0.10  # minimum $0.10
-SCAN_PRICE_MAX = 16.00
+SCAN_PRICE_MAX = 15.00
 SCAN_FLOAT_MAX = 60_000_000  # 60M shares
 SCAN_MOVE_PCT_MIN = 20.0  # start watching once stock moves 20%+ intraday
 SCAN_MAX_RESULTS = 50
@@ -204,6 +204,23 @@ FIB_DT_GAP_MAX_PCT = 50.0             # skip gaps > 50% (poor performance)
 FIB_DT_ENTRY_WINDOW_END = "13:00"     # no entries after 1 PM ET (edge disappears)
 FIB_DT_PREFERRED_RATIOS = {0.382, 0.5, 0.618, 0.764, 0.88, 1.414, 2.272, 2.414, 3.272, 3.414, 3.618}
 FIB_DT_USE_RATIO_FILTER = True        # only enter on preferred fib ratios
+
+# ── Fibonacci Double-Touch LIVE Trading ──────────────
+FIB_DT_LIVE_SCAN_INTERVAL = 15           # 15-sec cycle (match bar size)
+FIB_DT_LIVE_BAR_SIZE = "15 secs"         # 15-second bars from IBKR
+FIB_DT_LIVE_BAR_DURATION = "1 D"         # request full day of bars
+FIB_DT_LIVE_MAX_SYMBOLS = 5              # max symbols to track
+FIB_DT_LIVE_MAX_ENTRIES_PER_DAY = 3      # max entries per day
+FIB_DT_LIVE_ENTRY_START = "08:00"        # no entries before 8 AM ET
+FIB_DT_LIVE_ENTRY_END = "12:00"          # no entries after 12 PM ET
+FIB_DT_LIVE_GAP_MIN_PCT = 10.0           # minimum gap %
+FIB_DT_LIVE_GAP_MAX_PCT = 25.0           # maximum gap %
+FIB_DT_LIVE_FLOAT_MAX = 500_000_000      # max float 500M shares
+FIB_DT_LIVE_STOP_PCT = 0.03              # 3% below fib level
+FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
+FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
+FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
+FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
 
 # ── Logging ────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
