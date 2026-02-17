@@ -576,6 +576,8 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
     Returns path to saved PNG or None on failure.
     """
     try:
+        # Crop to last ~200 bars so chart focuses on recent price action
+        df = df.tail(200).copy()
         if len(df) < 5:
             return None
 
@@ -606,6 +608,17 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         vis_max = price_max + margin
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
+
+        # Ensure at least 3 fib levels are visible — expand Y range if needed
+        if len(visible_levels) < 3 and all_levels:
+            sorted_levels = sorted(all_levels, key=lambda lv: abs(lv - current_price))
+            closest_3 = sorted_levels[:3]
+            for lv in closest_3:
+                if lv < vis_min:
+                    vis_min = lv - margin * 0.5
+                if lv > vis_max:
+                    vis_max = lv + margin * 0.5
+            visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
         # Draw fib levels — S1 labels right, S2 labels left, skip overlaps
         _default_color = '#888888'
