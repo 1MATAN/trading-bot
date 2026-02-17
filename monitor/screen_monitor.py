@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import requests
-from ib_insync import IB, Stock, LimitOrder, ScannerSubscription, util as ib_util
+from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
 
@@ -50,6 +50,7 @@ from config.settings import (
     MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT,
+    FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -1221,7 +1222,12 @@ class ScannerThread(threading.Thread):
                 break
 
     def _execute_order(self, req: dict):
-        """Place an order via IBKR. req = {sym, action, qty, price}."""
+        """Place an order via IBKR.
+
+        Standard: req = {sym, action, qty, price}
+        Fib DT:   req = {sym, action, qty, price, strategy='fib_dt',
+                         stop_price, target_price, half, other_half}
+        """
         sym = req['sym']
         action = req['action']  # 'BUY' or 'SELL'
         qty = req['qty']
@@ -1230,7 +1236,11 @@ class ScannerThread(threading.Thread):
         ib = _get_ibkr()
         if not ib:
             if self.on_order_result:
-                self.on_order_result(f"IBKR not connected", False)
+                self.on_order_result("IBKR not connected", False)
+            return
+
+        if req.get('strategy') == 'fib_dt':
+            self._execute_fib_dt_order(ib, req)
             return
 
         try:
@@ -1256,6 +1266,67 @@ class ScannerThread(threading.Thread):
             if self.on_order_result:
                 self.on_order_result(msg, False)
 
+    def _execute_fib_dt_order(self, ib: IB, req: dict):
+        """Execute Fib Double-Touch split-exit bracket order."""
+        sym = req['sym']
+        qty = req['qty']
+        stop_price = req['stop_price']
+        target_price = req['target_price']
+        half = req['half']
+        other_half = req['other_half']
+
+        try:
+            contract = Stock(sym, 'SMART', 'USD')
+            ib.qualifyContracts(contract)
+
+            # 1. Market buy full qty
+            buy_order = MarketOrder('BUY', qty)
+            buy_order.outsideRth = True
+            buy_trade = ib.placeOrder(contract, buy_order)
+            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_trade.orderStatus.status}")
+
+            # 2. OCA bracket for first half
+            oca_group = f"FibDT_{sym}_{int(time.time())}"
+
+            oca_stop = StopOrder('SELL', half, stop_price)
+            oca_stop.outsideRth = True
+            oca_stop.ocaGroup = oca_group
+            oca_stop.ocaType = 1  # cancel others on fill
+            oca_stop.tif = 'GTC'
+            ib.placeOrder(contract, oca_stop)
+
+            oca_target = LimitOrder('SELL', half, target_price)
+            oca_target.outsideRth = True
+            oca_target.ocaGroup = oca_group
+            oca_target.ocaType = 1
+            oca_target.tif = 'GTC'
+            ib.placeOrder(contract, oca_target)
+
+            # 3. Standalone stop for other half
+            solo_stop = StopOrder('SELL', other_half, stop_price)
+            solo_stop.outsideRth = True
+            solo_stop.tif = 'GTC'
+            ib.placeOrder(contract, solo_stop)
+
+            msg = (f"FIB DT: BUY {qty} {sym} | "
+                   f"OCA {half}sh stop ${stop_price:.2f}/target ${target_price:.2f} | "
+                   f"Solo stop {other_half}sh ${stop_price:.2f}")
+            log.info(msg)
+            if self.on_order_result:
+                self.on_order_result(msg, True)
+            send_telegram(
+                f"📐 <b>FIB DT Order</b>\n"
+                f"  Market BUY {qty} {sym}\n"
+                f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
+                f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
+                f"  outsideRth: ✓  |  TIF: GTC"
+            )
+        except Exception as e:
+            msg = f"FIB DT failed: {sym} — {e}"
+            log.error(msg)
+            if self.on_order_result:
+                self.on_order_result(msg, False)
+
     def _fetch_account_data(self):
         """Fetch account values and positions from IBKR."""
         ib = _get_ibkr()
@@ -1272,9 +1343,15 @@ class ScannerThread(threading.Thread):
                     buying_power = float(av.value)
 
             positions = {}
-            for pos in ib.positions():
-                s = pos.contract.symbol
-                positions[s] = (int(pos.position), round(pos.avgCost, 4))
+            # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
+            for item in ib.portfolio():
+                s = item.contract.symbol
+                positions[s] = (
+                    int(item.position),
+                    round(item.averageCost, 4),
+                    round(item.marketPrice, 4),
+                    round(item.unrealizedPNL, 2),
+                )
 
             self.on_account(net_liq, buying_power, positions)
         except Exception as e:
@@ -1442,7 +1519,11 @@ class App:
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
-        self._cached_positions: dict[str, tuple[int, float]] = {}  # {sym: (qty, avgCost)}
+        self._cached_positions: dict[str, tuple] = {}  # {sym: (qty, avgCost, mktPrice, pnl)}
+        self._row_widgets: dict[str, dict] = {}   # sym → cached label widgets
+        self._rendered_order: list[str] = []       # last symbol render order
+        self._portfolio_widgets: dict[str, dict] = {}  # sym → cached portfolio widgets
+        self._portfolio_order: list[str] = []
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
@@ -1495,7 +1576,19 @@ class App:
         self.canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=6)
+        # ── Portfolio Panel ──
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=4)
+        tk.Label(self.root, text="Portfolio:", font=("Helvetica", 20, "bold"),
+                 bg=self.BG, fg=self.FG).pack(padx=12, anchor='w')
+        # Portfolio column headers
+        port_hdr = tk.Frame(self.root, bg=self.BG)
+        port_hdr.pack(fill='x', padx=12)
+        for text, w in [("SYM", 6), ("QTY", 6), ("AVG", 8), ("PRICE", 8), ("P&L", 10), ("P&L%", 7)]:
+            tk.Label(port_hdr, text=text, font=("Courier", 16, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        self._portfolio_frame = tk.Frame(self.root, bg=self.BG)
+        self._portfolio_frame.pack(fill='x', padx=12, pady=2)
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=4)
 
         # ── Trading Panel ──
         self._build_trading_panel()
@@ -1597,117 +1690,259 @@ class App:
         self._stock_data = stocks
         self.root.after(0, self._render_stock_table)
 
+    def _compute_row_data(self, sym: str, d: dict, idx: int) -> dict:
+        """Compute display values for a stock row."""
+        is_selected = (sym == self._selected_symbol_name)
+        bg = self.SELECTED_BG if is_selected else (self.ROW_BG if idx % 2 == 0 else self.ROW_ALT)
+        enrich = d.get('enrich', {})
+
+        vol_raw = d.get('volume_raw', 0)
+        float_shares = _parse_float_to_shares(enrich.get('float', '-')) if enrich else 0
+        turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+        is_hot = turnover >= HIGH_TURNOVER_PCT
+
+        sym_text = f"🔥{sym}" if is_hot else sym
+        sym_fg = "#ff6600" if is_hot else self.FG
+
+        pct = d['pct']
+        pct_color = self.GREEN if pct > 0 else self.RED if pct < 0 else self.FG
+
+        vol_text = d.get('volume', '')
+        if is_hot:
+            vol_text += f" ({turnover:.0f}%)"
+        vol_color = "#ff6600" if is_hot else "#aaa"
+
+        rvol = d.get('rvol', 0)
+        if rvol > 0:
+            rvol_text = f"{rvol:.1f}x"
+            rvol_color = "#ff4444" if rvol >= 5 else "#ffcc00" if rvol >= 2 else "#888"
+        else:
+            rvol_text = "—"
+            rvol_color = "#555"
+
+        flt = enrich.get('float', '') if enrich else ''
+        short = enrich.get('short', '') if enrich else ''
+
+        # Fib text
+        fib_text = ""
+        if enrich and (enrich.get('fib_above') or enrich.get('fib_below')):
+            parts = []
+            above = enrich.get('fib_above', [])
+            below = enrich.get('fib_below', [])
+            if above:
+                parts.append("⬆" + " ".join(f"${p:.3f}" for p in above))
+            if below:
+                parts.append("⬇" + " ".join(f"${p:.3f}" for p in below))
+            fib_text = "  📐 " + "  |  ".join(parts)
+
+        return {
+            'bg': bg, 'sym_text': sym_text, 'sym_fg': sym_fg,
+            'price_text': f"${d['price']:.2f}",
+            'pct_text': f"{pct:+.1f}%", 'pct_fg': pct_color,
+            'vol_text': vol_text, 'vol_fg': vol_color,
+            'rvol_text': rvol_text, 'rvol_fg': rvol_color,
+            'float_text': flt, 'short_text': short,
+            'fib_text': fib_text,
+        }
+
+    def _build_stock_row(self, sym: str, rd: dict) -> dict:
+        """Create widget row for a stock and return widget refs."""
+        _click = lambda e, s=sym: self._select_stock(s)
+
+        row1 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        row1.pack(fill='x', pady=0)
+        row1.bind('<Button-1>', _click)
+
+        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 20, "bold"),
+                           bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
+        sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
+
+        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 20),
+                             bg=rd['bg'], fg=self.FG, width=8, anchor='w')
+        price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
+
+        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 20, "bold"),
+                           bg=rd['bg'], fg=rd['pct_fg'], width=8, anchor='w')
+        pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click)
+
+        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 18),
+                           bg=rd['bg'], fg=rd['vol_fg'], width=12, anchor='w')
+        vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click)
+
+        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 18, "bold"),
+                            bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
+        rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click)
+
+        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 18),
+                             bg=rd['bg'], fg="#cca0ff", width=8, anchor='w')
+        float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click)
+
+        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 18),
+                             bg=rd['bg'], fg="#ffaa00", width=7, anchor='w')
+        short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click)
+
+        # Fib row
+        row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        row2.pack(fill='x', pady=0)
+        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 16),
+                           bg=rd['bg'], fg="#66cccc", anchor='w')
+        fib_lbl.pack(side='left', padx=(12, 0))
+        if not rd['fib_text']:
+            row2.pack_forget()
+
+        return {
+            'row1': row1, 'row2': row2,
+            'sym_lbl': sym_lbl, 'price_lbl': price_lbl, 'pct_lbl': pct_lbl,
+            'vol_lbl': vol_lbl, 'rvol_lbl': rvol_lbl,
+            'float_lbl': float_lbl, 'short_lbl': short_lbl,
+            'fib_lbl': fib_lbl,
+        }
+
+    def _update_stock_row(self, widgets: dict, rd: dict):
+        """In-place update of an existing stock row's labels."""
+        bg = rd['bg']
+        widgets['row1'].config(bg=bg)
+        widgets['sym_lbl'].config(text=rd['sym_text'], fg=rd['sym_fg'], bg=bg)
+        widgets['price_lbl'].config(text=rd['price_text'], bg=bg)
+        widgets['pct_lbl'].config(text=rd['pct_text'], fg=rd['pct_fg'], bg=bg)
+        widgets['vol_lbl'].config(text=rd['vol_text'], fg=rd['vol_fg'], bg=bg)
+        widgets['rvol_lbl'].config(text=rd['rvol_text'], fg=rd['rvol_fg'], bg=bg)
+        widgets['float_lbl'].config(text=rd['float_text'], bg=bg)
+        widgets['short_lbl'].config(text=rd['short_text'], bg=bg)
+        # Fib row
+        if rd['fib_text']:
+            widgets['fib_lbl'].config(text=rd['fib_text'], bg=bg)
+            widgets['row2'].config(bg=bg)
+            widgets['row2'].pack(fill='x', pady=0)
+        else:
+            widgets['row2'].pack_forget()
+
     def _render_stock_table(self):
         """Render the stock table from self._stock_data.
 
-        Each stock gets two lines:
-          Line 1: SYM  $PRICE  +CHG%  VOL  FLOAT  SHORT%
-          Line 2:   Fib ⬆ $X.XX  $X.XX  $X.XX  |  Fib ⬇ $X.XX  $X.XX
+        Uses in-place label updates when sort order is unchanged (fast path)
+        to prevent flicker. Full rebuild only when symbol order changes.
         """
-        for w in self.stock_frame.winfo_children():
-            w.destroy()
-
         if not self._stock_data:
+            for w in self.stock_frame.winfo_children():
+                w.destroy()
+            self._row_widgets.clear()
+            self._rendered_order.clear()
             tk.Label(self.stock_frame, text="No stocks yet",
                      bg=self.BG, fg="#666", font=("Helvetica", 20)).pack(pady=10)
             return
 
-        # Sort by change% descending
         sorted_stocks = sorted(self._stock_data.items(),
                                key=lambda x: x[1]['pct'], reverse=True)
+        new_order = [sym for sym, _ in sorted_stocks]
 
-        for i, (sym, d) in enumerate(sorted_stocks):
-            is_selected = (sym == self._selected_symbol_name)
-            bg = self.SELECTED_BG if is_selected else (self.ROW_BG if i % 2 == 0 else self.ROW_ALT)
-            enrich = d.get('enrich', {})
+        if new_order == self._rendered_order:
+            # ── Fast path: in-place update ──
+            for i, (sym, d) in enumerate(sorted_stocks):
+                rd = self._compute_row_data(sym, d, i)
+                if sym in self._row_widgets:
+                    self._update_stock_row(self._row_widgets[sym], rd)
+        else:
+            # ── Full rebuild ──
+            for w in self.stock_frame.winfo_children():
+                w.destroy()
+            self._row_widgets.clear()
+            self._rendered_order = new_order
 
-            # Check if volume is unusually high
-            vol_raw = d.get('volume_raw', 0)
-            float_shares = _parse_float_to_shares(enrich.get('float', '-')) if enrich else 0
-            turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
-            is_hot = turnover >= HIGH_TURNOVER_PCT
+            for i, (sym, d) in enumerate(sorted_stocks):
+                rd = self._compute_row_data(sym, d, i)
+                self._row_widgets[sym] = self._build_stock_row(sym, rd)
 
-            # ── Line 1: SYM  PRICE  CHG%  VOL  FLOAT  SHORT ──
-            row1 = tk.Frame(self.stock_frame, bg=bg)
-            row1.pack(fill='x', pady=0)
+    # ── Portfolio Panel ─────────────────────────────────────
 
-            # Click handler for stock selection
-            _click = lambda e, s=sym, p=d['price']: self._select_stock(s, p)
-            row1.bind('<Button-1>', _click)
+    def _render_portfolio(self):
+        """Render portfolio positions with P&L. Uses in-place updates."""
+        positions = self._cached_positions
+        if not positions:
+            for w in self._portfolio_frame.winfo_children():
+                w.destroy()
+            self._portfolio_widgets.clear()
+            self._portfolio_order.clear()
+            return
 
-            sym_text = f"🔥{sym}" if is_hot else sym
-            lbl = tk.Label(row1, text=sym_text, font=("Courier", 20, "bold"),
-                     bg=bg, fg="#ff6600" if is_hot else self.FG, width=8, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+        new_order = sorted(positions.keys())
 
-            lbl = tk.Label(row1, text=f"${d['price']:.2f}", font=("Courier", 20),
-                     bg=bg, fg=self.FG, width=8, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+        if new_order == self._portfolio_order:
+            # Fast path — in-place update
+            for i, sym in enumerate(new_order):
+                pos = positions[sym]
+                qty, avg = pos[0], pos[1]
+                mkt_price = pos[2] if len(pos) >= 3 else 0.0
+                pnl = pos[3] if len(pos) >= 4 else 0.0
+                cost = abs(qty * avg) if avg > 0 else 1
+                pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
+                is_selected = (sym == self._selected_symbol_name)
+                bg = self.SELECTED_BG if is_selected else (self.ROW_BG if i % 2 == 0 else self.ROW_ALT)
+                pnl_fg = self.GREEN if pnl >= 0 else self.RED
 
-            pct = d['pct']
-            pct_color = self.GREEN if pct > 0 else self.RED if pct < 0 else self.FG
-            lbl = tk.Label(row1, text=f"{pct:+.1f}%", font=("Courier", 20, "bold"),
-                     bg=bg, fg=pct_color, width=8, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+                w = self._portfolio_widgets.get(sym)
+                if not w:
+                    continue
+                w['row'].config(bg=bg)
+                w['sym_lbl'].config(bg=bg)
+                w['qty_lbl'].config(text=str(qty), bg=bg)
+                w['avg_lbl'].config(text=f"${avg:.2f}", bg=bg)
+                w['price_lbl'].config(text=f"${mkt_price:.2f}", bg=bg)
+                w['pnl_lbl'].config(text=f"${pnl:+,.2f}", fg=pnl_fg, bg=bg)
+                w['pnl_pct_lbl'].config(text=f"{pnl_pct:+.1f}%", fg=pnl_fg, bg=bg)
+        else:
+            # Full rebuild
+            for w in self._portfolio_frame.winfo_children():
+                w.destroy()
+            self._portfolio_widgets.clear()
+            self._portfolio_order = new_order
 
-            vol_color = "#ff6600" if is_hot else "#aaa"
-            vol_text = d.get('volume', '')
-            if is_hot:
-                vol_text += f" ({turnover:.0f}%)"
-            lbl = tk.Label(row1, text=vol_text, font=("Courier", 18),
-                     bg=bg, fg=vol_color, width=12, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+            for i, sym in enumerate(new_order):
+                pos = positions[sym]
+                qty, avg = pos[0], pos[1]
+                mkt_price = pos[2] if len(pos) >= 3 else 0.0
+                pnl = pos[3] if len(pos) >= 4 else 0.0
+                cost = abs(qty * avg) if avg > 0 else 1
+                pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
+                is_selected = (sym == self._selected_symbol_name)
+                bg = self.SELECTED_BG if is_selected else (self.ROW_BG if i % 2 == 0 else self.ROW_ALT)
+                pnl_fg = self.GREEN if pnl >= 0 else self.RED
 
-            # RVOL column
-            rvol = d.get('rvol', 0)
-            if rvol > 0:
-                rvol_text = f"{rvol:.1f}x"
-                if rvol >= 5:
-                    rvol_color = "#ff4444"   # red — extremely high
-                elif rvol >= 2:
-                    rvol_color = "#ffcc00"   # yellow — high
-                else:
-                    rvol_color = "#888"      # gray — normal
-            else:
-                rvol_text = "—"
-                rvol_color = "#555"
-            lbl = tk.Label(row1, text=rvol_text, font=("Courier", 18, "bold"),
-                     bg=bg, fg=rvol_color, width=6, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+                _click = lambda e, s=sym: self._select_stock(s)
 
-            # Float + Short from enrichment
-            flt = enrich.get('float', '') if enrich else ''
-            short = enrich.get('short', '') if enrich else ''
-            lbl = tk.Label(row1, text=flt, font=("Courier", 18),
-                     bg=bg, fg="#cca0ff", width=8, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
-            lbl = tk.Label(row1, text=short, font=("Courier", 18),
-                     bg=bg, fg="#ffaa00", width=7, anchor='w')
-            lbl.pack(side='left')
-            lbl.bind('<Button-1>', _click)
+                row = tk.Frame(self._portfolio_frame, bg=bg)
+                row.pack(fill='x', pady=0)
+                row.bind('<Button-1>', _click)
 
-            # ── Line 2: Fib levels (if enriched) ──
-            if enrich and (enrich.get('fib_above') or enrich.get('fib_below')):
-                row2 = tk.Frame(self.stock_frame, bg=bg)
-                row2.pack(fill='x', pady=0)
+                sym_lbl = tk.Label(row, text=sym, font=("Courier", 18, "bold"),
+                                   bg=bg, fg=self.FG, width=6, anchor='w')
+                sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
 
-                fib_parts = []
-                above = enrich.get('fib_above', [])
-                below = enrich.get('fib_below', [])
-                if above:
-                    fib_parts.append("⬆" + " ".join(f"${p:.3f}" for p in above))
-                if below:
-                    fib_parts.append("⬇" + " ".join(f"${p:.3f}" for p in below))
+                qty_lbl = tk.Label(row, text=str(qty), font=("Courier", 18),
+                                   bg=bg, fg=self.FG, width=6, anchor='w')
+                qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
 
-                fib_text = "  📐 " + "  |  ".join(fib_parts)
-                tk.Label(row2, text=fib_text, font=("Courier", 16),
-                         bg=bg, fg="#66cccc", anchor='w').pack(side='left', padx=(12, 0))
+                avg_lbl = tk.Label(row, text=f"${avg:.2f}", font=("Courier", 18),
+                                   bg=bg, fg="#aaa", width=8, anchor='w')
+                avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
+
+                price_lbl = tk.Label(row, text=f"${mkt_price:.2f}", font=("Courier", 18),
+                                     bg=bg, fg=self.FG, width=8, anchor='w')
+                price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
+
+                pnl_lbl = tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 18, "bold"),
+                                   bg=bg, fg=pnl_fg, width=10, anchor='w')
+                pnl_lbl.pack(side='left'); pnl_lbl.bind('<Button-1>', _click)
+
+                pnl_pct_lbl = tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 18, "bold"),
+                                       bg=bg, fg=pnl_fg, width=7, anchor='w')
+                pnl_pct_lbl.pack(side='left'); pnl_pct_lbl.bind('<Button-1>', _click)
+
+                self._portfolio_widgets[sym] = {
+                    'row': row, 'sym_lbl': sym_lbl, 'qty_lbl': qty_lbl,
+                    'avg_lbl': avg_lbl, 'price_lbl': price_lbl,
+                    'pnl_lbl': pnl_lbl, 'pnl_pct_lbl': pnl_pct_lbl,
+                }
 
     # ── Trading Panel ──────────────────────────────────────
 
@@ -1755,7 +1990,14 @@ class App:
                       command=lambda p=pct: self._place_order('BUY', p / 100)
                       ).pack(side='left', padx=2)
 
-        tk.Label(row2, text="  ", bg=self.BG).pack(side='left')
+        tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
+
+        tk.Button(row2, text="FIB DT", font=("Helvetica", 18, "bold"),
+                  bg="#00838f", fg="white", activebackground="#00acc1",
+                  relief='flat', width=8,
+                  command=self._place_fib_dt_order).pack(side='left', padx=2)
+
+        tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
 
         for pct in [25, 50, 75, 100]:
             tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 18, "bold"),
@@ -1774,11 +2016,14 @@ class App:
             font=("Courier", 18), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(side='left')
 
-    def _select_stock(self, sym: str, price: float):
+    def _select_stock(self, sym: str):
         """Handle stock row click — populate trading panel fields."""
         self._selected_symbol_name = sym
         self._selected_sym.set(sym)
-        self._trade_price.set(f"{price:.2f}")
+        # Look up price from current stock data
+        d = self._stock_data.get(sym)
+        if d:
+            self._trade_price.set(f"{d['price']:.2f}")
         self._update_position_display()
         # Re-render table to update highlight
         self._render_stock_table()
@@ -1789,8 +2034,13 @@ class App:
         if not sym or sym not in self._cached_positions:
             self._position_var.set("Position: ---")
             return
-        qty, avg = self._cached_positions[sym]
-        self._position_var.set(f"Position: {qty} @ ${avg:.2f}")
+        pos = self._cached_positions[sym]
+        qty, avg = pos[0], pos[1]
+        if len(pos) >= 4:
+            pnl = pos[3]
+            self._position_var.set(f"Position: {qty} @ ${avg:.2f}  P&L: ${pnl:+,.2f}")
+        else:
+            self._position_var.set(f"Position: {qty} @ ${avg:.2f}")
 
     def _update_account_display(self):
         """Update account label with cached values."""
@@ -1802,13 +2052,14 @@ class App:
             self._account_var.set("Account: ---")
 
     def _on_account_data(self, net_liq: float, buying_power: float,
-                         positions: dict[str, tuple[int, float]]):
+                         positions: dict[str, tuple]):
         """Callback from ScannerThread with account data."""
         self._cached_net_liq = net_liq
         self._cached_buying_power = buying_power
         self._cached_positions = positions
         self.root.after(0, self._update_account_display)
         self.root.after(0, self._update_position_display)
+        self.root.after(0, self._render_portfolio)
 
     def _on_order_result(self, msg: str, success: bool):
         """Callback from ScannerThread with order result."""
@@ -1867,6 +2118,97 @@ class App:
             'sym': sym, 'action': action, 'qty': qty, 'price': price,
         })
         self._order_status_var.set(f"Queued: {action} {qty} {sym} @ ${price:.2f}...")
+        self._order_status_label.config(fg="#ffcc00")
+
+    def _place_fib_dt_order(self):
+        """Validate and queue a Fib Double-Touch split-exit bracket order."""
+        sym = self._selected_symbol_name
+        if not sym or sym == "---":
+            messagebox.showwarning("No Stock", "Select a stock first.")
+            return
+
+        try:
+            entry_price = float(self._trade_price.get())
+            if entry_price <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showwarning("Invalid Price", "Enter a valid price.")
+            return
+
+        if not self.scanner or not self.scanner.running:
+            messagebox.showwarning("Scanner Off", "Start the scanner first.")
+            return
+
+        # Look up fib levels
+        cached = _fib_cache.get(sym)
+        if not cached:
+            messagebox.showwarning("No Fib Data", f"No Fibonacci data for {sym}.\nWait for enrichment.")
+            return
+
+        _anchor_low, _anchor_high, all_levels, _ratio_map = cached
+        if not all_levels:
+            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.")
+            return
+
+        # Nearest support fib = max level <= entry_price
+        supports = [lv for lv in all_levels if lv <= entry_price]
+        if not supports:
+            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.")
+            return
+        nearest_support = supports[-1]  # all_levels is sorted
+
+        # Stop price = nearest support × (1 - STOP_PCT)
+        stop_price = round(nearest_support * (1 - FIB_DT_LIVE_STOP_PCT), 2)
+
+        # Target = Nth fib level above entry
+        above_levels = [lv for lv in all_levels if lv > entry_price]
+        if len(above_levels) < FIB_DT_LIVE_TARGET_LEVELS:
+            messagebox.showwarning("Not Enough Levels",
+                                   f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
+                                   f"only {len(above_levels)} available.")
+            return
+        target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
+
+        # Qty = 100% of buying power
+        bp = self._cached_buying_power
+        if bp <= 0:
+            messagebox.showwarning("No Data", "Waiting for account data...")
+            return
+        qty = int(bp / entry_price)
+        if qty <= 0:
+            messagebox.showwarning("Qty Too Low", "Not enough buying power.")
+            return
+
+        half = qty // 2
+        other_half = qty - half
+
+        # Confirmation dialog
+        confirm = messagebox.askokcancel(
+            "FIB DT Order",
+            f"FIB DOUBLE-TOUCH — {sym}\n\n"
+            f"Entry: MARKET BUY {qty} shares\n"
+            f"Support: ${nearest_support:.4f}\n"
+            f"Stop: ${stop_price:.2f} (−{FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
+            f"Target: ${target_price:.2f} (fib #{FIB_DT_LIVE_TARGET_LEVELS})\n\n"
+            f"Split exit:\n"
+            f"  OCA half: {half} shares (stop + target)\n"
+            f"  Standalone stop: {other_half} shares\n\n"
+            f"outsideRth=True\n"
+            f"Continue?"
+        )
+        if not confirm:
+            return
+
+        self._order_queue.put({
+            'sym': sym, 'action': 'BUY', 'qty': qty, 'price': entry_price,
+            'strategy': 'fib_dt',
+            'stop_price': stop_price,
+            'target_price': target_price,
+            'half': half,
+            'other_half': other_half,
+        })
+        self._order_status_var.set(
+            f"Queued: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
         self._order_status_label.config(fg="#ffcc00")
 
     def _toggle(self):
