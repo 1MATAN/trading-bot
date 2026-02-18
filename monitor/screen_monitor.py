@@ -297,6 +297,43 @@ stock_history = StockHistory()
 
 _translator = GoogleTranslator(source='en', target='iw')
 
+# Regex to strip IBKR headline metadata like {A:800015:L:en:K:-0.97:C:0.97}
+import re
+_IBKR_HEADLINE_RE = re.compile(r'\{[^}]*\}\*?\s*')
+
+
+def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
+    """Fetch recent news headlines from IBKR (Dow Jones, The Fly, Briefing).
+
+    Returns list of {'title_en': str, 'date': str, 'source': str}.
+    """
+    ib = _get_ibkr()
+    if not ib:
+        return []
+    try:
+        contract = Stock(symbol, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        providers = 'DJ-N+DJ-RT+FLY+BRFG+BRFUPDN'
+        headlines = ib.reqHistoricalNews(contract.conId, providers, '', '', max_news)
+        if not headlines:
+            return []
+        results = []
+        for h in headlines:
+            # Strip metadata tags from headline
+            clean = _IBKR_HEADLINE_RE.sub('', h.headline).strip()
+            if not clean:
+                continue
+            date_str = h.time.strftime('%Y-%m-%d') if h.time else ''
+            results.append({
+                'title_en': clean,
+                'date': date_str,
+                'source': h.providerCode or '',
+            })
+        return results
+    except Exception as e:
+        log.debug(f"IBKR news {symbol}: {e}")
+        return []
+
 
 def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
     """Fetch fundamentals + news from Finviz."""
@@ -497,6 +534,45 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
         data['news'] = info.get('news', [])
     except Exception as e:
         log.error(f"Finviz {sym}: {e}")
+
+    # ── IBKR news (Dow Jones, The Fly) ──
+    if on_status:
+        on_status(f"Enriching {sym}... (IBKR News)")
+    try:
+        ibkr_news = _fetch_ibkr_news(sym, max_news=5)
+        if ibkr_news:
+            # Collect titles for dedup and batch translate
+            finviz_titles = {n.get('title_he', '').lower() for n in data['news']}
+            new_titles_en = []
+            new_dates = []
+            new_sources = []
+            for n in ibkr_news:
+                title_lower = n['title_en'].lower()
+                # Skip if very similar to an existing Finviz headline
+                if any(title_lower[:30] in ft or ft[:30] in title_lower
+                       for ft in finviz_titles if len(ft) > 10):
+                    continue
+                new_titles_en.append(n['title_en'])
+                new_dates.append(n['date'])
+                new_sources.append(n['source'])
+
+            if new_titles_en:
+                try:
+                    combined = "\n||||\n".join(new_titles_en)
+                    translated = _translator.translate(combined)
+                    titles_he = translated.split("\n||||\n")
+                except Exception:
+                    titles_he = new_titles_en
+                for i, title_he in enumerate(titles_he):
+                    src = new_sources[i] if i < len(new_sources) else ''
+                    data['news'].append({
+                        'title_he': title_he.strip(),
+                        'date': new_dates[i] if i < len(new_dates) else '',
+                        'source': src,
+                    })
+            log.info(f"IBKR news {sym}: {len(ibkr_news)} raw → {len(new_titles_en)} new")
+    except Exception as e:
+        log.debug(f"IBKR news enrich {sym}: {e}")
 
     # ── Fibonacci levels ──
     if price > 0:
@@ -827,7 +903,9 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         lines.append("")
         lines.append(f"📰 <b>חדשות:</b>")
         for n in enriched['news']:
-            lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
+            src = n.get('source', '')
+            src_tag = f" [{src}]" if src else ""
+            lines.append(f"  • {n['title_he']}  <i>({n['date']}{src_tag})</i>")
 
     send_telegram("\n".join(lines))
 
