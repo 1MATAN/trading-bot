@@ -27,7 +27,7 @@ import threading
 import time
 import tkinter as tk
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from tkinter import messagebox
 
@@ -441,6 +441,35 @@ def check_milestone(sym: str, pct: float) -> str | None:
             f"  נוכחי: {pct:+.1f}%"
         )
     return None
+
+
+# ══════════════════════════════════════════════════════════
+#  Pre-Market Open Reminders
+# ══════════════════════════════════════════════════════════
+
+_MARKET_OPEN_ET = time(9, 30)  # US market open
+_REMINDER_MINUTES = [30, 15, 5]  # minutes before open
+_reminders_sent: set[str] = set()  # "YYYY-MM-DD_30" etc.
+
+
+def _check_market_reminders():
+    """Send Telegram reminders before market open."""
+    now_et = datetime.now(ZoneInfo('US/Eastern'))
+    today_str = now_et.strftime('%Y-%m-%d')
+    # Only on weekdays
+    if now_et.weekday() >= 5:
+        return
+    open_dt = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    mins_to_open = (open_dt - now_et).total_seconds() / 60
+
+    for m in _REMINDER_MINUTES:
+        key = f"{today_str}_{m}"
+        if key in _reminders_sent:
+            continue
+        if 0 < mins_to_open <= m and mins_to_open > (m - 2):
+            _reminders_sent.add(key)
+            send_telegram(f"⏰ <b>תזכורת:</b> {m} דקות לפתיחת המסחר!")
+            log.info(f"Market reminder sent: {m} min to open")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1491,6 +1520,7 @@ class ScannerThread(threading.Thread):
         return merged
 
     def _cycle(self):
+        _check_market_reminders()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
             if self.on_status:
