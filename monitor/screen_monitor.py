@@ -495,6 +495,9 @@ _milestone_alerted: dict[str, float] = {}
 
 def _format_fib_text(sym: str, price: float) -> str:
     """Build fib levels text — highest at top, lowest at bottom (like a chart)."""
+    # Recalculate if needed (auto-advance when price exceeds top level)
+    if price > 0:
+        calc_fib_levels(sym, price)
     cached = _fib_cache.get(sym)
     if not cached:
         return ""
