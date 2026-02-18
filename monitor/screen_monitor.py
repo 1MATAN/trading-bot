@@ -493,13 +493,21 @@ MILESTONE_STEP_PCT = 5.0    # alert every 5% step
 _milestone_alerted: dict[str, float] = {}
 
 
-def check_milestone(sym: str, pct: float) -> str | None:
-    """Check if stock crossed the next +5% milestone.
+def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
+    """Check if stock crossed a +5% milestone up or down.
 
     Returns alert message or None.
     E.g. stock at +27% → milestone 25. If last alerted was 20 → alert for 25.
+    Also detects corrections: +30% → +24% alerts "dropped below +25%".
     """
     if pct < MILESTONE_START_PCT:
+        # Stock dropped below tracking threshold — clear and alert
+        if sym in _milestone_alerted:
+            last = _milestone_alerted.pop(sym)
+            return (
+                f"⚠️ <b>{sym}</b> ירד מתחת ל-+{MILESTONE_START_PCT:.0f}%\n"
+                f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
+            )
         return None
 
     current_milestone = int(pct // MILESTONE_STEP_PCT) * MILESTONE_STEP_PCT
@@ -509,7 +517,13 @@ def check_milestone(sym: str, pct: float) -> str | None:
         _milestone_alerted[sym] = current_milestone
         return (
             f"📈 <b>{sym}</b> חצה +{current_milestone:.0f}%!\n"
-            f"  נוכחי: {pct:+.1f}%"
+            f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
+        )
+    elif current_milestone < last:
+        _milestone_alerted[sym] = current_milestone
+        return (
+            f"📉 <b>{sym}</b> תיקון — ירד מתחת ל-+{last:.0f}%\n"
+            f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
         )
     return None
 
@@ -2124,9 +2138,9 @@ class ScannerThread(threading.Thread):
             else:
                 status += "  ✓"
 
-        # ── Milestone alerts (+5% steps) ──
+        # ── Milestone alerts (+5% steps, including corrections) ──
         for sym, d in current.items():
-            ms_msg = check_milestone(sym, d['pct'])
+            ms_msg = check_milestone(sym, d['pct'], d['price'])
             if ms_msg:
                 send_telegram(ms_msg)
                 status += f"  📈{sym}"
