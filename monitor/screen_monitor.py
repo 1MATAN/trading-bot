@@ -1428,17 +1428,18 @@ class TelegramListenerThread(threading.Thread):
         try:
             resp = requests.get(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={'offset': self._offset, 'timeout': 10},
-                timeout=15,
+                params={'offset': self._offset, 'timeout': 30},
+                timeout=35,
             )
         except requests.exceptions.Timeout:
             return
         except Exception as e:
-            log.debug(f"getUpdates error: {e}")
+            log.warning(f"getUpdates error: {e}")
             time_mod.sleep(3)
             return
 
         if not resp.ok:
+            log.warning(f"getUpdates failed: {resp.status_code} {resp.text[:200]}")
             time_mod.sleep(3)
             return
 
@@ -1479,7 +1480,7 @@ class TelegramListenerThread(threading.Thread):
             log.info(f"TelegramListener: queued lookup for {symbol} (chat={chat_id})")
 
     def _parse_symbol(self, text: str) -> str | None:
-        """Extract stock symbol from /stock CMD or @mention."""
+        """Extract stock symbol from /SYM, /stock SYM, or @mention SYM."""
         # /stock AAPL  or  /stock@botname AAPL
         if text.startswith('/stock'):
             parts = text.split()
@@ -1488,6 +1489,17 @@ class TelegramListenerThread(threading.Thread):
                 if sym.isalpha() and 1 <= len(sym) <= 5:
                     return sym
             return None
+
+        # /AAPL or /AAPL@botname — direct ticker command
+        _IGNORE_CMDS = {'start', 'help', 'stop', 'settings', 'menu', 'stock'}
+        if text.startswith('/'):
+            cmd = text.split()[0][1:]  # remove leading /
+            if '@' in cmd:
+                cmd = cmd.split('@')[0]
+            if cmd.lower() not in _IGNORE_CMDS:
+                sym = cmd.upper()
+                if sym.isalpha() and 1 <= len(sym) <= 5:
+                    return sym
 
         # @botname AAPL
         if self._bot_username and f'@{self._bot_username}' in text:
@@ -1608,6 +1620,9 @@ class ScannerThread(threading.Thread):
         try:
             contract = Stock(sym, 'SMART', 'USD')
             ib.qualifyContracts(contract)
+            if not contract.conId:
+                send_telegram_to(chat_id, f"❌ <b>{sym}</b> — סימבול לא נמצא", reply_to=message_id)
+                return
             bars = ib.reqHistoricalData(
                 contract, endDateTime='', durationStr='2 D',
                 barSizeSetting='1 day', whatToShow='TRADES', useRTH=True,
@@ -1972,6 +1987,8 @@ class ScannerThread(threading.Thread):
             # Live-update GUI after each enrichment
             if self.on_stocks:
                 self.on_stocks(self._merge_stocks(current))
+            # Process any pending Telegram lookups between enrichments
+            self._process_lookup_queue()
             if not self.running:
                 return
 
