@@ -3005,13 +3005,17 @@ class ScannerThread(threading.Thread):
 
                 btn = _make_lookup_button(sym)
 
+                # Build score line with reasons for all alerts
+                reason_str = f" ({', '.join(reasons)})" if reasons else ""
+                score_line = f"\n🏆 ניקוד: {score}/100{reason_str}"
+
                 # 1. HOD break
                 if self.previous and sym in self.previous:
                     hod_msg = check_hod_break(sym, d, self.previous[sym])
                     if hod_msg:
                         signals.append("HOD")
                         if score >= ALERT_MIN_SCORE:
-                            send_telegram(hod_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                            send_telegram(hod_msg + score_line, reply_markup=btn)
                         else:
                             log.info(f"Alert filtered {sym} HOD: score {score} < {ALERT_MIN_SCORE}")
                 # 2. Fib 2nd touch
@@ -3019,7 +3023,7 @@ class ScannerThread(threading.Thread):
                 if fib2_msg:
                     signals.append("FIB×2")
                     if score >= ALERT_MIN_SCORE:
-                        send_telegram(fib2_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                        send_telegram(fib2_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} FIB×2: score {score} < {ALERT_MIN_SCORE}")
                 # 3. LOD 2nd touch
@@ -3027,7 +3031,7 @@ class ScannerThread(threading.Thread):
                 if lod_msg:
                     signals.append("LOD×2")
                     if score >= ALERT_MIN_SCORE:
-                        send_telegram(lod_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                        send_telegram(lod_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} LOD×2: score {score} < {ALERT_MIN_SCORE}")
                 # 4. VWAP cross
@@ -3035,7 +3039,7 @@ class ScannerThread(threading.Thread):
                 if vwap_msg:
                     signals.append("VWAP")
                     if score >= ALERT_MIN_SCORE:
-                        send_telegram(vwap_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                        send_telegram(vwap_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} VWAP: score {score} < {ALERT_MIN_SCORE}")
                 # 5. 1-min spike
@@ -3043,7 +3047,7 @@ class ScannerThread(threading.Thread):
                 if spike_msg:
                     signals.append("SPIKE")
                     if score >= ALERT_MIN_SCORE:
-                        send_telegram(spike_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                        send_telegram(spike_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} SPIKE: score {score} < {ALERT_MIN_SCORE}")
 
