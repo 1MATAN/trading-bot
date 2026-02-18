@@ -902,8 +902,11 @@ def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
     return " | ".join(parts) if parts else ""
 
 
-def _send_stock_report(sym: str, stock: dict, enriched: dict):
-    """Send comprehensive Telegram report for a newly discovered stock."""
+def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Path | None]:
+    """Build full stock report text + fib chart image.
+
+    Returns (report_text, chart_path_or_None).
+    """
     price = stock['price']
 
     # ── Download MA timeframes first (needed for resist line) ──
@@ -971,22 +974,28 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
             src_tag = f" [{src}]" if src else ""
             lines.append(f"  • {n['title_he']}  <i>({n['date']}{src_tag})</i>")
 
-    send_telegram("\n".join(lines))
+    text = "\n".join(lines)
 
     # ── Fib chart image ──
+    chart_path: Path | None = None
     cached = _fib_cache.get(sym)
-    if not cached:
-        return
+    if cached:
+        all_levels = cached[2]
+        ratio_map = cached[3]
+        df_5min = ma_frames.get('5m')
+        if df_5min is not None:
+            chart_path = generate_fib_chart(sym, df_5min, all_levels, price,
+                                            ratio_map=ratio_map)
 
-    all_levels = cached[2]
-    ratio_map = cached[3]
+    return text, chart_path
 
-    df_5min = ma_frames.get('5m')
-    if df_5min is not None:
-        img = generate_fib_chart(sym, df_5min, all_levels, price,
-                                 ratio_map=ratio_map)
-        if img:
-            send_telegram_photo(img, f"📐 {sym} — 5min + Fibonacci ${price:.2f}")
+
+def _send_stock_report(sym: str, stock: dict, enriched: dict):
+    """Send comprehensive Telegram report for a newly discovered stock."""
+    text, chart_path = _build_stock_report(sym, stock, enriched)
+    send_telegram(text)
+    if chart_path:
+        send_telegram_photo(chart_path, f"📐 {sym} — 5min + Fibonacci ${stock['price']:.2f}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1295,6 +1304,44 @@ def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
     return ok
 
 
+def send_telegram_to(chat_id: str, text: str, reply_to: int | None = None) -> bool:
+    """Send text message to a specific chat (for lookup replies)."""
+    if not BOT_TOKEN:
+        return False
+    try:
+        payload: dict = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+        if reply_to:
+            payload['reply_to_message_id'] = reply_to
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload, timeout=10,
+        )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram send_to ({chat_id}): {e}")
+        return False
+
+
+def send_telegram_photo_to(chat_id: str, image_path: Path, caption: str = "",
+                           reply_to: int | None = None) -> bool:
+    """Send photo to a specific chat (for lookup replies)."""
+    if not BOT_TOKEN:
+        return False
+    try:
+        data: dict = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
+        if reply_to:
+            data['reply_to_message_id'] = reply_to
+        with open(image_path, 'rb') as photo:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data=data, files={'photo': photo}, timeout=30,
+            )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram photo_to ({chat_id}): {e}")
+        return False
+
+
 # ══════════════════════════════════════════════════════════
 #  File Logger
 # ══════════════════════════════════════════════════════════
@@ -1326,6 +1373,132 @@ class FileLogger:
 
 
 file_logger = FileLogger()
+
+
+# ══════════════════════════════════════════════════════════
+#  Telegram Listener (incoming messages → stock lookups)
+# ══════════════════════════════════════════════════════════
+
+class TelegramListenerThread(threading.Thread):
+    """Poll Telegram getUpdates for /stock commands and @mentions."""
+
+    _COOLDOWN_SECS = 60
+
+    def __init__(self, lookup_queue: queue.Queue):
+        super().__init__(daemon=True)
+        self.lookup_queue = lookup_queue
+        self.running = False
+        self._offset = 0
+        self._bot_username: str = ""
+        self._cooldowns: dict[str, float] = {}  # symbol -> last lookup time
+
+    def stop(self):
+        self.running = False
+
+    def _get_bot_username(self):
+        """Call getMe to learn the bot's username for @mention detection."""
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getMe",
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                self._bot_username = data.get('result', {}).get('username', '')
+                log.info(f"Telegram bot username: @{self._bot_username}")
+        except Exception as e:
+            log.warning(f"getMe failed: {e}")
+
+    def run(self):
+        if not BOT_TOKEN:
+            log.warning("TelegramListener: no BOT_TOKEN, exiting")
+            return
+        self.running = True
+        self._get_bot_username()
+        log.info("TelegramListener started")
+        while self.running:
+            try:
+                self._poll()
+            except Exception as e:
+                log.error(f"TelegramListener poll error: {e}")
+                time_mod.sleep(5)
+
+    def _poll(self):
+        """Long-poll getUpdates and parse stock requests."""
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={'offset': self._offset, 'timeout': 10},
+                timeout=15,
+            )
+        except requests.exceptions.Timeout:
+            return
+        except Exception as e:
+            log.debug(f"getUpdates error: {e}")
+            time_mod.sleep(3)
+            return
+
+        if not resp.ok:
+            time_mod.sleep(3)
+            return
+
+        updates = resp.json().get('result', [])
+        for update in updates:
+            self._offset = update['update_id'] + 1
+            msg = update.get('message')
+            if not msg:
+                continue
+            text = msg.get('text', '').strip()
+            if not text:
+                continue
+            chat_id = str(msg['chat']['id'])
+            message_id = msg['message_id']
+
+            symbol = self._parse_symbol(text)
+            if not symbol:
+                continue
+
+            # Rate limit check
+            now = time_mod.time()
+            last = self._cooldowns.get(symbol, 0)
+            if now - last < self._COOLDOWN_SECS:
+                remaining = int(self._COOLDOWN_SECS - (now - last))
+                send_telegram_to(
+                    chat_id,
+                    f"⏳ <b>{symbol}</b> — נבדק לאחרונה. נסה שוב עוד {remaining} שניות.",
+                    reply_to=message_id,
+                )
+                continue
+
+            self._cooldowns[symbol] = now
+            self.lookup_queue.put({
+                'chat_id': chat_id,
+                'message_id': message_id,
+                'symbol': symbol,
+            })
+            log.info(f"TelegramListener: queued lookup for {symbol} (chat={chat_id})")
+
+    def _parse_symbol(self, text: str) -> str | None:
+        """Extract stock symbol from /stock CMD or @mention."""
+        # /stock AAPL  or  /stock@botname AAPL
+        if text.startswith('/stock'):
+            parts = text.split()
+            if len(parts) >= 2:
+                sym = parts[1].upper()
+                if sym.isalpha() and 1 <= len(sym) <= 5:
+                    return sym
+            return None
+
+        # @botname AAPL
+        if self._bot_username and f'@{self._bot_username}' in text:
+            cleaned = text.replace(f'@{self._bot_username}', '').strip()
+            parts = cleaned.split()
+            if parts:
+                sym = parts[0].upper()
+                if sym.isalpha() and 1 <= len(sym) <= 5:
+                    return sym
+
+        return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -1361,6 +1534,9 @@ class ScannerThread(threading.Thread):
         # Cache scanner contracts for FIB DT (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
+        # ── Telegram stock lookup ──
+        self._lookup_queue: queue.Queue = queue.Queue()
+        self._telegram_listener: TelegramListenerThread | None = None
 
     def _get_buying_power(self) -> float:
         """Return cached buying power for position sizing."""
@@ -1368,9 +1544,14 @@ class ScannerThread(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self._telegram_listener:
+            self._telegram_listener.stop()
 
     def run(self):
         self.running = True
+        # Start Telegram listener for stock lookups
+        self._telegram_listener = TelegramListenerThread(self._lookup_queue)
+        self._telegram_listener.start()
         log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
         while self.running:
             try:
@@ -1383,6 +1564,7 @@ class ScannerThread(threading.Thread):
                 if not self.running:
                     break
                 self._process_order_queue()
+                self._process_lookup_queue()
                 time_mod.sleep(1)
 
     def _process_order_queue(self):
@@ -1395,6 +1577,93 @@ class ScannerThread(threading.Thread):
                 self._execute_order(req)
             except queue.Empty:
                 break
+
+    def _process_lookup_queue(self):
+        """Process pending Telegram stock lookup requests."""
+        while not self._lookup_queue.empty():
+            try:
+                req = self._lookup_queue.get_nowait()
+                self._handle_stock_lookup(req)
+            except queue.Empty:
+                break
+
+    def _handle_stock_lookup(self, req: dict):
+        """Handle a stock lookup request from Telegram.
+
+        Fetches price from IBKR, enriches via Finviz + Fib,
+        and sends a full report back to the requesting chat.
+        """
+        sym = req['symbol']
+        chat_id = req['chat_id']
+        message_id = req['message_id']
+
+        send_telegram_to(chat_id, f"🔍 מחפש מידע על <b>{sym}</b>...", reply_to=message_id)
+
+        ib = _get_ibkr()
+        if not ib:
+            send_telegram_to(chat_id, f"❌ <b>{sym}</b> — IBKR לא מחובר", reply_to=message_id)
+            return
+
+        # ── Get current price from IBKR ──
+        try:
+            contract = Stock(sym, 'SMART', 'USD')
+            ib.qualifyContracts(contract)
+            bars = ib.reqHistoricalData(
+                contract, endDateTime='', durationStr='2 D',
+                barSizeSetting='1 day', whatToShow='TRADES', useRTH=True,
+            )
+            if not bars:
+                send_telegram_to(chat_id, f"❌ <b>{sym}</b> — לא נמצאו נתונים", reply_to=message_id)
+                return
+
+            last_bar = bars[-1]
+            price = last_bar.close
+            volume = last_bar.volume
+            prev_close = bars[-2].close if len(bars) >= 2 else 0
+            pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
+
+            if volume >= 1_000_000:
+                vol_str = f"{volume / 1_000_000:.1f}M"
+            elif volume >= 1_000:
+                vol_str = f"{volume / 1_000:.0f}K"
+            else:
+                vol_str = str(int(volume))
+
+            stock_data = {
+                'price': round(price, 2),
+                'pct': round(pct, 1),
+                'volume': vol_str,
+                'volume_raw': int(volume),
+                'vwap': vwap,
+                'prev_close': round(prev_close, 4),
+            }
+        except Exception as e:
+            send_telegram_to(chat_id, f"❌ <b>{sym}</b> — שגיאה: {e}", reply_to=message_id)
+            return
+
+        # ── Enrich (Finviz + Fib) ──
+        # Clear enrichment cache to get fresh data on explicit lookup
+        _enrichment.pop(sym, None)
+        enriched = _enrich_stock(sym, price)
+
+        # ── Build and send report ──
+        try:
+            text, chart_path = _build_stock_report(sym, stock_data, enriched)
+            # Replace the 🆕 prefix with 🔎 for lookups
+            text = text.replace("🆕", "🔎", 1)
+            send_telegram_to(chat_id, text, reply_to=message_id)
+            if chart_path:
+                send_telegram_photo_to(
+                    chat_id, chart_path,
+                    f"📐 {sym} — 5min + Fibonacci ${price:.2f}",
+                    reply_to=message_id,
+                )
+        except Exception as e:
+            log.error(f"Stock lookup report {sym}: {e}")
+            send_telegram_to(chat_id, f"❌ <b>{sym}</b> — שגיאה בבניית הדוח: {e}", reply_to=message_id)
+
+        log.info(f"Stock lookup completed: {sym} → chat={chat_id}")
 
     def _execute_order(self, req: dict):
         """Place an order via IBKR.
