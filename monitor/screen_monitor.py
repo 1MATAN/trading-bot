@@ -488,9 +488,36 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
 
 MILESTONE_START_PCT = 20.0  # only track stocks above this %
 MILESTONE_STEP_PCT = 5.0    # alert every 5% step
+MILESTONE_VOL_RATIO = 2.4   # 1-min candle volume must be ≥ 2.4x previous
 
 # {symbol: last milestone alerted (e.g. 25, 30, 35...)}
 _milestone_alerted: dict[str, float] = {}
+
+
+def _check_1min_volume_spike(sym: str) -> tuple[bool, float]:
+    """Check if last 1-min candle volume ≥ MILESTONE_VOL_RATIO × previous candle.
+
+    Returns (spike_detected, ratio).
+    """
+    ib = _get_ibkr()
+    if not ib:
+        return True, 0.0  # no connection — don't block alert
+    try:
+        contract = Stock(sym, 'SMART', 'USD')
+        ib.qualifyContracts(contract)
+        bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='300 S',
+            barSizeSetting='1 min', whatToShow='TRADES', useRTH=False,
+        )
+        if bars and len(bars) >= 2:
+            prev_vol = bars[-2].volume
+            curr_vol = bars[-1].volume
+            if prev_vol > 0:
+                ratio = curr_vol / prev_vol
+                return ratio >= MILESTONE_VOL_RATIO, round(ratio, 1)
+    except Exception as e:
+        log.debug(f"1min vol check {sym}: {e}")
+    return True, 0.0  # on error — don't block alert
 
 
 def _format_fib_text(sym: str, price: float) -> str:
@@ -2203,8 +2230,12 @@ class ScannerThread(threading.Thread):
         for sym, d in current.items():
             ms_msg = check_milestone(sym, d['pct'], d['price'])
             if ms_msg:
-                send_telegram(ms_msg)
-                status += f"  📈{sym}"
+                spike, ratio = _check_1min_volume_spike(sym)
+                if spike:
+                    send_telegram(ms_msg)
+                    status += f"  📈{sym}"
+                else:
+                    log.info(f"Milestone {sym} skipped: 1min vol ratio {ratio}x < {MILESTONE_VOL_RATIO}x")
 
         # ── Volume anomaly checks ──
         for sym, d in current.items():
