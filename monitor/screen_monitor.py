@@ -215,6 +215,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             else:
                 vol_str = str(int(volume))
 
+            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
+
             stocks[sym] = {
                 "price": round(price, 2),
                 "pct": round(pct, 1),
@@ -222,6 +224,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 "volume_raw": int(volume),
                 "rvol": rvol,
                 "float": "",
+                "vwap": vwap,
             }
 
         except Exception as e:
@@ -448,6 +451,8 @@ HIGH_TURNOVER_PCT = 10.0  # volume > 10% of float = unusual
 
 # {symbol} — already alerted for high volume this session
 _vol_alerted: set[str] = set()
+
+
 
 
 def _parse_float_to_shares(flt_str: str) -> float:
@@ -904,6 +909,14 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}",
         f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}",
     ]
+
+    # VWAP line
+    vwap = stock.get('vwap', 0)
+    if vwap > 0:
+        above = price > vwap
+        vwap_icon = "🟢" if above else "🔴"
+        vwap_label = "מעל" if above else "מתחת"
+        lines.append(f"{vwap_icon} VWAP: ${vwap:.2f} — מחיר {vwap_label} ל-VWAP")
 
     # Resist line
     if resist_str:
@@ -1520,14 +1533,25 @@ class ScannerThread(threading.Thread):
             _enrich_stock(sym, d['price'], on_status=self.on_status)
 
             if not is_baseline:
-                # Only send Telegram for NEW stocks after baseline
-                _send_stock_report(sym, d, _enrichment[sym])
-                file_logger.log_alert(ts, {
-                    'type': 'new', 'symbol': sym,
-                    'price': d['price'], 'pct': d['pct'],
-                    'volume': d.get('volume', ''),
-                    'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
-                })
+                # Filter: only send Telegram if above VWAP + >16% + float <70M
+                vwap = d.get('vwap', 0)
+                pct = d.get('pct', 0)
+                price = d.get('price', 0)
+                flt_shares = _parse_float_to_shares(_enrichment[sym].get('float', '-'))
+                flt_ok = 0 < flt_shares < 70_000_000
+                above_vwap = vwap > 0 and price > vwap
+                above_pct = pct >= 16
+
+                if above_vwap and above_pct and flt_ok:
+                    _send_stock_report(sym, d, _enrichment[sym])
+                    file_logger.log_alert(ts, {
+                        'type': 'new', 'symbol': sym,
+                        'price': d['price'], 'pct': d['pct'],
+                        'volume': d.get('volume', ''),
+                        'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
+                    })
+                else:
+                    log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={_enrichment[sym].get('float', '-')}")
 
             enriched_count += 1
             # Live-update GUI after each enrichment
