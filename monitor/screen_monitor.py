@@ -493,6 +493,35 @@ MILESTONE_STEP_PCT = 5.0    # alert every 5% step
 _milestone_alerted: dict[str, float] = {}
 
 
+def _format_fib_text(sym: str, price: float) -> str:
+    """Build fib levels text block for milestone alerts."""
+    cached = _fib_cache.get(sym)
+    if not cached:
+        return ""
+    all_levels = cached[2]
+    ratio_map = cached[3]
+    above = [lv for lv in all_levels if lv > price][:6]
+    below = [lv for lv in all_levels if lv <= price][-3:]
+    if not above and not below:
+        return ""
+    lines = ["\n📐 <b>פיבונאצ'י:</b>"]
+    for lv in above:
+        info = ratio_map.get(round(lv, 4))
+        if info:
+            ratio, series = info
+            lines.append(f"  ⬆️ ${lv:.4f}  ({ratio} {series})")
+        else:
+            lines.append(f"  ⬆️ ${lv:.4f}")
+    for lv in reversed(below):
+        info = ratio_map.get(round(lv, 4))
+        if info:
+            ratio, series = info
+            lines.append(f"  ⬇️ ${lv:.4f}  ({ratio} {series})")
+        else:
+            lines.append(f"  ⬇️ ${lv:.4f}")
+    return "\n".join(lines)
+
+
 def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
     """Check if stock crossed a +5% milestone up or down.
 
@@ -500,6 +529,8 @@ def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
     E.g. stock at +27% → milestone 25. If last alerted was 20 → alert for 25.
     Also detects corrections: +30% → +24% alerts "dropped below +25%".
     """
+    fib_text = _format_fib_text(sym, price) if price > 0 else ""
+
     if pct < MILESTONE_START_PCT:
         # Stock dropped below tracking threshold — clear and alert
         if sym in _milestone_alerted:
@@ -507,6 +538,7 @@ def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
             return (
                 f"⚠️ <b>{sym}</b> ירד מתחת ל-+{MILESTONE_START_PCT:.0f}%\n"
                 f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
+                f"{fib_text}"
             )
         return None
 
@@ -518,12 +550,14 @@ def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
         return (
             f"📈 <b>{sym}</b> חצה +{current_milestone:.0f}%!\n"
             f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
+            f"{fib_text}"
         )
     elif current_milestone < last:
         _milestone_alerted[sym] = current_milestone
         return (
             f"📉 <b>{sym}</b> תיקון — ירד מתחת ל-+{last:.0f}%\n"
             f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
+            f"{fib_text}"
         )
     return None
 
