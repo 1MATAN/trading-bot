@@ -3121,8 +3121,8 @@ class App:
             return
         target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
 
-        # Qty = 100% of buying power
-        bp = self._cached_buying_power
+        # Qty = 100% of NetLiq (not margin-inflated BuyingPower)
+        bp = self._cached_net_liq
         if bp <= 0:
             messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
             return

@@ -28,6 +28,7 @@ from config.settings import (
     FIB_DT_LIVE_PROXIMITY_PCT,
     FIB_DT_LIVE_MIN_BOUNCE_BARS,
     FIB_DT_LIVE_PREFERRED_RATIOS,
+    FIB_DT_LIVE_TRAILING_BARS,
     FIB_LOOKBACK_YEARS,
 )
 from scanner.gap_scanner import GapSignal
@@ -99,6 +100,7 @@ class DTSymbolState:
     date_key: str = ""
     # Trailing state
     prev_bar_high: float = 0.0
+    trailing_no_high_count: int = 0  # consecutive bars without new high
 
 
 # ── Fibonacci helpers ──────────────────────────────────────
@@ -189,6 +191,7 @@ class FibDTLiveStrategy:
         if st:
             st.phase = DTSymbolPhase.TRAILING
             st.prev_bar_high = 0.0  # reset, will be set from next bar
+            st.trailing_no_high_count = 0
             logger.info(f"[{symbol}] -> TRAILING (target filled, monitoring no-new-high)")
 
     def mark_position_closed(self, symbol: str) -> None:
@@ -384,18 +387,22 @@ class FibDTLiveStrategy:
 
         bar_high = float(df["high"].iloc[-1])
 
-        # Need at least one previous bar's high to compare
         if st.prev_bar_high > 0 and bar_high <= st.prev_bar_high:
-            reason = (
-                f"no_new_high (prev_high=${st.prev_bar_high:.4f}, "
-                f"bar_high=${bar_high:.4f})"
-            )
-            logger.info(f"[{st.symbol}] TRAILING EXIT: {reason}")
-            return DTTrailingExit(
-                symbol=st.symbol,
-                contract=st.contract,
-                reason=reason,
-            )
+            st.trailing_no_high_count += 1
+            if st.trailing_no_high_count >= FIB_DT_LIVE_TRAILING_BARS:
+                reason = (
+                    f"no_new_high x{st.trailing_no_high_count} "
+                    f"(prev_high=${st.prev_bar_high:.4f}, bar_high=${bar_high:.4f})"
+                )
+                logger.info(f"[{st.symbol}] TRAILING EXIT: {reason}")
+                return DTTrailingExit(
+                    symbol=st.symbol,
+                    contract=st.contract,
+                    reason=reason,
+                )
+            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{FIB_DT_LIVE_TRAILING_BARS}")
+        else:
+            st.trailing_no_high_count = 0
 
         # Update prev_bar_high for next cycle
         st.prev_bar_high = bar_high
@@ -538,6 +545,7 @@ class FibDTLiveStrategySync:
         if st:
             st.phase = DTSymbolPhase.TRAILING
             st.prev_bar_high = 0.0
+            st.trailing_no_high_count = 0
             logger.info(f"[{symbol}] -> TRAILING (target filled, monitoring no-new-high)")
 
     def mark_position_closed(self, symbol: str) -> None:
@@ -741,16 +749,21 @@ class FibDTLiveStrategySync:
         bar_high = float(df["high"].iloc[-1])
 
         if st.prev_bar_high > 0 and bar_high <= st.prev_bar_high:
-            reason = (
-                f"no_new_high (prev_high=${st.prev_bar_high:.4f}, "
-                f"bar_high=${bar_high:.4f})"
-            )
-            logger.info(f"[{st.symbol}] TRAILING EXIT: {reason}")
-            return DTTrailingExit(
-                symbol=st.symbol,
-                contract=st.contract,
-                reason=reason,
-            )
+            st.trailing_no_high_count += 1
+            if st.trailing_no_high_count >= FIB_DT_LIVE_TRAILING_BARS:
+                reason = (
+                    f"no_new_high x{st.trailing_no_high_count} "
+                    f"(prev_high=${st.prev_bar_high:.4f}, bar_high=${bar_high:.4f})"
+                )
+                logger.info(f"[{st.symbol}] TRAILING EXIT: {reason}")
+                return DTTrailingExit(
+                    symbol=st.symbol,
+                    contract=st.contract,
+                    reason=reason,
+                )
+            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{FIB_DT_LIVE_TRAILING_BARS}")
+        else:
+            st.trailing_no_high_count = 0
 
         st.prev_bar_high = bar_high
         return None

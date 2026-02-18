@@ -250,6 +250,7 @@ FIB_DT_LIVE_STOP_PCT = 0.03              # 3% below fib level
 FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
 FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
 FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
+FIB_DT_LIVE_TRAILING_BARS = 3            # bars without new high before trailing exit (3 × 15s = 45s)
 FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
 
 # ── Screen Monitor (IBKR Scanner) ────────────────────
