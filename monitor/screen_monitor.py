@@ -28,6 +28,7 @@ import time
 import tkinter as tk
 from collections import defaultdict
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from tkinter import messagebox
 
 import matplotlib
@@ -323,7 +324,12 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
             clean = _IBKR_HEADLINE_RE.sub('', h.headline).strip()
             if not clean:
                 continue
-            date_str = h.time.strftime('%Y-%m-%d %H:%M') if h.time else ''
+            if h.time:
+                utc_dt = h.time.replace(tzinfo=ZoneInfo('UTC'))
+                il_dt = utc_dt.astimezone(ZoneInfo('Asia/Jerusalem'))
+                date_str = il_dt.strftime('%Y-%m-%d %H:%M')
+            else:
+                date_str = ''
             results.append({
                 'title_en': clean,
                 'date': date_str,
@@ -373,7 +379,14 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             title_en = row.get('Title', '')
             if title_en:
                 titles_en.append(title_en)
-                dates.append(str(row.get('Date', ''))[:16])
+                raw_date = str(row.get('Date', ''))
+                try:
+                    et_dt = datetime.strptime(raw_date[:19], '%Y-%m-%d %H:%M:%S')
+                    et_dt = et_dt.replace(tzinfo=ZoneInfo('US/Eastern'))
+                    il_dt = et_dt.astimezone(ZoneInfo('Asia/Jerusalem'))
+                    dates.append(il_dt.strftime('%Y-%m-%d %H:%M'))
+                except (ValueError, IndexError):
+                    dates.append(raw_date[:16])
 
         # Batch translate all headlines in one call
         if titles_en:
