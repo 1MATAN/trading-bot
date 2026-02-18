@@ -686,7 +686,97 @@ _lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD la
 _vwap_side: dict[str, str] = {}                         # sym -> 'above' | 'below'
 _price_1min: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, price)]
 _spike_alerted: set[str] = set()                        # already alerted 8%+ spike
+_multi_signal_alerted: set[str] = set()                 # already sent multi-signal alert today
 _alerts_date: str = ""                                  # date for daily reset
+
+# ── Alert score thresholds ──
+ALERT_MIN_SCORE = 40       # minimum score to send any alert (0-100)
+MULTI_SIGNAL_MIN = 2       # minimum signals for combined alert
+
+
+def _calc_alert_score(sym: str, d: dict) -> tuple[int, list[str]]:
+    """Score a stock 0-100 for alert relevance. Higher = more likely to move big.
+
+    Returns (score, [reasons]).
+    Factors: low float, high RVOL, above VWAP, high pct change, near fib.
+    """
+    score = 0
+    reasons = []
+    enrich = _enrichment.get(sym, {})
+
+    # ── Float (0-30 pts) — lower is better ──
+    flt = _parse_float_to_shares(enrich.get('float', '-'))
+    if 0 < flt < 3_000_000:
+        score += 30
+        reasons.append("float<3M")
+    elif 0 < flt < 10_000_000:
+        score += 20
+        reasons.append("float<10M")
+    elif 0 < flt < 30_000_000:
+        score += 10
+        reasons.append("float<30M")
+
+    # ── RVOL (0-25 pts) — higher is better ──
+    rvol = d.get('rvol', 0)
+    if rvol >= 5.0:
+        score += 25
+        reasons.append(f"RVOL {rvol}x")
+    elif rvol >= 3.0:
+        score += 18
+        reasons.append(f"RVOL {rvol}x")
+    elif rvol >= 2.0:
+        score += 10
+        reasons.append(f"RVOL {rvol}x")
+
+    # ── Above VWAP (0-15 pts) ──
+    price = d.get('price', 0)
+    vwap = d.get('vwap', 0)
+    if price > 0 and vwap > 0 and price > vwap:
+        pct_above = (price - vwap) / vwap * 100
+        if pct_above > 5:
+            score += 15
+            reasons.append(f"VWAP+{pct_above:.0f}%")
+        else:
+            score += 8
+            reasons.append("above VWAP")
+
+    # ── Daily % change (0-15 pts) ──
+    pct = d.get('pct', 0)
+    if pct >= 50:
+        score += 15
+        reasons.append(f"{pct:+.0f}%")
+    elif pct >= 30:
+        score += 10
+        reasons.append(f"{pct:+.0f}%")
+    elif pct >= 20:
+        score += 5
+        reasons.append(f"{pct:+.0f}%")
+
+    # ── Short interest (0-10 pts) — squeeze potential ──
+    short_str = enrich.get('short', '-')
+    try:
+        short_pct = float(short_str.replace('%', ''))
+        if short_pct >= 20:
+            score += 10
+            reasons.append(f"short {short_pct:.0f}%")
+        elif short_pct >= 10:
+            score += 5
+            reasons.append(f"short {short_pct:.0f}%")
+    except (ValueError, AttributeError):
+        pass
+
+    # ── Near fib level (0-5 pts) ──
+    cached = _fib_cache.get(sym)
+    if cached and price > 0:
+        _, _, all_levels, _ = cached
+        threshold = price * 0.008
+        for lv in all_levels:
+            if abs(price - lv) <= threshold:
+                score += 5
+                reasons.append("near fib")
+                break
+
+    return min(score, 100), reasons
 
 
 def _reset_alerts_if_new_day():
@@ -702,6 +792,7 @@ def _reset_alerts_if_new_day():
         _vwap_side.clear()
         _price_1min.clear()
         _spike_alerted.clear()
+        _multi_signal_alerted.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -1603,8 +1694,11 @@ def detect_anomalies(current: dict, previous: dict) -> list[dict]:
 #  Telegram
 # ══════════════════════════════════════════════════════════
 
-def send_telegram(text: str) -> bool:
-    """Send text message to personal chat and group (if configured)."""
+def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
+    """Send text message to personal chat and group (if configured).
+
+    ``reply_markup`` can be an InlineKeyboardMarkup dict for buttons.
+    """
     if not BOT_TOKEN or not CHAT_ID:
         return False
     ok = False
@@ -1612,16 +1706,27 @@ def send_telegram(text: str) -> bool:
         if not cid:
             continue
         try:
+            payload: dict = {'chat_id': cid, 'text': text, 'parse_mode': 'HTML'}
+            if reply_markup:
+                payload['reply_markup'] = reply_markup
             resp = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={'chat_id': cid, 'text': text, 'parse_mode': 'HTML'},
-                timeout=10,
+                json=payload, timeout=10,
             )
             if cid == CHAT_ID:
                 ok = resp.ok
         except Exception as e:
             log.error(f"Telegram ({cid}): {e}")
     return ok
+
+
+def _make_lookup_button(sym: str) -> dict:
+    """Build InlineKeyboardMarkup with a 'Full Report' button for a symbol."""
+    return {
+        'inline_keyboard': [[
+            {'text': f'📊 דוח מלא — {sym}', 'callback_data': f'lookup:{sym}'},
+        ]]
+    }
 
 
 def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
@@ -1789,6 +1894,13 @@ class TelegramListenerThread(threading.Thread):
         updates = resp.json().get('result', [])
         for update in updates:
             self._offset = update['update_id'] + 1
+
+            # ── Handle inline button callbacks ──
+            cb = update.get('callback_query')
+            if cb:
+                self._handle_callback(cb)
+                continue
+
             msg = update.get('message')
             if not msg:
                 continue
@@ -1821,6 +1933,44 @@ class TelegramListenerThread(threading.Thread):
                 'symbol': symbol,
             })
             log.info(f"TelegramListener: queued lookup for {symbol} (chat={chat_id})")
+
+    def _handle_callback(self, cb: dict):
+        """Handle inline keyboard callback (e.g. 'lookup:AAPL')."""
+        cb_id = cb.get('id', '')
+        data = cb.get('data', '')
+        chat_id = str(cb.get('message', {}).get('chat', {}).get('id', ''))
+        message_id = cb.get('message', {}).get('message_id', 0)
+
+        # Answer the callback to remove the loading spinner
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+                json={'callback_query_id': cb_id, 'text': '🔍 טוען דוח...'},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+        if data.startswith('lookup:'):
+            sym = data.split(':', 1)[1].upper()
+            if sym.isalpha() and 1 <= len(sym) <= 5:
+                # Rate limit check
+                now = time_mod.time()
+                last = self._cooldowns.get(sym, 0)
+                if now - last < self._COOLDOWN_SECS:
+                    remaining = int(self._COOLDOWN_SECS - (now - last))
+                    send_telegram_to(
+                        chat_id,
+                        f"⏳ <b>{sym}</b> — נבדק לאחרונה. נסה שוב עוד {remaining} שניות.",
+                    )
+                    return
+                self._cooldowns[sym] = now
+                self.lookup_queue.put({
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'symbol': sym,
+                })
+                log.info(f"TelegramListener: callback lookup for {sym} (chat={chat_id})")
 
     def _parse_symbol(self, text: str) -> str | None:
         """Extract stock symbol from /SYM, /stock SYM, or @mention SYM."""
@@ -2605,32 +2755,75 @@ class ScannerThread(threading.Thread):
                     send_telegram(vol_msg)
                     status += f"  🔥{sym}"
 
-        # ── Real-time alerts (5 types) ──
+        # ── Real-time alerts (5 types, score-filtered + multi-signal) ──
         if not is_baseline and current:
             for sym, d in current.items():
                 price = d['price']
                 pct = d.get('pct', 0)
+                score, reasons = _calc_alert_score(sym, d)
+
+                # Collect signals for this stock this cycle
+                signals: list[str] = []
+
+                btn = _make_lookup_button(sym)
+
                 # 1. HOD break
                 if self.previous and sym in self.previous:
                     hod_msg = check_hod_break(sym, d, self.previous[sym])
                     if hod_msg:
-                        send_telegram(hod_msg)
+                        signals.append("HOD")
+                        if score >= ALERT_MIN_SCORE:
+                            send_telegram(hod_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                        else:
+                            log.info(f"Alert filtered {sym} HOD: score {score} < {ALERT_MIN_SCORE}")
                 # 2. Fib 2nd touch
                 fib2_msg = check_fib_second_touch(sym, price, pct)
                 if fib2_msg:
-                    send_telegram(fib2_msg)
+                    signals.append("FIB×2")
+                    if score >= ALERT_MIN_SCORE:
+                        send_telegram(fib2_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                    else:
+                        log.info(f"Alert filtered {sym} FIB×2: score {score} < {ALERT_MIN_SCORE}")
                 # 3. LOD 2nd touch
                 lod_msg = check_lod_touch(sym, price, d.get('day_low', 0), pct)
                 if lod_msg:
-                    send_telegram(lod_msg)
+                    signals.append("LOD×2")
+                    if score >= ALERT_MIN_SCORE:
+                        send_telegram(lod_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                    else:
+                        log.info(f"Alert filtered {sym} LOD×2: score {score} < {ALERT_MIN_SCORE}")
                 # 4. VWAP cross
                 vwap_msg = check_vwap_cross(sym, price, d.get('vwap', 0), pct)
                 if vwap_msg:
-                    send_telegram(vwap_msg)
+                    signals.append("VWAP")
+                    if score >= ALERT_MIN_SCORE:
+                        send_telegram(vwap_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                    else:
+                        log.info(f"Alert filtered {sym} VWAP: score {score} < {ALERT_MIN_SCORE}")
                 # 5. 1-min spike
                 spike_msg = check_1min_spike(sym, price, pct)
                 if spike_msg:
-                    send_telegram(spike_msg)
+                    signals.append("SPIKE")
+                    if score >= ALERT_MIN_SCORE:
+                        send_telegram(spike_msg + f"\n🏆 ניקוד: {score}/100", reply_markup=btn)
+                    else:
+                        log.info(f"Alert filtered {sym} SPIKE: score {score} < {ALERT_MIN_SCORE}")
+
+                # ── Multi-signal alert ──
+                if len(signals) >= MULTI_SIGNAL_MIN and sym not in _multi_signal_alerted:
+                    _multi_signal_alerted.add(sym)
+                    enrich = _enrichment.get(sym, {})
+                    flt = enrich.get('float', '-')
+                    short = enrich.get('short', '-')
+                    send_telegram(
+                        f"🔥🔥🔥 <b>MULTI-SIGNAL — {sym}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⚡ {len(signals)} סיגנלים: {' + '.join(signals)}\n"
+                        f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
+                        f"📊 Float: {flt} | Short: {short} | RVOL: {d.get('rvol', 0)}x\n"
+                        f"🏆 ניקוד: {score}/100 ({', '.join(reasons)})",
+                        reply_markup=btn,
+                    )
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()
