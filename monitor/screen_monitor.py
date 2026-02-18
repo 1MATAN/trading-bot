@@ -1962,6 +1962,7 @@ class ScannerThread(threading.Thread):
                     buying_power = float(av.value)
             # Cache for FIB DT position sizing
             self._cached_buying_power = buying_power
+            log.info(f"Account: NetLiq=${net_liq:,.0f} BuyingPower=${buying_power:,.0f}")
 
             positions = {}
             # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
@@ -2209,6 +2210,9 @@ class ScannerThread(threading.Thread):
                     send_telegram(vol_msg)
                     status += f"  🔥{sym}"
 
+        # ── Fetch account data before FIB DT (needs buying power) ──
+        self._fetch_account_data()
+
         # ── FIB DT Auto-Strategy ──
         self._run_fib_dt_cycle(current, status)
 
@@ -2221,9 +2225,6 @@ class ScannerThread(threading.Thread):
         if self.on_status:
             self.on_status(status)
         log.info(status)
-
-        # Fetch account data at end of each cycle
-        self._fetch_account_data()
 
 
 # ══════════════════════════════════════════════════════════
