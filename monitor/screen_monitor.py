@@ -220,18 +220,27 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
             session = _get_market_session()
 
+            # Extended-hours running high/low/vwap from MIDPOINT bars
+            ext_high = None
+            ext_low = None
+            ext_vwap = None
+
             if session == 'pre_market':
                 # Pre-market: last RTH bar is yesterday → it IS prev_close
                 prev_close = last_bar.close
-                # Get current price from MIDPOINT (bid/ask avg)
+                # Get current price + running high/low/vwap from MIDPOINT
                 try:
                     mid_bars = ib.reqHistoricalData(
                         stock_contract, endDateTime='',
-                        durationStr='7200 S', barSizeSetting='1 min',
+                        durationStr='21600 S', barSizeSetting='1 min',
                         whatToShow='MIDPOINT', useRTH=False,
                     )
                     if mid_bars:
                         price = mid_bars[-1].close
+                        ext_high = max(b.high for b in mid_bars)
+                        ext_low = min(b.low for b in mid_bars)
+                        # Typical price average as VWAP proxy (no volume in MIDPOINT)
+                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
                 except Exception:
                     pass  # fall back to last RTH close
 
@@ -241,15 +250,18 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                     prev_close = bars[-2].close
                 else:
                     prev_close = 0.0
-                # Get current AH price from MIDPOINT
+                # Get current AH price + running high/low from MIDPOINT
                 try:
                     mid_bars = ib.reqHistoricalData(
                         stock_contract, endDateTime='',
-                        durationStr='7200 S', barSizeSetting='1 min',
+                        durationStr='14400 S', barSizeSetting='1 min',
                         whatToShow='MIDPOINT', useRTH=False,
                     )
                     if mid_bars:
                         price = mid_bars[-1].close
+                        ext_high = max(b.high for b in mid_bars)
+                        ext_low = min(b.low for b in mid_bars)
+                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
                 except Exception:
                     pass  # fall back to RTH close
 
@@ -285,6 +297,23 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
+            # Override with extended-hours values when available
+            rth_high = round(last_bar.high, 4)
+            rth_low = round(last_bar.low, 4)
+            if session == 'pre_market' and ext_high is not None:
+                # Pre-market: use only extended-hours data (RTH bar is yesterday)
+                day_high = round(ext_high, 4)
+                day_low = round(ext_low, 4)
+                vwap = round(ext_vwap, 4)
+            elif session == 'after_hours' and ext_high is not None:
+                # After-hours: combine RTH + AH data
+                day_high = round(max(rth_high, ext_high), 4)
+                day_low = round(min(rth_low, ext_low), 4)
+                vwap = round(ext_vwap, 4)
+            else:
+                day_high = rth_high
+                day_low = rth_low
+
             stocks[sym] = {
                 "price": round(price, 2),
                 "pct": round(pct, 1),
@@ -294,8 +323,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 "float": "",
                 "vwap": vwap,
                 "prev_close": round(prev_close, 4),
-                "day_high": round(last_bar.high, 4),
-                "day_low": round(last_bar.low, 4),
+                "day_high": day_high,
+                "day_low": day_low,
                 "contract": stock_contract,
             }
 
@@ -2138,16 +2167,23 @@ class ScannerThread(threading.Thread):
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
             session = _get_market_session()
+            ext_high = None
+            ext_low = None
+            ext_vwap = None
+
             if session == 'pre_market':
                 prev_close = last_bar.close
                 try:
                     mid_bars = ib.reqHistoricalData(
                         contract, endDateTime='',
-                        durationStr='7200 S', barSizeSetting='1 min',
+                        durationStr='21600 S', barSizeSetting='1 min',
                         whatToShow='MIDPOINT', useRTH=False,
                     )
                     if mid_bars:
                         price = mid_bars[-1].close
+                        ext_high = max(b.high for b in mid_bars)
+                        ext_low = min(b.low for b in mid_bars)
+                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
                 except Exception:
                     pass
             elif session == 'after_hours':
@@ -2155,11 +2191,14 @@ class ScannerThread(threading.Thread):
                 try:
                     mid_bars = ib.reqHistoricalData(
                         contract, endDateTime='',
-                        durationStr='7200 S', barSizeSetting='1 min',
+                        durationStr='14400 S', barSizeSetting='1 min',
                         whatToShow='MIDPOINT', useRTH=False,
                     )
                     if mid_bars:
                         price = mid_bars[-1].close
+                        ext_high = max(b.high for b in mid_bars)
+                        ext_low = min(b.low for b in mid_bars)
+                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
                 except Exception:
                     pass
             else:
@@ -2173,6 +2212,14 @@ class ScannerThread(threading.Thread):
                 vol_str = f"{volume / 1_000:.0f}K"
             else:
                 vol_str = str(int(volume))
+
+            # Override with extended-hours values when available
+            rth_high = round(last_bar.high, 4)
+            rth_low = round(last_bar.low, 4)
+            if session == 'pre_market' and ext_high is not None:
+                vwap = round(ext_vwap, 4)
+            elif session == 'after_hours' and ext_high is not None:
+                vwap = round(ext_vwap, 4)
 
             stock_data = {
                 'price': round(price, 2),
