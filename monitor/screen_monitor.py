@@ -722,12 +722,197 @@ _alerts_date: str = ""                                  # date for daily reset
 ALERT_MIN_SCORE = 40       # minimum score to send any alert (0-100)
 MULTI_SIGNAL_MIN = 2       # minimum signals for combined alert
 
+# ── News catalyst keywords (bullish / bearish) ──
+# Each tuple: (keyword, points, reason_label)
+# Matched case-insensitively against news headlines (Hebrew + English)
+_NEWS_BULLISH_KW: list[tuple[str, int, str]] = [
+    # ── AI / Tech ──
+    ("artificial intelligence", 20, "AI"),
+    ("בינה מלאכותית", 20, "AI"),
+    (" ai ", 15, "AI"),             # space-padded to avoid matching "said", "laim"
+    ("machine learning", 15, "AI"),
+    ("למידת מכונה", 15, "AI"),
+    ("deep learning", 15, "AI"),
+    ("generative ai", 20, "AI"),
+    ("chatgpt", 15, "AI"),
+    ("openai", 15, "AI"),
+    ("nvidia", 12, "AI"),
+    ("quantum comput", 15, "quantum"),
+    ("מחשוב קוונטי", 15, "quantum"),
+    # ── FDA / Biotech ──
+    ("fda approv", 25, "FDA"),
+    ("אישור fda", 25, "FDA"),
+    ("fda clear", 20, "FDA"),
+    ("breakthrough therapy", 20, "FDA"),
+    ("טיפול פורץ דרך", 20, "FDA"),
+    ("phase 3", 15, "Phase3"),
+    ("phase iii", 15, "Phase3"),
+    ("שלב 3", 15, "Phase3"),
+    ("clinical trial", 10, "clinical"),
+    ("ניסוי קליני", 10, "clinical"),
+    ("positive results", 15, "results+"),
+    ("תוצאות חיוביות", 15, "results+"),
+    ("positive data", 15, "results+"),
+    ("נתונים חיוביים", 15, "results+"),
+    # ── Government / Defense ──
+    ("government contract", 25, "gov"),
+    ("חוזה ממשלתי", 25, "gov"),
+    ("ממשלה", 12, "gov"),
+    ("government", 12, "gov"),
+    ("defense contract", 20, "defense"),
+    ("חוזה ביטחוני", 20, "defense"),
+    ("department of defense", 20, "defense"),
+    ("pentagon", 15, "defense"),
+    ("פנטגון", 15, "defense"),
+    ("military", 12, "defense"),
+    ("צבאי", 12, "defense"),
+    ("nasa", 15, "NASA"),
+    # ── Investment / Institutional ──
+    ("major investor", 20, "investor"),
+    ("משקיע", 15, "investor"),
+    ("institutional buy", 15, "investor"),
+    ("רכישה מוסדית", 15, "investor"),
+    ("13d filing", 15, "investor"),
+    ("activist investor", 18, "investor"),
+    ("warren buffett", 20, "investor"),
+    ("berkshire", 15, "investor"),
+    ("stake", 12, "investor"),
+    ("אחזקה", 10, "investor"),
+    ("insider buy", 15, "insider"),
+    ("רכישת פנים", 15, "insider"),
+    ("buyback", 15, "buyback"),
+    ("רכישה עצמית", 15, "buyback"),
+    ("share repurchase", 15, "buyback"),
+    # ── M&A / Partnerships ──
+    ("partnership", 18, "partnership"),
+    ("שותפות", 18, "partnership"),
+    ("collaboration", 12, "partnership"),
+    ("שיתוף פעולה", 12, "partnership"),
+    ("strategic alliance", 15, "partnership"),
+    ("ברית אסטרטגית", 15, "partnership"),
+    ("acquisition", 18, "M&A"),
+    ("רכישה", 12, "M&A"),
+    ("merger", 18, "M&A"),
+    ("מיזוג", 18, "M&A"),
+    ("buyout", 18, "M&A"),
+    ("takeover", 18, "M&A"),
+    ("השתלטות", 18, "M&A"),
+    # ── Earnings / Revenue ──
+    ("beat estimates", 18, "beat"),
+    ("עלה על התחזיות", 18, "beat"),
+    ("beats expectations", 18, "beat"),
+    ("revenue surge", 15, "revenue+"),
+    ("זינוק בהכנסות", 15, "revenue+"),
+    ("record revenue", 18, "revenue+"),
+    ("הכנסות שיא", 18, "revenue+"),
+    ("record earnings", 18, "earnings+"),
+    ("profit surge", 15, "earnings+"),
+    ("raised guidance", 18, "guidance+"),
+    ("העלאת תחזית", 18, "guidance+"),
+    ("raises guidance", 18, "guidance+"),
+    ("upgrade", 12, "upgrade"),
+    ("העלאת דירוג", 12, "upgrade"),
+    ("price target raised", 15, "PT+"),
+    ("יעד מחיר הועלה", 15, "PT+"),
+    ("price target increase", 15, "PT+"),
+    # ── Regulatory / IP ──
+    ("patent", 12, "patent"),
+    ("פטנט", 12, "patent"),
+    ("patent granted", 18, "patent"),
+    ("patent approved", 18, "patent"),
+    ("license agreement", 12, "license"),
+    ("הסכם רישיון", 12, "license"),
+    # ── Hot sectors ──
+    ("electric vehicle", 12, "EV"),
+    ("רכב חשמלי", 12, "EV"),
+    (" ev ", 10, "EV"),
+    ("solar", 10, "solar"),
+    ("סולארי", 10, "solar"),
+    ("clean energy", 10, "cleanE"),
+    ("אנרגיה נקייה", 10, "cleanE"),
+    ("blockchain", 10, "crypto"),
+    ("בלוקצ'יין", 10, "crypto"),
+    ("bitcoin", 10, "crypto"),
+    ("ביטקוין", 10, "crypto"),
+    ("crypto", 10, "crypto"),
+    ("short squeeze", 20, "squeeze"),
+    ("שורט סקוויז", 20, "squeeze"),
+    ("cannabis", 10, "cannabis"),
+    ("קנאביס", 10, "cannabis"),
+    ("marijuana", 10, "cannabis"),
+    ("legalization", 12, "legal"),
+    ("לגליזציה", 12, "legal"),
+    ("space", 10, "space"),
+    ("חלל", 10, "space"),
+    ("satellite", 10, "space"),
+    ("לוויין", 10, "space"),
+]
+
+# Bearish keywords — subtract points
+_NEWS_BEARISH_KW: list[tuple[str, int, str]] = [
+    ("dilution", -15, "dilution"),
+    ("דילול", -15, "dilution"),
+    ("offering", -12, "offering"),
+    ("הנפק", -10, "offering"),
+    ("shelf registration", -12, "shelf"),
+    ("bankruptcy", -20, "bankrupt"),
+    ("פשיטת רגל", -20, "bankrupt"),
+    ("delisting", -20, "delist"),
+    ("מחיקה מהמסחר", -20, "delist"),
+    ("sec investigation", -15, "SEC"),
+    ("חקירת sec", -15, "SEC"),
+    ("fraud", -18, "fraud"),
+    ("הונאה", -18, "fraud"),
+    ("lawsuit", -8, "lawsuit"),
+    ("תביע", -8, "lawsuit"),
+    ("downgrade", -12, "downgrade"),
+    ("הורדת דירוג", -12, "downgrade"),
+    ("price target cut", -12, "PT-"),
+    ("price target lower", -12, "PT-"),
+    ("missed estimates", -15, "miss"),
+    ("miss expectations", -15, "miss"),
+    ("reverse split", -15, "r/s"),
+    ("איחוד מניות", -15, "r/s"),
+    ("going concern", -18, "concern"),
+]
+
+
+def _score_news_catalysts(sym: str) -> tuple[int, list[str]]:
+    """Score news headlines for bullish/bearish catalysts. Returns (points, [labels])."""
+    enrich = _enrichment.get(sym, {})
+    news_list = enrich.get('news', [])
+    if not news_list:
+        return 0, []
+
+    total = 0
+    seen_labels: set[str] = set()
+    reasons: list[str] = []
+
+    for article in news_list:
+        title = article.get('title_he', '').lower()
+        if not title:
+            continue
+        # Add spaces around title for word-boundary matching
+        padded = f" {title} "
+        for kw, pts, label in _NEWS_BULLISH_KW:
+            if label not in seen_labels and kw.lower() in padded:
+                total += pts
+                seen_labels.add(label)
+                reasons.append(f"📰{label}")
+        for kw, pts, label in _NEWS_BEARISH_KW:
+            if label not in seen_labels and kw.lower() in padded:
+                total += pts  # pts is negative
+                seen_labels.add(label)
+                reasons.append(f"📰⚠️{label}")
+
+    return total, reasons
+
 
 def _calc_alert_score(sym: str, d: dict) -> tuple[int, list[str]]:
     """Score a stock 0-100 for alert relevance. Higher = more likely to move big.
 
     Returns (score, [reasons]).
-    Factors: low float, high RVOL, above VWAP, high pct change, near fib.
+    Factors: low float, high RVOL, above VWAP, high pct change, near fib, news catalysts.
     """
     score = 0
     reasons = []
@@ -805,7 +990,13 @@ def _calc_alert_score(sym: str, d: dict) -> tuple[int, list[str]]:
                 reasons.append("near fib")
                 break
 
-    return min(score, 100), reasons
+    # ── News catalysts (up to +25 / down to -20 pts) ──
+    news_pts, news_reasons = _score_news_catalysts(sym)
+    if news_pts != 0:
+        score += news_pts
+        reasons.extend(news_reasons)
+
+    return max(min(score, 100), 0), reasons
 
 
 def _reset_alerts_if_new_day():
