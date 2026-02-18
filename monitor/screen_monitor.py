@@ -494,7 +494,7 @@ _milestone_alerted: dict[str, float] = {}
 
 
 def _format_fib_text(sym: str, price: float) -> str:
-    """Build fib levels text block for milestone alerts."""
+    """Build fib levels text — highest at top, lowest at bottom (like a chart)."""
     cached = _fib_cache.get(sym)
     if not cached:
         return ""
@@ -505,20 +505,18 @@ def _format_fib_text(sym: str, price: float) -> str:
     if not above and not below:
         return ""
     lines = ["\n📐 <b>פיבונאצ'י:</b>"]
-    for lv in above:
+    # Above: highest first (top of chart)
+    for lv in reversed(above):
         info = ratio_map.get(round(lv, 4))
-        if info:
-            ratio, series = info
-            lines.append(f"  ⬆️ ${lv:.4f}  ({ratio} {series})")
-        else:
-            lines.append(f"  ⬆️ ${lv:.4f}")
+        ratio_label = f"  ({info[0]} {info[1]})" if info else ""
+        lines.append(f"  🟢 ${lv:.4f}{ratio_label}")
+    # Current price separator
+    lines.append(f"  ━━ ${price:.2f} ━━")
+    # Below: highest first (closest to price at top)
     for lv in reversed(below):
         info = ratio_map.get(round(lv, 4))
-        if info:
-            ratio, series = info
-            lines.append(f"  ⬇️ ${lv:.4f}  ({ratio} {series})")
-        else:
-            lines.append(f"  ⬇️ ${lv:.4f}")
+        ratio_label = f"  ({info[0]} {info[1]})" if info else ""
+        lines.append(f"  🔴 ${lv:.4f}{ratio_label}")
     return "\n".join(lines)
 
 
@@ -1078,30 +1076,11 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     else:
         lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
-    # Fibonacci levels (text)
-    fib_above = enriched.get('fib_above', [])
-    fib_below = enriched.get('fib_below', [])
-    if fib_above or fib_below:
+    # Fibonacci levels (text) — chart layout: highest at top
+    fib_text = _format_fib_text(sym, price)
+    if fib_text:
         lines.append("")
-        lines.append(f"📐 <b>פיבונאצ'י:</b>")
-        if fib_above:
-            for lv in fib_above:
-                cached = _fib_cache.get(sym)
-                ratio_info = cached[3].get(round(lv, 4)) if cached else None
-                if ratio_info:
-                    ratio, series = ratio_info
-                    lines.append(f"  ⬆️ ${lv:.4f}  ({ratio} {series})")
-                else:
-                    lines.append(f"  ⬆️ ${lv:.4f}")
-        if fib_below:
-            for lv in reversed(fib_below):
-                cached = _fib_cache.get(sym)
-                ratio_info = cached[3].get(round(lv, 4)) if cached else None
-                if ratio_info:
-                    ratio, series = ratio_info
-                    lines.append(f"  ⬇️ ${lv:.4f}  ({ratio} {series})")
-                else:
-                    lines.append(f"  ⬇️ ${lv:.4f}")
+        lines.append(fib_text.lstrip("\n"))
 
     # News (Hebrew)
     if enriched['news']:
