@@ -294,6 +294,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 "float": "",
                 "vwap": vwap,
                 "prev_close": round(prev_close, 4),
+                "day_high": round(last_bar.high, 4),
+                "day_low": round(last_bar.low, 4),
                 "contract": stock_contract,
             }
 
@@ -668,6 +670,193 @@ def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
             f"🔥 <b>{sym}</b> — ווליום חריג!\n"
             f"  Vol: {volume_raw:,.0f}  |  Float: {enrich['float']}\n"
             f"  Turnover: {turnover_pct:.0f}% מהפלוט"
+        )
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+#  Real-Time Trading Alerts (5 types)
+# ══════════════════════════════════════════════════════════
+
+# ── Alert tracking state ──
+_hod_break_alerted: dict[str, float] = {}              # sym -> last HOD value alerted
+_fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touch_count}
+_lod_touch_tracker: dict[str, int] = {}                 # sym -> touch count at day_low
+_lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD last cycle
+_vwap_side: dict[str, str] = {}                         # sym -> 'above' | 'below'
+_price_1min: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, price)]
+_spike_alerted: set[str] = set()                        # already alerted 8%+ spike
+_alerts_date: str = ""                                  # date for daily reset
+
+
+def _reset_alerts_if_new_day():
+    """Clear all alert tracking state when date changes."""
+    global _alerts_date
+    today = datetime.now(ZoneInfo('US/Eastern')).strftime('%Y-%m-%d')
+    if today != _alerts_date:
+        _alerts_date = today
+        _hod_break_alerted.clear()
+        _fib_touch_tracker.clear()
+        _lod_touch_tracker.clear()
+        _lod_was_near.clear()
+        _vwap_side.clear()
+        _price_1min.clear()
+        _spike_alerted.clear()
+        log.info(f"Alert state reset for new day: {today}")
+
+
+def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
+    """Alert 1: Price broke today's high of day."""
+    cur_high = current.get('day_high', 0)
+    prev_high = previous.get('day_high', 0)
+    price = current.get('price', 0)
+    if cur_high <= 0 or prev_high <= 0:
+        return None
+    # New HOD: today's high is higher than last cycle AND price is at/near the high
+    if cur_high > prev_high and price >= cur_high * 0.998:
+        # Only alert once per new high value (allow re-alert if high changes again)
+        last_alerted = _hod_break_alerted.get(sym, 0)
+        if cur_high <= last_alerted:
+            return None
+        _hod_break_alerted[sym] = cur_high
+        pct = current.get('pct', 0)
+        return (
+            f"🔺 <b>HOD BREAK — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 ${price:.2f} → שיא יומי חדש!\n"
+            f"📊 קודם: ${prev_high:.2f} | שינוי: {pct:+.1f}%"
+        )
+    return None
+
+
+def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
+    """Alert 2: 2nd time price touches same fib level (0.8% proximity)."""
+    if price <= 0:
+        return None
+    if sym not in _fib_cache:
+        calc_fib_levels(sym, price)
+    if sym not in _fib_cache:
+        return None
+
+    _, _, all_levels, ratio_map = _fib_cache[sym]
+    if sym not in _fib_touch_tracker:
+        _fib_touch_tracker[sym] = {}
+
+    threshold = price * 0.008  # 0.8%
+
+    for lv in all_levels:
+        if abs(price - lv) <= threshold:
+            lv_key = round(lv, 4)
+            count = _fib_touch_tracker[sym].get(lv_key, 0)
+            if count < 2:
+                _fib_touch_tracker[sym][lv_key] = count + 1
+                if count + 1 == 2:
+                    info = ratio_map.get(lv_key)
+                    ratio_label = f"{info[0]} {info[1]}" if info else ""
+                    proximity = abs(price - lv) / price * 100
+                    return (
+                        f"🎯🎯 <b>FIB TOUCH x2 — {sym}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 רמה: ${lv:.4f} ({ratio_label})\n"
+                        f"💰 מחיר: ${price:.2f} | קרבה: {proximity:.1f}%\n"
+                        f"📊 שינוי: {pct:+.1f}%"
+                    )
+    return None
+
+
+def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str | None:
+    """Alert 3: 2nd time price touches day_low (0.5% proximity)."""
+    if price <= 0 or day_low <= 0:
+        return None
+
+    threshold = day_low * 0.005  # 0.5%
+    near_lod = abs(price - day_low) <= threshold
+
+    was_near = _lod_was_near.get(sym, False)
+    _lod_was_near[sym] = near_lod
+
+    # Only count a new touch when transitioning from NOT near to near
+    if near_lod and not was_near:
+        count = _lod_touch_tracker.get(sym, 0) + 1
+        _lod_touch_tracker[sym] = count
+        if count == 2:
+            return (
+                f"🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📍 נמוך יומי: ${day_low:.2f}\n"
+                f"💰 מחיר: ${price:.2f} | שינוי: {pct:+.1f}%\n"
+                f"⚠️ נגיעה שנייה — תמיכה/שבירה?"
+            )
+    return None
+
+
+def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | None:
+    """Alert 4: Price crosses VWAP."""
+    if price <= 0 or vwap <= 0:
+        return None
+
+    current_side = 'above' if price > vwap else 'below'
+    prev_side = _vwap_side.get(sym)
+    _vwap_side[sym] = current_side
+
+    if prev_side is None:
+        return None  # first observation — just record
+
+    if prev_side == 'below' and current_side == 'above':
+        return (
+            f"⚡ <b>VWAP CROSS — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 חצה מעל VWAP!\n"
+            f"💰 ${price:.2f} > VWAP ${vwap:.2f}\n"
+            f"📊 שינוי: {pct:+.1f}%"
+        )
+    elif prev_side == 'above' and current_side == 'below':
+        return (
+            f"⚡ <b>VWAP CROSS — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 חצה מתחת VWAP!\n"
+            f"💰 ${price:.2f} < VWAP ${vwap:.2f}\n"
+            f"📊 שינוי: {pct:+.1f}%"
+        )
+    return None
+
+
+def check_1min_spike(sym: str, price: float, pct: float) -> str | None:
+    """Alert 5: Price rose 8%+ compared to ~1 minute ago."""
+    if price <= 0:
+        return None
+
+    now = time_mod.time()
+    if sym not in _price_1min:
+        _price_1min[sym] = []
+
+    _price_1min[sym].append((now, price))
+    # Prune entries older than 90 seconds
+    cutoff = now - 90
+    _price_1min[sym] = [(t, p) for t, p in _price_1min[sym] if t > cutoff]
+
+    if sym in _spike_alerted:
+        return None
+
+    # Find entry closest to 60 seconds ago (window: 55-65s)
+    target = now - 60
+    candidates = [(t, p) for t, p in _price_1min[sym] if abs(t - target) <= 5]
+    if not candidates:
+        return None
+
+    old_t, old_price = min(candidates, key=lambda x: abs(x[0] - target))
+    if old_price <= 0:
+        return None
+
+    change_pct = (price - old_price) / old_price * 100
+    if change_pct >= 8.0:
+        _spike_alerted.add(sym)
+        return (
+            f"🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⏱️ עלייה של {change_pct:.1f}% בדקה!\n"
+            f"💰 ${old_price:.2f} → ${price:.2f}\n"
+            f"📊 שינוי יומי: {pct:+.1f}%"
         )
     return None
 
@@ -2283,6 +2472,7 @@ class ScannerThread(threading.Thread):
 
     def _cycle(self):
         _check_market_reminders()
+        _reset_alerts_if_new_day()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
             if self.on_status:
@@ -2414,6 +2604,33 @@ class ScannerThread(threading.Thread):
                 if vol_msg:
                     send_telegram(vol_msg)
                     status += f"  🔥{sym}"
+
+        # ── Real-time alerts (5 types) ──
+        if not is_baseline and current:
+            for sym, d in current.items():
+                price = d['price']
+                pct = d.get('pct', 0)
+                # 1. HOD break
+                if self.previous and sym in self.previous:
+                    hod_msg = check_hod_break(sym, d, self.previous[sym])
+                    if hod_msg:
+                        send_telegram(hod_msg)
+                # 2. Fib 2nd touch
+                fib2_msg = check_fib_second_touch(sym, price, pct)
+                if fib2_msg:
+                    send_telegram(fib2_msg)
+                # 3. LOD 2nd touch
+                lod_msg = check_lod_touch(sym, price, d.get('day_low', 0), pct)
+                if lod_msg:
+                    send_telegram(lod_msg)
+                # 4. VWAP cross
+                vwap_msg = check_vwap_cross(sym, price, d.get('vwap', 0), pct)
+                if vwap_msg:
+                    send_telegram(vwap_msg)
+                # 5. 1-min spike
+                spike_msg = check_1min_spike(sym, price, pct)
+                if spike_msg:
+                    send_telegram(spike_msg)
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()
