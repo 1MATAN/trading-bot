@@ -7,14 +7,19 @@ places a market buy, then split exit orders:
 """
 
 import logging
+import time as _time
 from datetime import datetime
+
+from ib_insync import IB, MarketOrder, StopOrder, LimitOrder
 
 from broker.ibkr_connection import get_connection
 from broker.order_manager import OrderManager
 from broker.position_manager import PositionManager
 from notifications.trade_logger import TradeLogger
 from risk.risk_manager import RiskManager
-from strategies.fib_dt_live_strategy import DTEntryRequest, FibDTLiveStrategy
+from strategies.fib_dt_live_strategy import (
+    DTEntryRequest, DTTrailingExit, FibDTLiveStrategy, FibDTLiveStrategySync,
+)
 from utils.time_utils import now_et
 
 logger = logging.getLogger("trading_bot.fib_dt_live_entry")
@@ -205,3 +210,185 @@ class FibDTLiveEntry:
         )
 
         return True
+
+
+# ── Synchronous Entry Executor (for monitor integration) ─────
+
+class FibDTLiveEntrySync:
+    """Synchronous entry executor using raw ``ib_insync.IB`` calls.
+
+    Designed for use inside the scanner monitor thread which is not async.
+    Places: market buy → OCA bracket (half) → standalone stop (other half).
+    """
+
+    def __init__(self, ib_getter, strategy: FibDTLiveStrategySync,
+                 buying_power_getter=None, send_telegram_fn=None) -> None:
+        """
+        Parameters
+        ----------
+        ib_getter : callable
+            Zero-arg function returning an ``IB`` instance (or None).
+        strategy : FibDTLiveStrategySync
+            The sync strategy instance (for record_entry / mark_in_position).
+        buying_power_getter : callable or None
+            Zero-arg function returning current buying power as float.
+        send_telegram_fn : callable or None
+            Function(text: str) -> bool for Telegram notifications.
+        """
+        self._ib_getter = ib_getter
+        self._strategy = strategy
+        self._buying_power_getter = buying_power_getter
+        self._send_telegram = send_telegram_fn
+
+    def execute_entry(self, request: DTEntryRequest) -> bool:
+        """Execute a DTEntryRequest synchronously.
+
+        Returns True on success.
+        """
+        symbol = request.symbol
+        ib = self._ib_getter()
+        if not ib:
+            logger.error(f"[{symbol}] No IBKR connection for entry")
+            return False
+
+        # Position sizing
+        bp = self._buying_power_getter() if self._buying_power_getter else 0
+        if bp <= 0:
+            logger.warning(f"[{symbol}] No buying power available")
+            return False
+
+        qty = int(bp / request.entry_price)
+        if qty < 2:
+            logger.warning(f"[{symbol}] Position size {qty} too small for split exit")
+            return False
+
+        half = qty // 2
+        other_half = qty - half
+
+        try:
+            contract = request.contract
+
+            # 1. Market buy
+            buy_order = MarketOrder('BUY', qty)
+            buy_order.outsideRth = True
+            buy_trade = ib.placeOrder(contract, buy_order)
+            logger.info(f"[{symbol}] Market BUY {qty} shares — {buy_trade.orderStatus.status}")
+
+            # Get fill price
+            fill_price = request.entry_price
+            if buy_trade.orderStatus.status == "Filled":
+                fill_price = buy_trade.orderStatus.avgFillPrice
+            elif buy_trade.fills:
+                fill_price = buy_trade.fills[0].execution.avgPrice
+
+            # 2. OCA bracket for first half
+            oca_group = f"FibDT_{symbol}_{int(_time.time())}"
+
+            oca_stop = StopOrder('SELL', half, request.stop_price)
+            oca_stop.outsideRth = True
+            oca_stop.ocaGroup = oca_group
+            oca_stop.ocaType = 1
+            oca_stop.tif = 'GTC'
+            ib.placeOrder(contract, oca_stop)
+
+            oca_target = LimitOrder('SELL', half, request.target_price)
+            oca_target.outsideRth = True
+            oca_target.ocaGroup = oca_group
+            oca_target.ocaType = 1
+            oca_target.tif = 'GTC'
+            ib.placeOrder(contract, oca_target)
+
+            # 3. Standalone stop for other half
+            solo_stop = StopOrder('SELL', other_half, request.stop_price)
+            solo_stop.outsideRth = True
+            solo_stop.tif = 'GTC'
+            ib.placeOrder(contract, solo_stop)
+
+            msg = (
+                f"FIB DT: BUY {qty} {symbol} @ ~${fill_price:.2f} | "
+                f"OCA {half}sh stop ${request.stop_price:.2f}/target ${request.target_price:.2f} | "
+                f"Solo stop {other_half}sh ${request.stop_price:.2f}"
+            )
+            logger.info(msg)
+
+            # Update strategy state
+            self._strategy.record_entry()
+            self._strategy.mark_in_position(symbol)
+
+            # Telegram notification
+            if self._send_telegram:
+                self._send_telegram(
+                    f"📐 <b>FIB DT Auto-Entry</b>\n"
+                    f"  Market BUY {qty} {symbol} @ ~${fill_price:.2f}\n"
+                    f"  Fib: ${request.fib_level:.4f} (ratio={request.fib_ratio})\n"
+                    f"  OCA ({half}sh): stop ${request.stop_price:.2f} / target ${request.target_price:.2f}\n"
+                    f"  Standalone stop ({other_half}sh): ${request.stop_price:.2f}\n"
+                    f"  Gap: {request.gap_pct:+.1f}%"
+                )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[{symbol}] FIB DT entry failed: {e}")
+            if self._send_telegram:
+                self._send_telegram(f"❌ FIB DT entry failed: {symbol} — {e}")
+            return False
+
+    def execute_trailing_exit(self, exit_signal: DTTrailingExit) -> bool:
+        """Sell remaining shares for a trailing exit (sync).
+
+        Returns True on success.
+        """
+        symbol = exit_signal.symbol
+        ib = self._ib_getter()
+        if not ib:
+            logger.error(f"[{symbol}] No IBKR connection for trailing exit")
+            return False
+
+        try:
+            # Find current position
+            qty_to_sell = 0
+            for item in ib.portfolio():
+                if item.contract.symbol == symbol and item.position > 0:
+                    qty_to_sell = int(item.position)
+                    break
+
+            if qty_to_sell <= 0:
+                logger.info(f"[{symbol}] No position to sell for trailing exit")
+                self._strategy.mark_position_closed(symbol)
+                return True
+
+            sell_order = MarketOrder('SELL', qty_to_sell)
+            sell_order.outsideRth = True
+            trade = ib.placeOrder(exit_signal.contract, sell_order)
+            logger.info(
+                f"[{symbol}] TRAILING EXIT: SELL {qty_to_sell} shares — "
+                f"{trade.orderStatus.status} — {exit_signal.reason}"
+            )
+
+            self._strategy.mark_position_closed(symbol)
+
+            # Cancel any remaining open orders for this symbol
+            open_orders = ib.openOrders()
+            for order in open_orders:
+                for trade_obj in ib.openTrades():
+                    if (trade_obj.contract.symbol == symbol and
+                            trade_obj.order.orderId == order.orderId):
+                        try:
+                            ib.cancelOrder(order)
+                            logger.info(f"[{symbol}] Cancelled remaining order {order.orderId}")
+                        except Exception:
+                            pass
+
+            if self._send_telegram:
+                self._send_telegram(
+                    f"📐 <b>FIB DT Trailing Exit</b>\n"
+                    f"  SELL {qty_to_sell} {symbol}\n"
+                    f"  Reason: {exit_signal.reason}"
+                )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[{symbol}] Trailing exit failed: {e}")
+            return False

@@ -24,7 +24,7 @@ import logging
 import os
 import queue
 import threading
-import time
+import time as time_mod
 import tkinter as tk
 from collections import defaultdict
 from datetime import datetime, time, timedelta
@@ -45,12 +45,17 @@ from deep_translator import GoogleTranslator
 from strategies.fibonacci_engine import (
     find_anchor_candle, build_dual_series, advance_series,
 )
+from strategies.fib_dt_live_strategy import (
+    FibDTLiveStrategySync, DTEntryRequest, DTTrailingExit, GapSignal,
+)
+from strategies.fib_dt_live_entry import FibDTLiveEntrySync
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
     MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT,
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
+    STARTING_CAPITAL,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -217,6 +222,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
+            prev_close_val = bars[-2].close if len(bars) >= 2 else 0.0
+
             stocks[sym] = {
                 "price": round(price, 2),
                 "pct": round(pct, 1),
@@ -225,6 +232,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 "rvol": rvol,
                 "float": "",
                 "vwap": vwap,
+                "prev_close": round(prev_close_val, 4),
+                "contract": stock_contract,
             }
 
         except Exception as e:
@@ -1340,6 +1349,22 @@ class ScannerThread(threading.Thread):
         self.running = False
         self.previous: dict = {}
         self.count = 0
+        # ── FIB DT Auto-Strategy ──
+        self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
+        self._fib_dt_entry = FibDTLiveEntrySync(
+            ib_getter=_get_ibkr,
+            strategy=self._fib_dt_strategy,
+            buying_power_getter=self._get_buying_power,
+            send_telegram_fn=send_telegram,
+        )
+        self._fib_dt_current_sym: str | None = None  # best turnover symbol
+        # Cache scanner contracts for FIB DT (symbol -> Contract)
+        self._scanner_contracts: dict[str, object] = {}
+        self._cached_buying_power: float = 0.0
+
+    def _get_buying_power(self) -> float:
+        """Return cached buying power for position sizing."""
+        return self._cached_buying_power
 
     def stop(self):
         self.running = False
@@ -1358,7 +1383,7 @@ class ScannerThread(threading.Thread):
                 if not self.running:
                     break
                 self._process_order_queue()
-                time.sleep(1)
+                time_mod.sleep(1)
 
     def _process_order_queue(self):
         """Check and execute pending orders from the GUI thread."""
@@ -1436,7 +1461,7 @@ class ScannerThread(threading.Thread):
             log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_trade.orderStatus.status}")
 
             # 2. OCA bracket for first half
-            oca_group = f"FibDT_{sym}_{int(time.time())}"
+            oca_group = f"FibDT_{sym}_{int(time_mod.time())}"
 
             oca_stop = StopOrder('SELL', half, stop_price)
             oca_stop.outsideRth = True
@@ -1491,6 +1516,8 @@ class ScannerThread(threading.Thread):
                     net_liq = float(av.value)
                 elif av.tag == 'BuyingPower' and av.currency == 'USD':
                     buying_power = float(av.value)
+            # Cache for FIB DT position sizing
+            self._cached_buying_power = buying_power
 
             positions = {}
             # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
@@ -1508,6 +1535,95 @@ class ScannerThread(threading.Thread):
             self.on_account(net_liq, buying_power, positions)
         except Exception as e:
             log.debug(f"Account fetch: {e}")
+
+    def _run_fib_dt_cycle(self, current: dict, status: str):
+        """Run FIB DT auto-strategy: select best stock by turnover, feed to strategy."""
+        try:
+            # ── 1. Build ranked candidate list ──
+            candidates = []
+            for sym, d in current.items():
+                pct = d.get('pct', 0)
+                price = d.get('price', 0)
+                vwap = d.get('vwap', 0)
+                volume_raw = d.get('volume_raw', 0)
+                prev_close = d.get('prev_close', 0)
+                contract = d.get('contract')
+
+                if pct < 16 or price <= 0 or prev_close <= 0 or not contract:
+                    continue
+                if vwap > 0 and price <= vwap:
+                    continue
+
+                # Get float from enrichment cache
+                enrich = _enrichment.get(sym, {})
+                flt_str = enrich.get('float', '-')
+                flt_shares = _parse_float_to_shares(flt_str)
+                if flt_shares <= 0 or flt_shares >= 70_000_000:
+                    continue
+                if volume_raw <= 0:
+                    continue
+
+                turnover = volume_raw / flt_shares
+                candidates.append((sym, turnover, d, flt_shares))
+
+            if not candidates:
+                return
+
+            # Sort by turnover descending
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_sym, best_turnover, best_data, best_float = candidates[0]
+
+            # Log ranking (top 3)
+            top3 = candidates[:3]
+            ranking_str = " | ".join(
+                f"{s} {t:.2f}x" for s, t, _, _ in top3
+            )
+            log.info(f"FIB DT turnover ranking: {ranking_str}")
+
+            # ── 2. Build GapSignal for best candidate ──
+            gap_signal = GapSignal(
+                symbol=best_sym,
+                contract=best_data['contract'],
+                gap_pct=best_data['pct'],
+                prev_close=best_data['prev_close'],
+                current_price=best_data['price'],
+                float_shares=best_float,
+            )
+
+            if self._fib_dt_current_sym != best_sym:
+                log.info(
+                    f"FIB DT: tracking {best_sym} "
+                    f"(turnover={best_turnover:.2f}x, "
+                    f"+{best_data['pct']:.1f}%, "
+                    f"float={_enrichment.get(best_sym, {}).get('float', '?')})"
+                )
+                self._fib_dt_current_sym = best_sym
+
+            # ── 3. Run strategy cycle ──
+            entry_requests, trailing_exits = self._fib_dt_strategy.process_cycle(
+                [gap_signal]
+            )
+
+            # ── 4. Execute entries ──
+            for req in entry_requests:
+                log.info(
+                    f"FIB DT ENTRY SIGNAL: {req.symbol} "
+                    f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
+                    f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}"
+                )
+                success = self._fib_dt_entry.execute_entry(req)
+                if success:
+                    log.info(f"FIB DT: Entry executed for {req.symbol}")
+                else:
+                    log.warning(f"FIB DT: Entry failed for {req.symbol}")
+
+            # ── 5. Execute trailing exits ──
+            for exit_sig in trailing_exits:
+                log.info(f"FIB DT TRAILING EXIT: {exit_sig.symbol} — {exit_sig.reason}")
+                self._fib_dt_entry.execute_trailing_exit(exit_sig)
+
+        except Exception as e:
+            log.error(f"FIB DT cycle error: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -1643,6 +1759,9 @@ class ScannerThread(threading.Thread):
                 if vol_msg:
                     send_telegram(vol_msg)
                     status += f"  🔥{sym}"
+
+        # ── FIB DT Auto-Strategy ──
+        self._run_fib_dt_cycle(current, status)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
