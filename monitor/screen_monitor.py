@@ -435,6 +435,21 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             'earnings_date': fund.get('Earnings', '-'),
             'income': fund.get('Income', '-'),
             'float': fund.get('Shs Float', '-'),
+            'sector': fund.get('Sector', '-'),
+            'industry': fund.get('Industry', '-'),
+            'country': fund.get('Country', '-'),
+            'company': fund.get('Company', '-'),
+            'volume': fund.get('Volume', '-'),
+            'avg_volume': fund.get('Avg Volume', '-'),
+            'volatility_w': fund.get('Volatility W', '-'),
+            'volatility_m': fund.get('Volatility M', '-'),
+            'high_52w': fund.get('52W High', '-'),
+            'low_52w': fund.get('52W Low', '-'),
+            'market_cap': fund.get('Market Cap', '-'),
+            'insider_own': fund.get('Insider Own', '-'),
+            'insider_trans': fund.get('Insider Trans', '-'),
+            'inst_own': fund.get('Inst Own', '-'),
+            'inst_trans': fund.get('Inst Trans', '-'),
         }
 
         news_df = stock.ticker_news()
@@ -567,6 +582,13 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
     data = {
         'float': '-', 'short': '-', 'eps': '-',
         'income': '-', 'earnings': '-', 'cash': '-',
+        'sector': '-', 'industry': '-', 'country': '-', 'company': '-',
+        'volume': '-', 'avg_volume': '-',
+        'volatility_w': '-', 'volatility_m': '-',
+        'high_52w': '-', 'low_52w': '-',
+        'market_cap': '-',
+        'insider_own': '-', 'insider_trans': '-',
+        'inst_own': '-', 'inst_trans': '-',
         'fib_below': [], 'fib_above': [], 'news': [],
     }
 
@@ -582,6 +604,21 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
         data['income'] = f.get('income', '-')
         data['earnings'] = f.get('earnings_date', '-')
         data['cash'] = f.get('cash_per_share', '-')
+        data['sector'] = f.get('sector', '-')
+        data['industry'] = f.get('industry', '-')
+        data['country'] = f.get('country', '-')
+        data['company'] = f.get('company', '-')
+        data['volume'] = f.get('volume', '-')
+        data['avg_volume'] = f.get('avg_volume', '-')
+        data['volatility_w'] = f.get('volatility_w', '-')
+        data['volatility_m'] = f.get('volatility_m', '-')
+        data['high_52w'] = f.get('high_52w', '-')
+        data['low_52w'] = f.get('low_52w', '-')
+        data['market_cap'] = f.get('market_cap', '-')
+        data['insider_own'] = f.get('insider_own', '-')
+        data['insider_trans'] = f.get('insider_trans', '-')
+        data['inst_own'] = f.get('inst_own', '-')
+        data['inst_trans'] = f.get('inst_trans', '-')
         data['news'] = info.get('news', [])
     except Exception as e:
         log.error(f"Finviz {sym}: {e}")
@@ -630,25 +667,21 @@ def _calc_ma_table(current_price: float,
 
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float,
-                       ratio_map: dict | None = None,
-                       info_panel: dict | None = None) -> Path | None:
-    """Generate a 5-min candlestick chart with Fibonacci levels.
-
-    *info_panel* (optional): dict with keys sym, price, pct, float, short,
-    eps, ma_summary, news — drawn as semi-transparent overlay in top-right.
+                       ratio_map: dict | None = None) -> Path | None:
+    """Generate a candlestick chart with Fibonacci levels and MA overlays.
 
     Returns path to saved PNG or None on failure.
     """
     try:
-        # Crop to last ~200 bars so chart focuses on recent price action
-        df = df.tail(200).copy()
+        # Show up to 5000 bars — enough for 5m over 1.5 months
+        df = df.tail(5000).copy()
         if len(df) < 5:
             return None
 
-        fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
+        fig, ax = plt.subplots(figsize=(18, 10), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
-        # ── Candlestick chart (vectorized) ──
+        # ── Candlestick chart — thick bodies like TradingView ──
         x = np.arange(len(df))
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
@@ -659,44 +692,66 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
         up = closes >= opens
         down = ~up
-        width = 0.6
+        # Dynamic width: thicker for fewer bars, thinner for many
+        width = max(0.4, min(0.85, 120 / len(df)))
 
-        # Wicks
-        ax.vlines(x[up], lows[up], highs[up], color='#26a69a', linewidth=0.8)
-        ax.vlines(x[down], lows[down], highs[down], color='#ef5350', linewidth=0.8)
+        # Wicks — thick and visible
+        ax.vlines(x[up], lows[up], highs[up], color='#26a69a', linewidth=1.2)
+        ax.vlines(x[down], lows[down], highs[down], color='#ef5350', linewidth=1.2)
 
-        # Bodies
+        # Bodies — solid with edge for contrast
         body_bottom = np.minimum(opens, closes)
         body_height = np.maximum(np.abs(closes - opens), 0.001)
         ax.bar(x[up], body_height[up], bottom=body_bottom[up], width=width,
-               color='#26a69a', edgecolor='#26a69a', linewidth=0.5)
+               color='#26a69a', edgecolor='#1b8a7a', linewidth=0.5, zorder=3)
         ax.bar(x[down], body_height[down], bottom=body_bottom[down], width=width,
-               color='#ef5350', edgecolor='#ef5350', linewidth=0.5)
+               color='#ef5350', edgecolor='#c62828', linewidth=0.5, zorder=3)
 
-        # Filter fib levels to visible price range (with margin)
+        # ── Moving Averages overlay (only MAs ABOVE current price = resistance) ──
+        close_series = pd.Series(closes)
+        _ma_styles = {
+            'SMA9':  {'period': 9,  'color': '#FFD700', 'ls': '-'},   # yellow solid
+            'SMA20': {'period': 20, 'color': '#FF8C00', 'ls': '-'},   # orange solid
+            'SMA50': {'period': 50, 'color': '#00CED1', 'ls': '-'},   # cyan solid
+            'EMA9':  {'period': 9,  'color': '#FFD700', 'ls': '--'},  # yellow dashed
+            'EMA20': {'period': 20, 'color': '#FF8C00', 'ls': '--'},  # orange dashed
+            'EMA50': {'period': 50, 'color': '#00CED1', 'ls': '--'},  # cyan dashed
+        }
+        _ma_plotted = False
+        for name, cfg in _ma_styles.items():
+            p = cfg['period']
+            if len(close_series) < p:
+                continue
+            if name.startswith('SMA'):
+                vals = close_series.rolling(p).mean().values
+            else:
+                vals = close_series.ewm(span=p, adjust=False).mean().values
+            # Only draw if the latest MA value is above the current price
+            last_val = vals[-1]
+            if np.isnan(last_val) or last_val <= current_price:
+                continue
+            ax.plot(x, vals, color=cfg['color'], linestyle=cfg['ls'],
+                    linewidth=0.9, alpha=0.7, label=name)
+            _ma_plotted = True
+        if _ma_plotted:
+            ax.legend(loc='lower left', fontsize=6, framealpha=0.5,
+                      facecolor='#0e1117', edgecolor='#444', labelcolor='white',
+                      ncol=2)
+
+        # Y-axis driven by candle data — fib levels that fall in range are shown
         price_min = df['low'].min()
         price_max = df['high'].max()
-        margin = (price_max - price_min) * 0.15
-        vis_min = price_min - margin
-        vis_max = price_max + margin
+        price_range = price_max - price_min
+        vis_min = price_min - price_range * 0.25
+        vis_max = price_max + price_range * 0.25
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
-        # Ensure at least 3 fib levels are visible — expand Y range if needed
-        if len(visible_levels) < 3 and all_levels:
-            sorted_levels = sorted(all_levels, key=lambda lv: abs(lv - current_price))
-            closest_3 = sorted_levels[:3]
-            for lv in closest_3:
-                if lv < vis_min:
-                    vis_min = lv - margin * 0.5
-                if lv > vis_max:
-                    vis_max = lv + margin * 0.5
-            visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
-
-        # Draw fib levels — S1 labels right, S2 labels left, skip overlaps
+        # Draw fib levels — S1 labels on right, S2 labels on left
+        # Style matching TradingView: thin lines, ratio% (price) labels
         _default_color = '#888888'
         price_span = vis_max - vis_min
-        min_label_gap = price_span * 0.018
+        min_label_gap = price_span * 0.015
         last_y_right = -999.0
         last_y_left = -999.0
 
@@ -710,24 +765,26 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                 ratio, series = None, "S1"
 
             color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
-            ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.8, linestyle='-')
+            ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.7, linestyle='-', zorder=1)
 
+            # TradingView-style label: "61.80% (2.38)"
             if ratio is not None:
-                label = f'{ratio}  ${lv:.4f}'
+                pct = ratio * 100
+                label = f'{pct:.2f}% ({lv:.2f})'
             else:
-                label = f'${lv:.4f}'
+                label = f'({lv:.2f})'
 
             if series == "S2":
                 if abs(lv - last_y_left) < min_label_gap:
                     continue
                 ax.text(-0.5, lv, f'{label} ', color=color,
-                        fontsize=7, va='center', ha='right', fontweight='bold')
+                        fontsize=6.5, va='center', ha='right', fontweight='bold')
                 last_y_left = lv
             else:
                 if abs(lv - last_y_right) < min_label_gap:
                     continue
-                ax.text(len(df) - 0.5, lv, f' {label}', color=color,
-                        fontsize=7, va='center', ha='left', fontweight='bold')
+                ax.text(len(df) + 0.5, lv, f' {label}', color=color,
+                        fontsize=6.5, va='center', ha='left', fontweight='bold')
                 last_y_right = lv
 
         # Current price line
@@ -752,47 +809,18 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         ax.set_xticks(tick_positions)
         ax.set_xticklabels(tick_labels, color='#888', fontsize=7, rotation=30, ha='right')
 
-        # Styling
+        # Styling — last candle near right edge
         ax.set_ylim(vis_min, vis_max)
-        ax.set_xlim(-1, len(df) + 3)
+        ax.set_xlim(-1, len(df) + 1)
         ax.tick_params(colors='#888', labelsize=8)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_color('#333')
         ax.spines['left'].set_color('#333')
         ax.yaxis.label.set_color('#888')
-        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
+        ax.set_title(f'{sym} — 30m Extended + Fibonacci (${current_price:.2f})',
                      color='white', fontsize=14, fontweight='bold', pad=12)
         ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
-
-        # ── Embedded info panel (top-right corner) ──
-        if info_panel:
-            panel_lines = []
-            p_sym = info_panel.get('sym', sym)
-            p_price = info_panel.get('price', current_price)
-            p_pct = info_panel.get('pct', 0)
-            panel_lines.append(f"{p_sym}  ${p_price:.2f}  {p_pct:+.1f}%")
-            p_float = info_panel.get('float', '-')
-            p_short = info_panel.get('short', '-')
-            p_eps = info_panel.get('eps', '-')
-            panel_lines.append(f"Float: {p_float} | Short: {p_short}")
-            panel_lines.append(f"EPS: {p_eps}")
-            p_ma = info_panel.get('ma_summary', '')
-            if p_ma and p_ma != "✅ אין התנגדויות":
-                panel_lines.append(f"MA: {p_ma}")
-            p_news = info_panel.get('news')
-            if p_news:
-                # Truncate headline to 40 chars
-                headline = p_news[:40] + ('…' if len(p_news) > 40 else '')
-                panel_lines.append(headline)
-            panel_text = "\n".join(panel_lines)
-            ax.text(0.98, 0.97, panel_text,
-                    transform=ax.transAxes, fontsize=8, fontfamily='monospace',
-                    verticalalignment='top', horizontalalignment='right',
-                    color='white',
-                    bbox=dict(boxstyle='round,pad=0.5',
-                              facecolor='black', alpha=0.75,
-                              edgecolor='#555'))
 
         out_path = Path(f'/tmp/fib_{sym}.png')
         fig.savefig(out_path, dpi=100, bbox_inches='tight',
@@ -885,8 +913,9 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     if cached:
         ma_frames: dict[str, pd.DataFrame | None] = {}
         _tf_specs = [
-            ('5m',  '5 mins',  '5 D'),
+            ('5m',  '5 mins',  '1 M'),
             ('15m', '15 mins', '2 W'),
+            ('30m', '30 mins', '3 M'),
             ('1h',  '1 hour',  '3 M'),
             ('4h',  '4 hours', '6 M'),
         ]
@@ -896,22 +925,58 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         ma_rows = _calc_ma_table(price, ma_frames)
         ma_summary = _build_ma_summary(price, ma_rows)
 
-    # ── Message 1: compact text ──
-    lines = [
-        f"🆕 <b>{label}</b> — ${price:.2f}  {pct:+.1f}%  Vol:{stock.get('volume', '-')}",
-        "",
-    ]
-
-    # Fundamentals
+    # ── Build caption with all info ──
     eps = enriched.get('eps', '-')
     try:
         eps_val = float(str(eps).replace(',', ''))
         eps_icon = "🟢" if eps_val > 0 else "🔴"
     except (ValueError, TypeError):
         eps_icon = "⚪"
-    lines.append(f"📊 Float: {enriched['float']}  |  Short: {enriched['short']}")
-    lines.append(f"💰 {eps_icon} EPS: {eps}  |  Cash: ${enriched['cash']}")
+
+    lines = [
+        f"🆕 <b>{label}</b> — ${price:.2f}  {pct:+.1f}%  Vol:{stock.get('volume', '-')}",
+    ]
+
+    # Company info
+    company = enriched.get('company', '-')
+    if company and company != '-':
+        lines.append(f"\n🏢 {company}")
+    country = enriched.get('country', '-')
+    sector = enriched.get('sector', '-')
+    industry = enriched.get('industry', '-')
+    if any(v != '-' for v in [country, sector, industry]):
+        lines.append(f"🌍 {country} | {sector} | {industry}")
+
+    # Ownership
+    mcap = enriched.get('market_cap', '-')
+    inst_own = enriched.get('inst_own', '-')
+    inst_trans = enriched.get('inst_trans', '-')
+    insider_own = enriched.get('insider_own', '-')
+    insider_trans = enriched.get('insider_trans', '-')
+    lines.append(f"🏦 Inst: {inst_own} ({inst_trans}) | Insider: {insider_own} ({insider_trans})")
+    lines.append(f"💼 MCap: {mcap}")
+
+    # Fundamentals
+    lines.append(f"\n📊 Float: {enriched['float']} | Short: {enriched['short']}")
+    lines.append(f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}")
     lines.append(f"📅 Earnings: {enriched['earnings']}")
+
+    # Volume
+    vol = enriched.get('volume', '-')
+    avg_vol = enriched.get('avg_volume', '-')
+    lines.append(f"📈 Vol: {vol} | Avg: {avg_vol}")
+
+    # Volatility & 52W
+    vol_w = enriched.get('volatility_w', '-')
+    vol_m = enriched.get('volatility_m', '-')
+    hi52 = str(enriched.get('high_52w', '-')).split()[0]
+    lo52 = str(enriched.get('low_52w', '-')).split()[0]
+    lines.append(f"📉 Volatility: W {vol_w} | M {vol_m}")
+    lines.append(f"🎯 52W: ↑${hi52} | ↓${lo52}")
+
+    # MA resistance summary
+    if ma_summary:
+        lines.append(f"\n📈 Resist: {ma_summary}")
 
     # News (Hebrew)
     if enriched['news']:
@@ -919,37 +984,26 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         for n in enriched['news'][:3]:
             lines.append(f"📰 {n['title_he']}")
 
-    # MA resistance summary
-    if ma_summary:
-        lines.append("")
-        lines.append(f"📈 Resist: {ma_summary}")
+    caption = "\n".join(lines)
 
-    send_telegram("\n".join(lines))
-
-    # ── Message 2: Fib chart with embedded info panel ──
+    # ── Single message: fib chart + caption ──
     if not cached:
+        send_telegram(caption)
         return
 
     all_levels = cached[2]
     ratio_map = cached[3]
 
-    df_5min = ma_frames.get('5m') if ma_rows else None
-    if df_5min is not None:
-        # Build info panel for chart overlay
-        info_panel = {
-            'sym': sym,
-            'price': price,
-            'pct': pct,
-            'float': enriched.get('float', '-'),
-            'short': enriched.get('short', '-'),
-            'eps': eps,
-            'ma_summary': _build_ma_summary(price, ma_rows, max_levels=3),
-            'news': enriched['news'][0]['title_he'] if enriched.get('news') else None,
-        }
-        img = generate_fib_chart(sym, df_5min, all_levels, price,
-                                 ratio_map=ratio_map, info_panel=info_panel)
+    df_chart = ma_frames.get('5m') if ma_rows else None
+    if df_chart is not None:
+        img = generate_fib_chart(sym, df_chart, all_levels, price,
+                                 ratio_map=ratio_map)
         if img:
-            send_telegram_photo(img, f"📐 {label} — Fib ${price:.2f} {pct:+.1f}%")
+            send_telegram_photo(img, caption)
+            return
+
+    # Fallback: no chart available, send text only
+    send_telegram(caption)
 
 
 # ══════════════════════════════════════════════════════════
