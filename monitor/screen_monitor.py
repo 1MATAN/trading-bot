@@ -125,6 +125,10 @@ def _get_ibkr() -> IB | None:
 #  IBKR Scanner — replaces screenshot + OCR + parse
 # ══════════════════════════════════════════════════════════
 
+# Cache avg volume per symbol so repeat scans only need 2D of data
+_avg_vol_cache: dict[str, float] = {}
+
+
 def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                    price_max: float = MONITOR_PRICE_MAX) -> dict:
     """Run IBKR scanner and enrich each symbol with historical data.
@@ -159,14 +163,18 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
         if not sym or not sym.isalpha() or len(sym) > 5:
             continue
 
-        # Enrich with 12-day historical data for price, change%, volume, RVOL
+        # Reuse the scanner's already-qualified contract
+        stock_contract = contract
+
+        # Known stock with cached avg volume → only 2D needed
+        has_cached_avg = sym in _avg_vol_cache
+        duration = "2 D" if has_cached_avg else "12 D"
+
         try:
-            stock_contract = Stock(sym, "SMART", "USD")
-            ib.qualifyContracts(stock_contract)
             bars = ib.reqHistoricalData(
                 stock_contract,
                 endDateTime="",
-                durationStr="12 D",
+                durationStr=duration,
                 barSizeSetting="1 day",
                 whatToShow="TRADES",
                 useRTH=True,
@@ -185,13 +193,18 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             else:
                 pct = 0.0
 
-            # Calculate RVOL (today's volume / avg volume of previous days)
-            if len(bars) >= 2:
+            # RVOL: use cached avg or compute from full 12D
+            if has_cached_avg:
+                avg_vol = _avg_vol_cache[sym]
+            elif len(bars) >= 2:
                 prev_volumes = [b.volume for b in bars[:-1]]
                 avg_vol = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 0
-                rvol = round(volume / avg_vol, 1) if avg_vol > 0 else 0.0
+                if avg_vol > 0:
+                    _avg_vol_cache[sym] = avg_vol
             else:
-                rvol = 0.0
+                avg_vol = 0
+
+            rvol = round(volume / avg_vol, 1) if avg_vol > 0 else 0.0
 
             # Format volume (e.g. 2.3M, 890K)
             if volume >= 1_000_000:
@@ -213,8 +226,6 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
         except Exception as e:
             log.debug(f"Enrich {sym} failed: {e}")
             continue
-
-        time.sleep(0.05)  # light rate-limit between historical requests
 
     log.info(f"Scanner: {len(results)} raw → {len(stocks)} enriched symbols")
     return stocks
@@ -319,54 +330,32 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
         }
 
         news_df = stock.ticker_news()
+        titles_en = []
+        dates = []
         for _, row in news_df.head(max_news).iterrows():
             title_en = row.get('Title', '')
-            if not title_en:
-                continue
+            if title_en:
+                titles_en.append(title_en)
+                dates.append(str(row.get('Date', ''))[:10])
+
+        # Batch translate all headlines in one call
+        if titles_en:
             try:
-                title_he = _translator.translate(title_en)
+                combined = "\n||||\n".join(titles_en)
+                translated = _translator.translate(combined)
+                titles_he = translated.split("\n||||\n")
             except Exception:
-                title_he = title_en
-            date_str = str(row.get('Date', ''))[:10]
-            result['news'].append({
-                'title_he': title_he,
-                'date': date_str,
-            })
+                titles_he = titles_en
+            for i, title_he in enumerate(titles_he):
+                result['news'].append({
+                    'title_he': title_he.strip(),
+                    'date': dates[i] if i < len(dates) else '',
+                })
 
     except Exception as e:
         log.error(f"Finviz fetch failed for {symbol}: {e}")
 
     return result
-
-
-def format_stock_info(symbol: str, info: dict) -> str:
-    """Format fundamentals + news for Telegram (Hebrew)."""
-    f = info.get('fundamentals', {})
-
-    # Earnings indicator
-    eps = f.get('eps', '-')
-    try:
-        eps_val = float(str(eps).replace(',', ''))
-        eps_icon = "🟢" if eps_val > 0 else "🔴"
-    except (ValueError, TypeError):
-        eps_icon = "⚪"
-
-    lines = [f"📊 <b>{symbol}</b>"]
-    lines.append(f"  Float: {f.get('float', '-')}  |  Short: {f.get('short_float', '-')}")
-    lines.append(f"  Cash: ${f.get('cash_per_share', '-')}  |  {eps_icon} EPS: {eps}")
-    lines.append(f"  Income: {f.get('income', '-')}  |  Earnings: {f.get('earnings_date', '-')}")
-
-    return "\n".join(lines)
-
-
-def format_news_only(symbol: str, news: list[dict]) -> str:
-    """Format news as a separate message."""
-    if not news:
-        return ""
-    lines = [f"📰 <b>{symbol} — חדשות:</b>"]
-    for n in news:
-        lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
-    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════
@@ -529,12 +518,12 @@ def _calc_ma_table(current_price: float,
                    ma_frames: dict[str, pd.DataFrame | None]) -> list[dict]:
     """Compute SMA & EMA for periods 9/20/50/100/200 across all timeframes.
 
-    ``ma_frames``: {'1m': df, '5m': df, '15m': df, '1h': df, '2h': df,
-                    '4h': df, 'D': df, 'W': df, 'M': df}
+    ``ma_frames``: {'1m': df, '5m': df, '15m': df, '1h': df,
+                    '4h': df, 'D': df, 'W': df}
     Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    tf_order = ['1m', '5m', '15m', '1h', '4h', 'D', 'W']
     rows = []
     for tf in tf_order:
         frame = ma_frames.get(tf)
@@ -559,7 +548,7 @@ def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
     """
     green, red, grey = '#26a69a', '#ef5350', '#555'
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    tf_order = ['1m', '5m', '15m', '1h', '4h', 'D', 'W']
 
     ma_lookup = {}
     for r in ma_rows:
@@ -567,7 +556,7 @@ def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
 
     # Background box
     from matplotlib.patches import FancyBboxPatch
-    box_w, box_h = 0.30, 0.52
+    box_w, box_h = 0.30, 0.44
     bg = FancyBboxPatch((x_start - 0.005, y_start - box_h),
                         box_w, box_h,
                         boxstyle="round,pad=0.005",
@@ -751,48 +740,6 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         return None
 
 
-def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
-                        ma_type: str) -> str:
-    """Format MA table as a compact Telegram text message.
-
-    ``ma_type``: 'sma' or 'ema'.
-    Only shows MA values ABOVE the current price (resistance levels).
-    """
-    periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
-    key = 0 if ma_type == 'sma' else 1
-
-    lookup = {}
-    for r in ma_rows:
-        lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
-
-    label = ma_type.upper()
-    lines = [f"📈 <b>{sym} — {label} (התנגדויות)</b>  (${price:.2f})"]
-    # Header
-    hdr = f"<code>{'':>4}" + "".join(f"{p:>8}" for p in periods) + "</code>"
-    lines.append(hdr)
-
-    has_any = False
-    for tf in tf_order:
-        parts = f"<code>{tf:>4}"
-        row_has_value = False
-        for p in periods:
-            val = lookup.get((tf, p), (None, None))[key]
-            if val is not None and val > price:
-                parts += f" 🔴{val:>5.2f}"
-                row_has_value = True
-            else:
-                parts += "      —"
-        parts += "</code>"
-        if row_has_value:
-            lines.append(parts)
-            has_any = True
-
-    if not has_any:
-        lines.append("  ✅ אין התנגדויות — מחיר מעל כל הממוצעים")
-
-    return "\n".join(lines)
-
 
 def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
     """Find the closest SMA and EMA resistances above current price.
@@ -834,10 +781,8 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
         ('5m',  '5 mins',  '5 D'),
         ('15m', '15 mins', '2 W'),
         ('1h',  '1 hour',  '3 M'),
-        ('2h',  '2 hours', '6 M'),
         ('4h',  '4 hours', '1 Y'),
         ('W',   '1 week',  '5 Y'),
-        ('M',   '1 month', '5 Y'),
     ]
     for tf_key, bar_size, duration in _tf_specs:
         ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
