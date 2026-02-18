@@ -258,8 +258,8 @@ class StockHistory:
     def record(self, symbol: str, price: float, pct: float):
         now = datetime.now()
         self.data[symbol].append((now, price, pct))
-        # Keep last 2 hours max
-        cutoff = now - timedelta(hours=2)
+        # Keep last 24 hours max
+        cutoff = now - timedelta(hours=24)
         self.data[symbol] = [(t, p, pc) for t, p, pc in self.data[symbol] if t > cutoff]
 
     def get_momentum(self, symbol: str) -> dict:
@@ -304,6 +304,107 @@ class StockHistory:
 
 
 stock_history = StockHistory()
+
+
+# ══════════════════════════════════════════════════════════
+#  Daily Top Movers — track peak performance over 24h
+# ══════════════════════════════════════════════════════════
+
+TOP_MOVERS_PATH = DATA_DIR / "top_movers.json"
+
+
+class _DailyTopMovers:
+    """Track the best-performing stocks over a rolling 24-hour window.
+
+    Persists to JSON so data survives restarts.
+    """
+
+    def __init__(self):
+        self._data: dict[str, dict] = {}  # sym → {peak_pct, price, volume, first_seen, last_seen}
+        self._load()
+
+    # ── Persistence ──
+
+    def _load(self):
+        if not TOP_MOVERS_PATH.exists():
+            return
+        try:
+            with open(TOP_MOVERS_PATH) as f:
+                raw = json.load(f)
+            now = datetime.now()
+            cutoff = now - timedelta(hours=24)
+            for sym, info in raw.items():
+                first = datetime.fromisoformat(info['first_seen'])
+                if first > cutoff:
+                    self._data[sym] = info
+        except Exception:
+            log.debug("Top movers: failed to load JSON, starting fresh")
+
+    def _save(self):
+        try:
+            with open(TOP_MOVERS_PATH, 'w') as f:
+                json.dump(self._data, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Update ──
+
+    def update(self, stocks: dict):
+        """Update tracker with current scan results.
+
+        ``stocks`` is the raw scan dict: {sym: {price, pct, volume, ...}}.
+        """
+        now = datetime.now()
+        now_iso = now.isoformat()
+        cutoff = now - timedelta(hours=24)
+
+        for sym, d in stocks.items():
+            pct = d.get('pct', 0.0)
+            price = d.get('price', 0.0)
+            volume = d.get('volume', '')
+
+            existing = self._data.get(sym)
+            if existing:
+                if pct > existing['peak_pct']:
+                    existing['peak_pct'] = pct
+                existing['price'] = price
+                existing['volume'] = volume
+                existing['last_seen'] = now_iso
+            else:
+                self._data[sym] = {
+                    'peak_pct': pct,
+                    'price': price,
+                    'volume': volume,
+                    'first_seen': now_iso,
+                    'last_seen': now_iso,
+                }
+
+        # Prune entries older than 24h
+        expired = [s for s, info in self._data.items()
+                   if datetime.fromisoformat(info['first_seen']) <= cutoff]
+        for s in expired:
+            del self._data[s]
+
+        self._save()
+
+    # ── Query ──
+
+    def get_top(self, n: int = 10) -> list[dict]:
+        """Return top *n* movers sorted by peak_pct descending."""
+        items = sorted(self._data.items(), key=lambda x: x[1]['peak_pct'], reverse=True)
+        result = []
+        for sym, info in items[:n]:
+            result.append({
+                'symbol': sym,
+                'peak_pct': info['peak_pct'],
+                'price': info['price'],
+                'volume': info['volume'],
+                'first_seen': info['first_seen'],
+            })
+        return result
+
+
+top_movers = _DailyTopMovers()
 
 
 # ══════════════════════════════════════════════════════════
@@ -1099,7 +1200,8 @@ class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
                  on_status=None, on_stocks=None,
                  order_queue: queue.Queue | None = None,
-                 on_account=None, on_order_result=None):
+                 on_account=None, on_order_result=None,
+                 on_top_movers=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
@@ -1109,6 +1211,7 @@ class ScannerThread(threading.Thread):
         self.order_queue = order_queue
         self.on_account = on_account          # callback(net_liq, buying_power, positions)
         self.on_order_result = on_order_result  # callback(msg, success)
+        self.on_top_movers = on_top_movers    # callback(list[dict]) top movers
         self.running = False
         self.previous: dict = {}
         self.count = 0
@@ -1359,6 +1462,13 @@ class ScannerThread(threading.Thread):
         return merged
 
     def _cycle(self):
+        # ── Skip scanning when market is closed (20:00–04:00 ET) ──
+        if _market_session() == 'closed':
+            if self.on_status:
+                self.on_status("Market closed (20:00\u201304:00 ET)")
+            self._fetch_account_data()
+            return
+
         _cleanup_caches()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
@@ -1371,6 +1481,11 @@ class ScannerThread(threading.Thread):
 
         for sym, d in current.items():
             stock_history.record(sym, d['price'], d['pct'])
+
+        # ── Update top 24h movers ──
+        top_movers.update(current)
+        if self.on_top_movers:
+            self.on_top_movers(top_movers.get_top())
 
         file_logger.log_scan(ts, current)
 
@@ -1507,6 +1622,8 @@ class App:
         self._rendered_order: list[str] = []       # last symbol render order
         self._portfolio_widgets: dict[str, dict] = {}  # sym → cached portfolio widgets
         self._portfolio_order: list[str] = []
+        self._top_movers_widgets: list[dict] = []  # cached top movers row widgets
+        self._top_movers_data: list[dict] = []     # current top movers list
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
@@ -1558,6 +1675,18 @@ class App:
 
         self.canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
+
+        # ── Top 24h Movers Panel ──
+        tk.Frame(self.root, bg="#ffaa00", height=2).pack(fill='x', padx=12, pady=4)
+        tk.Label(self.root, text="Top 24h Movers:", font=("Helvetica", 20, "bold"),
+                 bg=self.BG, fg="#ffaa00").pack(padx=12, anchor='w')
+        tm_hdr = tk.Frame(self.root, bg=self.BG)
+        tm_hdr.pack(fill='x', padx=12)
+        for text, w in [("SYM", 8), ("PEAK%", 8), ("PRICE", 8), ("VOL", 10), ("FIRST SEEN", 12)]:
+            tk.Label(tm_hdr, text=text, font=("Courier", 16, "bold"),
+                     bg=self.BG, fg="#ffaa00", width=w, anchor='w').pack(side='left')
+        self._top_movers_frame = tk.Frame(self.root, bg=self.BG)
+        self._top_movers_frame.pack(fill='x', padx=12, pady=2)
 
         # ── Portfolio Panel ──
         tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=4)
@@ -1923,6 +2052,70 @@ class App:
                     'avg_lbl': avg_lbl, 'price_lbl': price_lbl,
                     'pnl_lbl': pnl_lbl, 'pnl_pct_lbl': pnl_pct_lbl,
                 }
+
+    # ── Top 24h Movers Panel ─────────────────────────────────
+
+    def _on_top_movers(self, movers: list[dict]):
+        """Callback from scanner thread — schedule GUI update."""
+        self._top_movers_data = movers
+        self.root.after(0, self._render_top_movers)
+
+    def _render_top_movers(self):
+        """Render the top 24h movers list."""
+        movers = self._top_movers_data
+        if not movers:
+            for w in self._top_movers_frame.winfo_children():
+                w.destroy()
+            self._top_movers_widgets.clear()
+            return
+
+        # Always full rebuild (max 10 rows, lightweight)
+        for w in self._top_movers_frame.winfo_children():
+            w.destroy()
+        self._top_movers_widgets.clear()
+
+        for i, m in enumerate(movers[:10]):
+            sym = m['symbol']
+            bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+            _click = lambda e, s=sym: self._select_stock(s)
+
+            row = tk.Frame(self._top_movers_frame, bg=bg)
+            row.pack(fill='x', pady=0)
+            row.bind('<Button-1>', _click)
+
+            sym_lbl = tk.Label(row, text=sym, font=("Courier", 18, "bold"),
+                               bg=bg, fg=self.FG, width=8, anchor='w')
+            sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
+
+            peak_pct = m.get('peak_pct', 0)
+            pct_fg = self.GREEN if peak_pct > 0 else self.RED
+            pct_lbl = tk.Label(row, text=f"{peak_pct:+.1f}%", font=("Courier", 18, "bold"),
+                               bg=bg, fg=pct_fg, width=8, anchor='w')
+            pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click)
+
+            price_lbl = tk.Label(row, text=f"${m.get('price', 0):.2f}", font=("Courier", 18),
+                                 bg=bg, fg=self.FG, width=8, anchor='w')
+            price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
+
+            vol_lbl = tk.Label(row, text=str(m.get('volume', '')), font=("Courier", 16),
+                               bg=bg, fg="#aaa", width=10, anchor='w')
+            vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click)
+
+            # Format first_seen as HH:MM
+            first_seen = m.get('first_seen', '')
+            try:
+                fs_dt = datetime.fromisoformat(first_seen)
+                fs_text = fs_dt.strftime('%H:%M')
+            except (ValueError, TypeError):
+                fs_text = first_seen[:5] if first_seen else ''
+            fs_lbl = tk.Label(row, text=fs_text, font=("Courier", 16),
+                              bg=bg, fg="#888", width=12, anchor='w')
+            fs_lbl.pack(side='left'); fs_lbl.bind('<Button-1>', _click)
+
+            self._top_movers_widgets.append({
+                'row': row, 'sym_lbl': sym_lbl, 'pct_lbl': pct_lbl,
+                'price_lbl': price_lbl, 'vol_lbl': vol_lbl, 'fs_lbl': fs_lbl,
+            })
 
     # ── Trading Panel ──────────────────────────────────────
 
@@ -2393,10 +2586,15 @@ class App:
                 order_queue=self._order_queue,
                 on_account=self._on_account_data,
                 on_order_result=self._on_order_result,
+                on_top_movers=self._on_top_movers,
             )
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
             self.status.set("Scanner running...")
+            # Show any persisted top movers immediately
+            existing = top_movers.get_top()
+            if existing:
+                self._on_top_movers(existing)
 
     def _apply_size(self, choice: str):
         geo = self._size_presets.get(choice, "1400x900")
