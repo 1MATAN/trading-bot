@@ -253,13 +253,14 @@ class FibDTLiveEntrySync:
             logger.error(f"[{symbol}] No IBKR connection for entry")
             return False
 
-        # Position sizing
+        # Position sizing (using NetLiq, not margin-inflated BuyingPower)
         bp = self._buying_power_getter() if self._buying_power_getter else 0
         if bp <= 0:
-            logger.warning(f"[{symbol}] No buying power available")
+            logger.warning(f"[{symbol}] No buying power available (NetLiq=${bp:,.0f})")
             return False
 
         qty = int(bp / request.entry_price)
+        logger.info(f"[{symbol}] Position sizing: NetLiq=${bp:,.0f} / ${request.entry_price:.2f} = {qty} shares")
         if qty < 2:
             logger.warning(f"[{symbol}] Position size {qty} too small for split exit")
             return False

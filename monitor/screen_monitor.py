@@ -1693,22 +1693,23 @@ class ScannerThread(threading.Thread):
         self._fib_dt_entry = FibDTLiveEntrySync(
             ib_getter=_get_ibkr,
             strategy=self._fib_dt_strategy,
-            buying_power_getter=self._get_buying_power,
+            buying_power_getter=self._get_net_liq,
             send_telegram_fn=send_telegram,
         )
         self._fib_dt_current_sym: str | None = None  # best turnover symbol
         # Cache scanner contracts for FIB DT (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
+        self._cached_net_liq: float = 0.0
         # Track FIB DT open positions for order fill monitoring
         self._fib_dt_positions: dict[str, dict] = {}  # symbol -> entry_info
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
 
-    def _get_buying_power(self) -> float:
-        """Return cached buying power for position sizing."""
-        return self._cached_buying_power
+    def _get_net_liq(self) -> float:
+        """Return cached NetLiquidation for position sizing."""
+        return self._cached_net_liq
 
     def stop(self):
         self.running = False
@@ -1991,9 +1992,10 @@ class ScannerThread(threading.Thread):
                     net_liq = float(av.value)
                 elif av.tag == 'BuyingPower' and av.currency == 'USD':
                     buying_power = float(av.value)
-            # Cache for FIB DT position sizing
+            # Cache for FIB DT position sizing (use NetLiq, not margin-inflated BuyingPower)
             self._cached_buying_power = buying_power
-            log.info(f"Account: NetLiq=${net_liq:,.0f} BuyingPower=${buying_power:,.0f}")
+            self._cached_net_liq = net_liq
+            log.info(f"Account: NetLiq=${net_liq:,.0f} BuyingPower=${buying_power:,.0f} (sizing uses NetLiq)")
 
             positions = {}
             # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
@@ -2264,6 +2266,21 @@ class ScannerThread(threading.Thread):
                 merged[sym]['enrich'] = _enrichment[sym]
         return merged
 
+    def _refresh_enrichment_fibs(self, current: dict):
+        """Re-partition fib_below/fib_above in enrichment cache using current prices."""
+        for sym, d in current.items():
+            if sym not in _enrichment:
+                continue
+            price = d.get('price', 0)
+            if price <= 0:
+                continue
+            try:
+                below, above = calc_fib_levels(sym, price)
+                _enrichment[sym]['fib_below'] = below
+                _enrichment[sym]['fib_above'] = above
+            except Exception as e:
+                log.debug(f"Fib refresh {sym}: {e}")
+
     def _cycle(self):
         _check_market_reminders()
         current = _run_ibkr_scan(self.price_min, self.price_max)
@@ -2406,6 +2423,9 @@ class ScannerThread(threading.Thread):
 
         # ── FIB DT Auto-Strategy ──
         self._run_fib_dt_cycle(current, status)
+
+        # ── Refresh fib partition with current prices ──
+        self._refresh_enrichment_fibs(current)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
