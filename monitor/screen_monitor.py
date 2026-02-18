@@ -1671,6 +1671,11 @@ class ScannerThread(threading.Thread):
             self._telegram_listener.stop()
 
     def run(self):
+        # Ensure asyncio event loop exists in this thread (ib_insync needs one)
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         self.running = True
         # Start Telegram listener for stock lookups
         self._telegram_listener = TelegramListenerThread(self._lookup_queue)
