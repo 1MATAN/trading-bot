@@ -850,11 +850,11 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         price_max = df['high'].max()
         margin = (price_max - price_min) * 0.15
 
-        # Find 3 fib levels below and 3 above current price
+        # Find 3 fib levels below and 6 above current price
         levels_below = sorted([lv for lv in all_levels if lv <= current_price])
         levels_above = sorted([lv for lv in all_levels if lv > current_price])
         target_below = levels_below[-3:] if len(levels_below) >= 3 else levels_below
-        target_above = levels_above[:3] if len(levels_above) >= 3 else levels_above
+        target_above = levels_above[:6] if len(levels_above) >= 6 else levels_above
 
         # Expand Y range to include these fib levels
         vis_min = price_min - margin
@@ -1044,6 +1044,31 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     else:
         lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
+    # Fibonacci levels (text)
+    fib_above = enriched.get('fib_above', [])
+    fib_below = enriched.get('fib_below', [])
+    if fib_above or fib_below:
+        lines.append("")
+        lines.append(f"📐 <b>פיבונאצ'י:</b>")
+        if fib_above:
+            for lv in fib_above:
+                cached = _fib_cache.get(sym)
+                ratio_info = cached[3].get(round(lv, 4)) if cached else None
+                if ratio_info:
+                    ratio, series = ratio_info
+                    lines.append(f"  ⬆️ ${lv:.4f}  ({ratio} {series})")
+                else:
+                    lines.append(f"  ⬆️ ${lv:.4f}")
+        if fib_below:
+            for lv in reversed(fib_below):
+                cached = _fib_cache.get(sym)
+                ratio_info = cached[3].get(round(lv, 4)) if cached else None
+                if ratio_info:
+                    ratio, series = ratio_info
+                    lines.append(f"  ⬇️ ${lv:.4f}  ({ratio} {series})")
+                else:
+                    lines.append(f"  ⬇️ ${lv:.4f}")
+
     # News (Hebrew)
     if enriched['news']:
         lines.append("")
@@ -1197,7 +1222,7 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
         _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map)
 
     below = [l for l in all_levels if l <= current_price][-3:]
-    above = [l for l in all_levels if l > current_price][:3]
+    above = [l for l in all_levels if l > current_price][:6]
     return below, above
 
 
