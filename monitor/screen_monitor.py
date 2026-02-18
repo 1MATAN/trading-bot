@@ -717,6 +717,8 @@ _price_1min: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, pr
 _spike_alerted: set[str] = set()                        # already alerted 8%+ spike
 _multi_signal_alerted: set[str] = set()                 # already sent multi-signal alert today
 _alerts_date: str = ""                                  # date for daily reset
+_daily_alert_count: dict[str, int] = {}                 # sym -> total alerts sent today
+_daily_volume_peak: dict[str, int] = {}                 # sym -> peak volume_raw seen today
 
 # ── Alert score thresholds ──
 ALERT_MIN_SCORE = 40       # minimum score to send any alert (0-100)
@@ -1013,6 +1015,8 @@ def _reset_alerts_if_new_day():
         _price_1min.clear()
         _spike_alerted.clear()
         _multi_signal_alerted.clear()
+        _daily_alert_count.clear()
+        _daily_volume_peak.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -2995,6 +2999,18 @@ class ScannerThread(threading.Thread):
 
         # ── Real-time alerts (5 types, score-filtered + multi-signal) ──
         if not is_baseline and current:
+            # Update daily volume peaks for all stocks in this cycle
+            for sym, d in current.items():
+                vol_raw = d.get('volume_raw', 0)
+                if vol_raw > _daily_volume_peak.get(sym, 0):
+                    _daily_volume_peak[sym] = vol_raw
+
+            # Find top-3 volume stocks for badge
+            vol_top3 = set()
+            if _daily_volume_peak:
+                sorted_vol = sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)
+                vol_top3 = {s for s, _ in sorted_vol[:3]}
+
             for sym, d in current.items():
                 price = d['price']
                 pct = d.get('pct', 0)
@@ -3005,9 +3021,27 @@ class ScannerThread(threading.Thread):
 
                 btn = _make_lookup_button(sym)
 
-                # Build score line with reasons for all alerts
+                # Build badges: volume rank + repeat alerts
+                badges = []
+                if sym in vol_top3:
+                    rank = [s for s, _ in sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)[:3]].index(sym) + 1
+                    vol_val = _daily_volume_peak[sym]
+                    if vol_val >= 1_000_000:
+                        vol_fmt = f"{vol_val / 1_000_000:.1f}M"
+                    elif vol_val >= 1_000:
+                        vol_fmt = f"{vol_val / 1_000:.0f}K"
+                    else:
+                        vol_fmt = str(vol_val)
+                    badges.append(f"📊 #{rank} ווליום היום ({vol_fmt})")
+                prev_alerts = _daily_alert_count.get(sym, 0)
+                if prev_alerts >= 2:
+                    badges.append(f"🔄 ×{prev_alerts} התראות היום")
+
+                # Build score line with reasons + badges
                 reason_str = f" ({', '.join(reasons)})" if reasons else ""
                 score_line = f"\n🏆 ניקוד: {score}/100{reason_str}"
+                if badges:
+                    score_line += "\n" + " | ".join(badges)
 
                 # 1. HOD break
                 if self.previous and sym in self.previous:
@@ -3015,6 +3049,7 @@ class ScannerThread(threading.Thread):
                     if hod_msg:
                         signals.append("HOD")
                         if score >= ALERT_MIN_SCORE:
+                            _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
                             send_telegram(hod_msg + score_line, reply_markup=btn)
                         else:
                             log.info(f"Alert filtered {sym} HOD: score {score} < {ALERT_MIN_SCORE}")
@@ -3023,6 +3058,7 @@ class ScannerThread(threading.Thread):
                 if fib2_msg:
                     signals.append("FIB×2")
                     if score >= ALERT_MIN_SCORE:
+                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
                         send_telegram(fib2_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} FIB×2: score {score} < {ALERT_MIN_SCORE}")
@@ -3031,6 +3067,7 @@ class ScannerThread(threading.Thread):
                 if lod_msg:
                     signals.append("LOD×2")
                     if score >= ALERT_MIN_SCORE:
+                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
                         send_telegram(lod_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} LOD×2: score {score} < {ALERT_MIN_SCORE}")
@@ -3039,6 +3076,7 @@ class ScannerThread(threading.Thread):
                 if vwap_msg:
                     signals.append("VWAP")
                     if score >= ALERT_MIN_SCORE:
+                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
                         send_telegram(vwap_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} VWAP: score {score} < {ALERT_MIN_SCORE}")
@@ -3047,6 +3085,7 @@ class ScannerThread(threading.Thread):
                 if spike_msg:
                     signals.append("SPIKE")
                     if score >= ALERT_MIN_SCORE:
+                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
                         send_telegram(spike_msg + score_line, reply_markup=btn)
                     else:
                         log.info(f"Alert filtered {sym} SPIKE: score {score} < {ALERT_MIN_SCORE}")
@@ -3057,13 +3096,15 @@ class ScannerThread(threading.Thread):
                     enrich = _enrichment.get(sym, {})
                     flt = enrich.get('float', '-')
                     short = enrich.get('short', '-')
+                    badge_line = ("\n" + " | ".join(badges)) if badges else ""
                     send_telegram(
                         f"🔥🔥🔥 <b>MULTI-SIGNAL — {sym}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"⚡ {len(signals)} סיגנלים: {' + '.join(signals)}\n"
                         f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                         f"📊 Float: {flt} | Short: {short} | RVOL: {d.get('rvol', 0)}x\n"
-                        f"🏆 ניקוד: {score}/100 ({', '.join(reasons)})",
+                        f"🏆 ניקוד: {score}/100 ({', '.join(reasons)})"
+                        f"{badge_line}",
                         reply_markup=btn,
                     )
 
