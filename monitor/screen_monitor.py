@@ -323,7 +323,7 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
             clean = _IBKR_HEADLINE_RE.sub('', h.headline).strip()
             if not clean:
                 continue
-            date_str = h.time.strftime('%Y-%m-%d') if h.time else ''
+            date_str = h.time.strftime('%Y-%m-%d %H:%M') if h.time else ''
             results.append({
                 'title_en': clean,
                 'date': date_str,
@@ -373,7 +373,7 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             title_en = row.get('Title', '')
             if title_en:
                 titles_en.append(title_en)
-                dates.append(str(row.get('Date', ''))[:10])
+                dates.append(str(row.get('Date', ''))[:16])
 
         # Batch translate all headlines in one call
         if titles_en:
