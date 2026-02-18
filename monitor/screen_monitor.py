@@ -2077,14 +2077,14 @@ class ScannerThread(threading.Thread):
             _enrich_stock(sym, d['price'], on_status=self.on_status)
 
             if not is_baseline:
-                # Filter: only send Telegram if above VWAP + >16% + float <70M
+                # Filter: only send Telegram if above VWAP + ≥20% + float <70M
                 vwap = d.get('vwap', 0)
                 pct = d.get('pct', 0)
                 price = d.get('price', 0)
                 flt_shares = _parse_float_to_shares(_enrichment[sym].get('float', '-'))
                 flt_ok = 0 < flt_shares < 70_000_000
                 above_vwap = vwap > 0 and price > vwap
-                above_pct = pct >= 16
+                above_pct = pct >= 20
 
                 if above_vwap and above_pct and flt_ok:
                     _send_stock_report(sym, d, _enrichment[sym])
