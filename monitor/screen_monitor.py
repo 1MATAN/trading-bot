@@ -128,6 +128,29 @@ def _get_ibkr() -> IB | None:
 
 
 # ══════════════════════════════════════════════════════════
+#  Market Session Detection
+# ══════════════════════════════════════════════════════════
+
+_ET = ZoneInfo('US/Eastern')
+
+
+def _get_market_session() -> str:
+    """Return current US market session based on Eastern Time.
+
+    Returns one of: 'pre_market', 'market', 'after_hours', 'closed'.
+    """
+    now_et = datetime.now(_ET)
+    t = now_et.time()
+    if time(4, 0) <= t < time(9, 30):
+        return 'pre_market'
+    elif time(9, 30) <= t < time(16, 0):
+        return 'market'
+    elif time(16, 0) <= t < time(20, 0):
+        return 'after_hours'
+    return 'closed'
+
+
+# ══════════════════════════════════════════════════════════
 #  IBKR Scanner — replaces screenshot + OCR + parse
 # ══════════════════════════════════════════════════════════
 
@@ -163,14 +186,17 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
     stocks: dict[str, dict] = {}
 
+    # ── Phase 1: Collect valid contracts ──
+    valid_items: list[tuple[str, object]] = []  # (sym, contract)
     for item in results:
         contract = item.contractDetails.contract
         sym = contract.symbol
         if not sym or not sym.isalpha() or len(sym) > 5:
             continue
+        valid_items.append((sym, contract))
 
-        # Reuse the scanner's already-qualified contract
-        stock_contract = contract
+    # ── Phase 2: Enrich with historical data ──
+    for sym, stock_contract in valid_items:
 
         # Known stock with cached avg volume → only 2D needed
         has_cached_avg = sym in _avg_vol_cache
@@ -192,12 +218,49 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             price = last_bar.close
             volume = last_bar.volume
 
-            # Calculate change% from previous close
-            if len(bars) >= 2:
-                prev_close = bars[-2].close
-                pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+            session = _get_market_session()
+
+            if session == 'pre_market':
+                # Pre-market: last RTH bar is yesterday → it IS prev_close
+                prev_close = last_bar.close
+                # Get current price from MIDPOINT (bid/ask avg)
+                try:
+                    mid_bars = ib.reqHistoricalData(
+                        stock_contract, endDateTime='',
+                        durationStr='7200 S', barSizeSetting='1 min',
+                        whatToShow='MIDPOINT', useRTH=False,
+                    )
+                    if mid_bars:
+                        price = mid_bars[-1].close
+                except Exception:
+                    pass  # fall back to last RTH close
+
+            elif session == 'after_hours':
+                # After-hours: last RTH bar is today → prev_close is yesterday
+                if len(bars) >= 2:
+                    prev_close = bars[-2].close
+                else:
+                    prev_close = 0.0
+                # Get current AH price from MIDPOINT
+                try:
+                    mid_bars = ib.reqHistoricalData(
+                        stock_contract, endDateTime='',
+                        durationStr='7200 S', barSizeSetting='1 min',
+                        whatToShow='MIDPOINT', useRTH=False,
+                    )
+                    if mid_bars:
+                        price = mid_bars[-1].close
+                except Exception:
+                    pass  # fall back to RTH close
+
             else:
-                pct = 0.0
+                # Market hours (or closed): normal calculation
+                if len(bars) >= 2:
+                    prev_close = bars[-2].close
+                else:
+                    prev_close = 0.0
+
+            pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
             # RVOL: use cached avg or compute from full 12D
             if has_cached_avg:
@@ -222,8 +285,6 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
-            prev_close_val = bars[-2].close if len(bars) >= 2 else 0.0
-
             stocks[sym] = {
                 "price": round(price, 2),
                 "pct": round(pct, 1),
@@ -232,7 +293,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 "rvol": rvol,
                 "float": "",
                 "vwap": vwap,
-                "prev_close": round(prev_close_val, 4),
+                "prev_close": round(prev_close, 4),
                 "contract": stock_contract,
             }
 
@@ -240,7 +301,8 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             log.debug(f"Enrich {sym} failed: {e}")
             continue
 
-    log.info(f"Scanner: {len(results)} raw → {len(stocks)} enriched symbols")
+    session = _get_market_session()
+    log.info(f"Scanner [{session}]: {len(results)} raw → {len(stocks)} enriched symbols")
     return stocks
 
 
@@ -1634,9 +1696,37 @@ class ScannerThread(threading.Thread):
             last_bar = bars[-1]
             price = last_bar.close
             volume = last_bar.volume
-            prev_close = bars[-2].close if len(bars) >= 2 else 0
-            pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
+
+            session = _get_market_session()
+            if session == 'pre_market':
+                prev_close = last_bar.close
+                try:
+                    mid_bars = ib.reqHistoricalData(
+                        contract, endDateTime='',
+                        durationStr='7200 S', barSizeSetting='1 min',
+                        whatToShow='MIDPOINT', useRTH=False,
+                    )
+                    if mid_bars:
+                        price = mid_bars[-1].close
+                except Exception:
+                    pass
+            elif session == 'after_hours':
+                prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+                try:
+                    mid_bars = ib.reqHistoricalData(
+                        contract, endDateTime='',
+                        durationStr='7200 S', barSizeSetting='1 min',
+                        whatToShow='MIDPOINT', useRTH=False,
+                    )
+                    if mid_bars:
+                        price = mid_bars[-1].close
+                except Exception:
+                    pass
+            else:
+                prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+
+            pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
             if volume >= 1_000_000:
                 vol_str = f"{volume / 1_000_000:.1f}M"
@@ -1998,7 +2088,10 @@ class ScannerThread(threading.Thread):
         # ── Baseline: send single summary to Telegram ──
         if is_baseline and current:
             top5 = sorted(current.items(), key=lambda x: x[1]['pct'], reverse=True)[:5]
-            summary_lines = [f"📡 <b>Scanner started</b> — {len(current)} stocks"]
+            session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
+                             'after_hours': 'After-Hours', 'closed': 'Closed'}
+            sess = session_label.get(_get_market_session(), 'Unknown')
+            summary_lines = [f"📡 <b>Scanner started</b> [{sess}] — {len(current)} stocks"]
             for sym, d in top5:
                 e = _enrichment.get(sym, {})
                 flt = e.get('float', '-')
