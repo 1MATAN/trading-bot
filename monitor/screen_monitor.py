@@ -818,16 +818,19 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
     Returns path to saved PNG or None on failure.
     """
     try:
-        # Crop to last ~200 bars so chart focuses on recent price action
-        df = df.tail(200).copy()
+        # Crop to last ~120 bars — chart will extend right so last candle is centered
+        df = df.tail(120).copy()
         if len(df) < 5:
             return None
+
+        n_bars = len(df)
+        right_padding = n_bars  # equal space on right → last candle in the middle
 
         fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
         # ── Candlestick chart ──
-        x = np.arange(len(df))
+        x = np.arange(n_bars)
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
         width = 0.6
@@ -896,7 +899,7 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
             else:
                 if abs(lv - last_y_right) < min_label_gap:
                     continue
-                ax.text(len(df) - 0.5, lv, f' {label}', color=color,
+                ax.text(n_bars + 1, lv, f' {label}', color=color,
                         fontsize=7, va='center', ha='left', fontweight='bold')
                 last_y_right = lv
 
@@ -924,7 +927,7 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
         # Styling
         ax.set_ylim(vis_min, vis_max)
-        ax.set_xlim(-1, len(df) + 3)
+        ax.set_xlim(-1, n_bars + right_padding)
         ax.tick_params(colors='#888', labelsize=8)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -1143,9 +1146,16 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     Returns (3_below, 3_above) relative to current_price.
     Auto-advances when price > 4.236 of the LOWER series (S1).
     """
-    if symbol in _fib_cache:
-        anchor_low, anchor_high, all_levels, _ratio_map = _fib_cache[symbol]
-    else:
+    cached = _fib_cache.get(symbol)
+    if cached:
+        anchor_low, anchor_high, all_levels, _ratio_map = cached
+        # Invalidate cache if price exceeded the top cached level (needs re-advance)
+        if all_levels and current_price > all_levels[-1]:
+            log.info(f"Fib cache invalidated for {symbol}: price ${current_price:.2f} > top level ${all_levels[-1]:.4f}")
+            del _fib_cache[symbol]
+            cached = None
+
+    if not cached:
         df = _download_daily(symbol)
         if df is None:
             return [], []
