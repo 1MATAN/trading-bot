@@ -28,7 +28,6 @@ import time
 import tkinter as tk
 from collections import defaultdict
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from tkinter import messagebox
 
 import matplotlib
@@ -38,7 +37,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import requests
-from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, Order, ScannerSubscription, util as ib_util
+from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
 
@@ -81,68 +80,45 @@ logging.basicConfig(
 log = logging.getLogger("monitor")
 
 
-_ET = ZoneInfo("US/Eastern")
-
-
-def _market_session() -> str:
-    """Return current market session: 'rth', 'extended', or 'closed'."""
-    now = datetime.now(_ET)
-    h, m = now.hour, now.minute
-    t = h * 60 + m  # minutes since midnight
-    if 570 <= t < 960:      # 9:30 – 16:00
-        return 'rth'
-    elif 240 <= t < 570:    # 4:00 – 9:30
-        return 'extended'
-    elif 960 <= t < 1200:   # 16:00 – 20:00
-        return 'extended'
-    else:                   # 20:00 – 4:00
-        return 'closed'
-
-
 # ══════════════════════════════════════════════════════════
 #  IBKR Connection (single synchronous IB instance)
 # ══════════════════════════════════════════════════════════
 
 _ibkr: IB | None = None
-_ibkr_lock = threading.Lock()
 
 
 def _get_ibkr() -> IB | None:
     """Get/create a dedicated IBKR connection for the monitor."""
     global _ibkr
-    with _ibkr_lock:
-        if _ibkr and _ibkr.isConnected():
-            return _ibkr
+    if _ibkr and _ibkr.isConnected():
+        return _ibkr
+    try:
+        # Ensure an asyncio event loop exists in this thread
+        # (ib_insync needs one; non-main threads don't get one by default)
         try:
-            # Ensure an asyncio event loop exists in this thread
-            # (ib_insync needs one; non-main threads don't get one by default)
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.set_event_loop(asyncio.new_event_loop())
-            _ibkr = IB()
-            _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
-            log.info("IBKR connection established (monitor)")
-            accts = _ibkr.managedAccounts() or []
-            acct = accts[0] if accts else "?"
-            # Subscribe to account updates so accountValues()/portfolio() return data
-            _ibkr.reqAccountUpdates(account=acct if acct != "?" else "")
-            _ibkr.sleep(0.5)  # let account data arrive
-            ok = send_telegram(
-                f"✅ <b>Monitor Online</b>\n"
-                f"  IBKR: מחובר ✓  |  Account: {acct}\n"
-                f"  Telegram: מחובר ✓\n"
-                f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            if ok:
-                log.info("Startup notification sent to Telegram")
-            else:
-                log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
-            return _ibkr
-        except Exception as e:
-            log.warning(f"IBKR connect failed: {e}")
-            _ibkr = None
-            return None
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        _ibkr = IB()
+        _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
+        log.info("IBKR connection established (monitor)")
+        accts = _ibkr.managedAccounts() or []
+        acct = accts[0] if accts else "?"
+        ok = send_telegram(
+            f"✅ <b>Monitor Online</b>\n"
+            f"  IBKR: מחובר ✓  |  Account: {acct}\n"
+            f"  Telegram: מחובר ✓\n"
+            f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        if ok:
+            log.info("Startup notification sent to Telegram")
+        else:
+            log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
+        return _ibkr
+    except Exception as e:
+        log.warning(f"IBKR connect failed: {e}")
+        _ibkr = None
+        return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -256,10 +232,9 @@ class StockHistory:
         self.data = defaultdict(list)
 
     def record(self, symbol: str, price: float, pct: float):
-        now = datetime.now()
-        self.data[symbol].append((now, price, pct))
-        # Keep last 24 hours max
-        cutoff = now - timedelta(hours=24)
+        self.data[symbol].append((datetime.now(), price, pct))
+        # Keep last 2 hours max
+        cutoff = datetime.now() - timedelta(hours=2)
         self.data[symbol] = [(t, p, pc) for t, p, pc in self.data[symbol] if t > cutoff]
 
     def get_momentum(self, symbol: str) -> dict:
@@ -271,10 +246,9 @@ class StockHistory:
         now_pct = pts[-1][2]
         now_price = pts[-1][1]
         momentum = {}
-        now = datetime.now()
 
         for label, minutes in [('1m', 1), ('5m', 5), ('15m', 15), ('30m', 30), ('1h', 60)]:
-            target_time = now - timedelta(minutes=minutes)
+            target_time = datetime.now() - timedelta(minutes=minutes)
             # Find closest point to target_time
             closest = min(pts, key=lambda x: abs((x[0] - target_time).total_seconds()))
             age = abs((closest[0] - target_time).total_seconds())
@@ -307,118 +281,10 @@ stock_history = StockHistory()
 
 
 # ══════════════════════════════════════════════════════════
-#  Daily Top Movers — track peak performance over 24h
-# ══════════════════════════════════════════════════════════
-
-TOP_MOVERS_PATH = DATA_DIR / "top_movers.json"
-
-
-class _DailyTopMovers:
-    """Track the best-performing stocks over a rolling 24-hour window.
-
-    Persists to JSON so data survives restarts.
-    """
-
-    def __init__(self):
-        self._data: dict[str, dict] = {}  # sym → {peak_pct, price, volume, first_seen, last_seen}
-        self._load()
-
-    # ── Persistence ──
-
-    def _load(self):
-        if not TOP_MOVERS_PATH.exists():
-            return
-        try:
-            with open(TOP_MOVERS_PATH) as f:
-                raw = json.load(f)
-            now = datetime.now()
-            cutoff = now - timedelta(hours=24)
-            for sym, info in raw.items():
-                first = datetime.fromisoformat(info['first_seen'])
-                if first > cutoff:
-                    self._data[sym] = info
-        except Exception:
-            log.debug("Top movers: failed to load JSON, starting fresh")
-
-    def _save(self):
-        try:
-            with open(TOP_MOVERS_PATH, 'w') as f:
-                json.dump(self._data, f, indent=2)
-        except Exception:
-            pass
-
-    # ── Update ──
-
-    def update(self, stocks: dict):
-        """Update tracker with current scan results.
-
-        ``stocks`` is the raw scan dict: {sym: {price, pct, volume, ...}}.
-        """
-        now = datetime.now()
-        now_iso = now.isoformat()
-        cutoff = now - timedelta(hours=24)
-
-        for sym, d in stocks.items():
-            pct = d.get('pct', 0.0)
-            price = d.get('price', 0.0)
-            volume = d.get('volume', '')
-
-            existing = self._data.get(sym)
-            if existing:
-                if pct > existing['peak_pct']:
-                    existing['peak_pct'] = pct
-                existing['price'] = price
-                existing['volume'] = volume
-                existing['last_seen'] = now_iso
-            else:
-                self._data[sym] = {
-                    'peak_pct': pct,
-                    'price': price,
-                    'volume': volume,
-                    'first_seen': now_iso,
-                    'last_seen': now_iso,
-                }
-
-        # Prune entries older than 24h
-        expired = [s for s, info in self._data.items()
-                   if datetime.fromisoformat(info['first_seen']) <= cutoff]
-        for s in expired:
-            del self._data[s]
-
-        self._save()
-
-    # ── Query ──
-
-    def get_top(self, n: int = 10) -> list[dict]:
-        """Return top *n* movers sorted by peak_pct descending."""
-        items = sorted(self._data.items(), key=lambda x: x[1]['peak_pct'], reverse=True)
-        result = []
-        for sym, info in items[:n]:
-            result.append({
-                'symbol': sym,
-                'peak_pct': info['peak_pct'],
-                'price': info['price'],
-                'volume': info['volume'],
-                'first_seen': info['first_seen'],
-            })
-        return result
-
-
-top_movers = _DailyTopMovers()
-
-
-# ══════════════════════════════════════════════════════════
 #  News Fetcher
 # ══════════════════════════════════════════════════════════
 
-_translator = None
-
-
-def _get_translator():
-    global _translator
-    if _translator is None:
-        _translator = GoogleTranslator(source='en', target='iw')
-    return _translator
+_translator = GoogleTranslator(source='en', target='iw')
 
 
 def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
@@ -435,21 +301,21 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             'earnings_date': fund.get('Earnings', '-'),
             'income': fund.get('Income', '-'),
             'float': fund.get('Shs Float', '-'),
+            'company': fund.get('Company', '-'),
+            'country': fund.get('Country', '-'),
             'sector': fund.get('Sector', '-'),
             'industry': fund.get('Industry', '-'),
-            'country': fund.get('Country', '-'),
-            'company': fund.get('Company', '-'),
-            'volume': fund.get('Volume', '-'),
-            'avg_volume': fund.get('Avg Volume', '-'),
-            'volatility_w': fund.get('Volatility W', '-'),
-            'volatility_m': fund.get('Volatility M', '-'),
-            'high_52w': fund.get('52W High', '-'),
-            'low_52w': fund.get('52W Low', '-'),
-            'market_cap': fund.get('Market Cap', '-'),
-            'insider_own': fund.get('Insider Own', '-'),
-            'insider_trans': fund.get('Insider Trans', '-'),
             'inst_own': fund.get('Inst Own', '-'),
             'inst_trans': fund.get('Inst Trans', '-'),
+            'insider_own': fund.get('Insider Own', '-'),
+            'insider_trans': fund.get('Insider Trans', '-'),
+            'market_cap': fund.get('Market Cap', '-'),
+            'vol_w': fund.get('Volatility W', '-'),
+            'vol_m': fund.get('Volatility M', '-'),
+            '52w_high': fund.get('52W High', '-'),
+            '52w_low': fund.get('52W Low', '-'),
+            'avg_volume': fund.get('Avg Volume', '-'),
+            'volume': fund.get('Volume', '-'),
         }
 
         news_df = stock.ticker_news()
@@ -458,7 +324,7 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             if not title_en:
                 continue
             try:
-                title_he = _get_translator().translate(title_en)
+                title_he = _translator.translate(title_en)
             except Exception:
                 title_he = title_en
             date_str = str(row.get('Date', ''))[:10]
@@ -472,6 +338,35 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
 
     return result
 
+
+def format_stock_info(symbol: str, info: dict) -> str:
+    """Format fundamentals + news for Telegram (Hebrew)."""
+    f = info.get('fundamentals', {})
+
+    # Earnings indicator
+    eps = f.get('eps', '-')
+    try:
+        eps_val = float(str(eps).replace(',', ''))
+        eps_icon = "🟢" if eps_val > 0 else "🔴"
+    except (ValueError, TypeError):
+        eps_icon = "⚪"
+
+    lines = [f"📊 <b>{symbol}</b>"]
+    lines.append(f"  Float: {f.get('float', '-')}  |  Short: {f.get('short_float', '-')}")
+    lines.append(f"  Cash: ${f.get('cash_per_share', '-')}  |  {eps_icon} EPS: {eps}")
+    lines.append(f"  Income: {f.get('income', '-')}  |  Earnings: {f.get('earnings_date', '-')}")
+
+    return "\n".join(lines)
+
+
+def format_news_only(symbol: str, news: list[dict]) -> str:
+    """Format news as a separate message."""
+    if not news:
+        return ""
+    lines = [f"📰 <b>{symbol} — חדשות:</b>"]
+    for n in news:
+        lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════
@@ -512,6 +407,9 @@ def check_milestone(sym: str, pct: float) -> str | None:
 
 HIGH_TURNOVER_PCT = 10.0  # volume > 10% of float = unusual
 
+# {symbol} — already alerted for high volume this session
+_vol_alerted: set[str] = set()
+
 
 def _parse_float_to_shares(flt_str: str) -> float:
     """Parse Finviz float string like '2.14M' or '120.5K' to share count."""
@@ -530,20 +428,28 @@ def _parse_float_to_shares(flt_str: str) -> float:
         return 0
 
 
-def _is_hot_volume(volume_raw: int, float_str: str) -> bool:
-    """Check if volume turnover >= 10% of float."""
-    float_shares = _parse_float_to_shares(float_str)
+def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
+    """Check if volume is unusually high relative to float.
+
+    Returns alert message or None. Only alerts once per symbol per session.
+    """
+    if sym in _vol_alerted:
+        return None
+
+    float_shares = _parse_float_to_shares(enrich.get('float', '-'))
     if float_shares <= 0 or volume_raw <= 0:
-        return False
-    return (volume_raw / float_shares) * 100 >= HIGH_TURNOVER_PCT
+        return None
 
+    turnover_pct = (volume_raw / float_shares) * 100
 
-def _sym_label(sym: str, volume_raw: int = 0, enrich: dict | None = None) -> str:
-    """Return symbol name with 🔥 prefix when volume is hot."""
-    if enrich and volume_raw > 0:
-        if _is_hot_volume(volume_raw, enrich.get('float', '-')):
-            return f"🔥{sym}"
-    return sym
+    if turnover_pct >= HIGH_TURNOVER_PCT:
+        _vol_alerted.add(sym)
+        return (
+            f"🔥 <b>{sym}</b> — ווליום חריג!\n"
+            f"  Vol: {volume_raw:,.0f}  |  Float: {enrich['float']}\n"
+            f"  Turnover: {turnover_pct:.0f}% מהפלוט"
+        )
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -552,23 +458,6 @@ def _sym_label(sym: str, volume_raw: int = 0, enrich: dict | None = None) -> str
 
 # {symbol: {float, short, eps, income, earnings, cash, fib_below, fib_above, news}}
 _enrichment: dict[str, dict] = {}
-# Timestamps for cache TTL (2 hours)
-_enrichment_ts: dict[str, float] = {}
-_CACHE_TTL_SEC = 2 * 3600  # 2 hours
-
-
-def _cleanup_caches():
-    """Remove stale entries from enrichment, fib, and daily caches."""
-    now = time.time()
-    stale = [sym for sym, ts in _enrichment_ts.items()
-             if now - ts > _CACHE_TTL_SEC]
-    for sym in stale:
-        _enrichment.pop(sym, None)
-        _enrichment_ts.pop(sym, None)
-        _fib_cache.pop(sym, None)
-        _daily_cache.pop(sym, None)
-    if stale:
-        log.info(f"Cache cleanup: removed {len(stale)} stale symbols: {stale}")
 
 
 def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
@@ -582,13 +471,10 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
     data = {
         'float': '-', 'short': '-', 'eps': '-',
         'income': '-', 'earnings': '-', 'cash': '-',
-        'sector': '-', 'industry': '-', 'country': '-', 'company': '-',
-        'volume': '-', 'avg_volume': '-',
-        'volatility_w': '-', 'volatility_m': '-',
-        'high_52w': '-', 'low_52w': '-',
-        'market_cap': '-',
-        'insider_own': '-', 'insider_trans': '-',
-        'inst_own': '-', 'inst_trans': '-',
+        'company': '-', 'country': '-', 'sector': '-', 'industry': '-',
+        'inst_own': '-', 'inst_trans': '-', 'insider_own': '-', 'insider_trans': '-',
+        'market_cap': '-', 'vol_w': '-', 'vol_m': '-',
+        '52w_high': '-', '52w_low': '-', 'avg_volume': '-', 'fvz_volume': '-',
         'fib_below': [], 'fib_above': [], 'news': [],
     }
 
@@ -604,21 +490,21 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
         data['income'] = f.get('income', '-')
         data['earnings'] = f.get('earnings_date', '-')
         data['cash'] = f.get('cash_per_share', '-')
+        data['company'] = f.get('company', '-')
+        data['country'] = f.get('country', '-')
         data['sector'] = f.get('sector', '-')
         data['industry'] = f.get('industry', '-')
-        data['country'] = f.get('country', '-')
-        data['company'] = f.get('company', '-')
-        data['volume'] = f.get('volume', '-')
-        data['avg_volume'] = f.get('avg_volume', '-')
-        data['volatility_w'] = f.get('volatility_w', '-')
-        data['volatility_m'] = f.get('volatility_m', '-')
-        data['high_52w'] = f.get('high_52w', '-')
-        data['low_52w'] = f.get('low_52w', '-')
-        data['market_cap'] = f.get('market_cap', '-')
-        data['insider_own'] = f.get('insider_own', '-')
-        data['insider_trans'] = f.get('insider_trans', '-')
         data['inst_own'] = f.get('inst_own', '-')
         data['inst_trans'] = f.get('inst_trans', '-')
+        data['insider_own'] = f.get('insider_own', '-')
+        data['insider_trans'] = f.get('insider_trans', '-')
+        data['market_cap'] = f.get('market_cap', '-')
+        data['vol_w'] = f.get('vol_w', '-')
+        data['vol_m'] = f.get('vol_m', '-')
+        data['52w_high'] = f.get('52w_high', '-')
+        data['52w_low'] = f.get('52w_low', '-')
+        data['avg_volume'] = f.get('avg_volume', '-')
+        data['fvz_volume'] = f.get('volume', '-')
         data['news'] = info.get('news', [])
     except Exception as e:
         log.error(f"Finviz {sym}: {e}")
@@ -635,7 +521,6 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
             log.error(f"Fib {sym}: {e}")
 
     _enrichment[sym] = data
-    _enrichment_ts[sym] = time.time()
     log.info(f"Enriched {sym}: float={data['float']} short={data['short']} fib={len(data['fib_below'])}↓{len(data['fib_above'])}↑")
     return data
 
@@ -649,7 +534,7 @@ def _calc_ma_table(current_price: float,
     Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['5m', '15m', '1h', '4h', 'D']
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
     rows = []
     for tf in tf_order:
         frame = ma_frames.get(tf)
@@ -665,93 +550,126 @@ def _calc_ma_table(current_price: float,
     return rows
 
 
+def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
+                       ma_type: str, x_start: float, y_start: float):
+    """Render a compact MA table overlay on the chart axes.
+
+    ``ma_type``: 'sma' or 'ema' — which column to display.
+    ``x_start``, ``y_start``: top-left corner in axes coordinates.
+    """
+    green, red, grey = '#26a69a', '#ef5350', '#555'
+    periods = [9, 20, 50, 100, 200]
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+
+    ma_lookup = {}
+    for r in ma_rows:
+        ma_lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
+
+    # Background box
+    from matplotlib.patches import FancyBboxPatch
+    box_w, box_h = 0.30, 0.52
+    bg = FancyBboxPatch((x_start - 0.005, y_start - box_h),
+                        box_w, box_h,
+                        boxstyle="round,pad=0.005",
+                        facecolor='#0e1117', edgecolor='#333',
+                        alpha=0.88, linewidth=0.5,
+                        transform=ax.transAxes, zorder=5)
+    ax.add_patch(bg)
+
+    z = 6  # zorder for text (above bg)
+    y = y_start - 0.015
+    lbl = ma_type.upper()
+    ax.text(x_start + box_w / 2, y, lbl, transform=ax.transAxes,
+            fontsize=7, fontweight='bold', color='#00d4ff',
+            ha='center', va='top', zorder=z)
+
+    # Column headers
+    col_offsets = [0.055, 0.105, 0.155, 0.21, 0.265]
+    y -= 0.025
+    for co, p in zip(col_offsets, periods):
+        ax.text(x_start + co, y, str(p), transform=ax.transAxes,
+                fontsize=5.5, fontweight='bold', color='#888',
+                ha='center', va='top', zorder=z)
+
+    # Data rows
+    key = 0 if ma_type == 'sma' else 1
+    for tf in tf_order:
+        y -= 0.023
+        ax.text(x_start + 0.005, y, tf, transform=ax.transAxes,
+                fontsize=5.5, fontweight='bold', color='#aaa',
+                va='top', zorder=z)
+        for co, p in zip(col_offsets, periods):
+            val = ma_lookup.get((tf, p), (None, None))[key]
+            if val is not None:
+                clr = green if current_price >= val else red
+                ax.text(x_start + co, y, f'{val:.2f}', transform=ax.transAxes,
+                        fontsize=5, color=clr, ha='center', va='top',
+                        fontfamily='monospace', zorder=z)
+            else:
+                ax.text(x_start + co, y, '—', transform=ax.transAxes,
+                        fontsize=5, color=grey, ha='center', va='top', zorder=z)
+
+
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float,
-                       ratio_map: dict | None = None) -> Path | None:
-    """Generate a candlestick chart with Fibonacci levels and MA overlays.
+                       ratio_map: dict | None = None,
+                       ma_frames: dict | None = None) -> Path | None:
+    """Generate a 5-min candlestick chart with Fibonacci levels + MA overlays.
+
+    Two compact MA tables overlaid on chart: SMA top-left, EMA bottom-left.
 
     Returns path to saved PNG or None on failure.
     """
     try:
-        # Show up to 5000 bars — enough for 5m over 1.5 months
-        df = df.tail(5000).copy()
+        # Crop to last ~200 bars so chart focuses on recent price action
+        df = df.tail(200).copy()
         if len(df) < 5:
             return None
 
-        fig, ax = plt.subplots(figsize=(18, 10), facecolor='#0e1117')
+        fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
-        # ── Candlestick chart — thick bodies like TradingView ──
+        # ── Candlestick chart ──
         x = np.arange(len(df))
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
-        opens = df['open'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        closes = df['close'].values
+        width = 0.6
+        for i, (_, row) in enumerate(df.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = '#26a69a' if c >= o else '#ef5350'
+            ax.plot([i, i], [l, h], color=color, linewidth=0.8)
+            body_bottom = min(o, c)
+            body_height = abs(c - o)
+            if body_height < 0.001:
+                body_height = 0.001
+            ax.bar(i, body_height, bottom=body_bottom, width=width,
+                   color=color, edgecolor=color, linewidth=0.5)
 
-        up = closes >= opens
-        down = ~up
-        # Dynamic width: thicker for fewer bars, thinner for many
-        width = max(0.4, min(0.85, 120 / len(df)))
-
-        # Wicks — thick and visible
-        ax.vlines(x[up], lows[up], highs[up], color='#26a69a', linewidth=1.2)
-        ax.vlines(x[down], lows[down], highs[down], color='#ef5350', linewidth=1.2)
-
-        # Bodies — solid with edge for contrast
-        body_bottom = np.minimum(opens, closes)
-        body_height = np.maximum(np.abs(closes - opens), 0.001)
-        ax.bar(x[up], body_height[up], bottom=body_bottom[up], width=width,
-               color='#26a69a', edgecolor='#1b8a7a', linewidth=0.5, zorder=3)
-        ax.bar(x[down], body_height[down], bottom=body_bottom[down], width=width,
-               color='#ef5350', edgecolor='#c62828', linewidth=0.5, zorder=3)
-
-        # ── Moving Averages overlay (only MAs ABOVE current price = resistance) ──
-        close_series = pd.Series(closes)
-        _ma_styles = {
-            'SMA9':  {'period': 9,  'color': '#FFD700', 'ls': '-'},   # yellow solid
-            'SMA20': {'period': 20, 'color': '#FF8C00', 'ls': '-'},   # orange solid
-            'SMA50': {'period': 50, 'color': '#00CED1', 'ls': '-'},   # cyan solid
-            'EMA9':  {'period': 9,  'color': '#FFD700', 'ls': '--'},  # yellow dashed
-            'EMA20': {'period': 20, 'color': '#FF8C00', 'ls': '--'},  # orange dashed
-            'EMA50': {'period': 50, 'color': '#00CED1', 'ls': '--'},  # cyan dashed
-        }
-        _ma_plotted = False
-        for name, cfg in _ma_styles.items():
-            p = cfg['period']
-            if len(close_series) < p:
-                continue
-            if name.startswith('SMA'):
-                vals = close_series.rolling(p).mean().values
-            else:
-                vals = close_series.ewm(span=p, adjust=False).mean().values
-            # Only draw if the latest MA value is above the current price
-            last_val = vals[-1]
-            if np.isnan(last_val) or last_val <= current_price:
-                continue
-            ax.plot(x, vals, color=cfg['color'], linestyle=cfg['ls'],
-                    linewidth=0.9, alpha=0.7, label=name)
-            _ma_plotted = True
-        if _ma_plotted:
-            ax.legend(loc='lower left', fontsize=6, framealpha=0.5,
-                      facecolor='#0e1117', edgecolor='#444', labelcolor='white',
-                      ncol=2)
-
-        # Y-axis driven by candle data — fib levels that fall in range are shown
+        # Filter fib levels — show at least 3 above and 3 below current price
         price_min = df['low'].min()
         price_max = df['high'].max()
-        price_range = price_max - price_min
-        vis_min = price_min - price_range * 0.25
-        vis_max = price_max + price_range * 0.25
+        margin = (price_max - price_min) * 0.15
+
+        # Find 3 fib levels below and 3 above current price
+        levels_below = sorted([lv for lv in all_levels if lv <= current_price])
+        levels_above = sorted([lv for lv in all_levels if lv > current_price])
+        target_below = levels_below[-3:] if len(levels_below) >= 3 else levels_below
+        target_above = levels_above[:3] if len(levels_above) >= 3 else levels_above
+
+        # Expand Y range to include these fib levels
+        vis_min = price_min - margin
+        vis_max = price_max + margin
+        if target_below:
+            vis_min = min(vis_min, min(target_below) - margin * 0.5)
+        if target_above:
+            vis_max = max(vis_max, max(target_above) + margin * 0.5)
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
-        # Draw fib levels — S1 labels on right, S2 labels on left
-        # Style matching TradingView: thin lines, ratio% (price) labels
+        # Draw fib levels — S1 labels right, S2 labels left, skip overlaps
         _default_color = '#888888'
         price_span = vis_max - vis_min
-        min_label_gap = price_span * 0.015
+        min_label_gap = price_span * 0.018
         last_y_right = -999.0
         last_y_left = -999.0
 
@@ -765,26 +683,24 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                 ratio, series = None, "S1"
 
             color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
-            ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.7, linestyle='-', zorder=1)
+            ax.axhline(y=lv, color=color, linewidth=0.8, alpha=0.8, linestyle='-')
 
-            # TradingView-style label: "61.80% (2.38)"
             if ratio is not None:
-                pct = ratio * 100
-                label = f'{pct:.2f}% ({lv:.2f})'
+                label = f'{ratio}  ${lv:.4f}'
             else:
-                label = f'({lv:.2f})'
+                label = f'${lv:.4f}'
 
             if series == "S2":
                 if abs(lv - last_y_left) < min_label_gap:
                     continue
                 ax.text(-0.5, lv, f'{label} ', color=color,
-                        fontsize=6.5, va='center', ha='right', fontweight='bold')
+                        fontsize=7, va='center', ha='right', fontweight='bold')
                 last_y_left = lv
             else:
                 if abs(lv - last_y_right) < min_label_gap:
                     continue
-                ax.text(len(df) + 0.5, lv, f' {label}', color=color,
-                        fontsize=6.5, va='center', ha='left', fontweight='bold')
+                ax.text(len(df) - 0.5, lv, f' {label}', color=color,
+                        fontsize=7, va='center', ha='left', fontweight='bold')
                 last_y_right = lv
 
         # Current price line
@@ -809,16 +725,16 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         ax.set_xticks(tick_positions)
         ax.set_xticklabels(tick_labels, color='#888', fontsize=7, rotation=30, ha='right')
 
-        # Styling — last candle near right edge
+        # Styling
         ax.set_ylim(vis_min, vis_max)
-        ax.set_xlim(-1, len(df) + 1)
+        ax.set_xlim(-1, len(df) + 3)
         ax.tick_params(colors='#888', labelsize=8)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_color('#333')
         ax.spines['left'].set_color('#333')
         ax.yaxis.label.set_color('#888')
-        ax.set_title(f'{sym} — 30m Extended + Fibonacci (${current_price:.2f})',
+        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
                      color='white', fontsize=14, fontweight='bold', pad=12)
         ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
 
@@ -843,7 +759,7 @@ def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
     Only shows MA values ABOVE the current price (resistance levels).
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['5m', '15m', '1h', '4h', 'D']
+    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
     key = 0 if ma_type == 'sma' else 1
 
     lookup = {}
@@ -878,54 +794,59 @@ def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
     return "\n".join(lines)
 
 
-def _build_ma_summary(price: float, ma_rows: list[dict], max_levels: int = 4) -> str:
-    """Return compact one-line summary of nearest MA resistance levels.
+def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
+    """Find the closest SMA and EMA resistances above current price.
 
-    Picks MA values that are ABOVE price, sorted by proximity, up to
-    *max_levels*.  Example: ``SMA50(D) $12.34 | EMA20(1h) $10.50``
+    Returns a compact string like: "SMA200(1h) $1.39 | EMA9(1h) $1.40"
     """
-    above: list[tuple[float, str]] = []
+    closest_sma = None  # (val, tf, period)
+    closest_ema = None
+
     for r in ma_rows:
-        for key, label in [('sma', 'SMA'), ('ema', 'EMA')]:
-            val = r[key]
-            if val is not None and val > price:
-                tag = f"{label}{r['period']}({r['tf']})"
-                above.append((val, tag))
-    # Sort by proximity to current price (closest first)
-    above.sort(key=lambda t: t[0])
-    selected = above[:max_levels]
-    if not selected:
-        return "✅ אין התנגדויות"
-    return " | ".join(f"{tag} ${val:.2f}" for val, tag in selected)
+        tf, period = r['tf'], r['period']
+        sma_val, ema_val = r['sma'], r['ema']
+
+        if sma_val is not None and sma_val > price:
+            if closest_sma is None or sma_val < closest_sma[0]:
+                closest_sma = (sma_val, tf, period)
+
+        if ema_val is not None and ema_val > price:
+            if closest_ema is None or ema_val < closest_ema[0]:
+                closest_ema = (ema_val, tf, period)
+
+    parts = []
+    if closest_sma:
+        parts.append(f"SMA{closest_sma[2]}({closest_sma[1]}) ${closest_sma[0]:.2f}")
+    if closest_ema:
+        parts.append(f"EMA{closest_ema[2]}({closest_ema[1]}) ${closest_ema[0]:.2f}")
+
+    return " | ".join(parts) if parts else ""
 
 
 def _send_stock_report(sym: str, stock: dict, enriched: dict):
-    """Send compact Telegram report: 1 text message + 1 fib chart image."""
-    label = _sym_label(sym, stock.get('volume_raw', 0), enriched)
+    """Send comprehensive Telegram report for a newly discovered stock."""
     price = stock['price']
-    pct = stock['pct']
 
-    # ── Build MA data (needed for text + chart panel) ──
-    cached = _fib_cache.get(sym)
-    ma_rows: list[dict] = []
-    ma_summary = ""
+    # ── Download MA timeframes first (needed for resist line) ──
+    ma_frames: dict[str, pd.DataFrame | None] = {}
+    _tf_specs = [
+        ('1m',  '1 min',   '2 D'),
+        ('5m',  '5 mins',  '5 D'),
+        ('15m', '15 mins', '2 W'),
+        ('1h',  '1 hour',  '3 M'),
+        ('2h',  '2 hours', '6 M'),
+        ('4h',  '4 hours', '1 Y'),
+        ('W',   '1 week',  '5 Y'),
+        ('M',   '1 month', '5 Y'),
+    ]
+    for tf_key, bar_size, duration in _tf_specs:
+        ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
+    ma_frames['D'] = _daily_cache.get(sym)
 
-    if cached:
-        ma_frames: dict[str, pd.DataFrame | None] = {}
-        _tf_specs = [
-            ('5m',  '5 mins',  '1 M'),
-            ('15m', '15 mins', '2 W'),
-            ('30m', '30 mins', '3 M'),
-            ('1h',  '1 hour',  '3 M'),
-            ('4h',  '4 hours', '6 M'),
-        ]
-        for tf_key, bar_size, duration in _tf_specs:
-            ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
-        ma_frames['D'] = _daily_cache.get(sym)
-        ma_rows = _calc_ma_table(price, ma_frames)
-        ma_summary = _build_ma_summary(price, ma_rows)
+    ma_rows = _calc_ma_table(price, ma_frames)
+    resist_str = _find_closest_resist(price, ma_rows)
 
-    # ── Build caption with all info ──
+    # ── EPS indicator ──
     eps = enriched.get('eps', '-')
     try:
         eps_val = float(str(eps).replace(',', ''))
@@ -933,77 +854,52 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     except (ValueError, TypeError):
         eps_icon = "⚪"
 
+    # ── Build consolidated message ──
     lines = [
-        f"🆕 <b>{label}</b> — ${price:.2f}  {pct:+.1f}%  Vol:{stock.get('volume', '-')}",
+        f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume', '-')}",
+        "",
+        f"🏢 {enriched.get('company', '-')}",
+        f"🌎 {enriched.get('country', '-')} | {enriched.get('sector', '-')} | {enriched.get('industry', '-')}",
+        f"🏛️ Inst: {enriched.get('inst_own', '-')} ({enriched.get('inst_trans', '-')}) | Insider: {enriched.get('insider_own', '-')} ({enriched.get('insider_trans', '-')})",
+        f"💰 MCap: {enriched.get('market_cap', '-')}",
+        "",
+        f"📊 Float: {enriched['float']} | Short: {enriched['short']}",
+        f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}",
+        f"📅 Earnings: {enriched['earnings']}",
+        f"📉 Vol: {enriched.get('fvz_volume', '-')} | Avg: {enriched.get('avg_volume', '-')}",
+        f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}",
+        f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}",
     ]
 
-    # Company info
-    company = enriched.get('company', '-')
-    if company and company != '-':
-        lines.append(f"\n🏢 {company}")
-    country = enriched.get('country', '-')
-    sector = enriched.get('sector', '-')
-    industry = enriched.get('industry', '-')
-    if any(v != '-' for v in [country, sector, industry]):
-        lines.append(f"🌍 {country} | {sector} | {industry}")
-
-    # Ownership
-    mcap = enriched.get('market_cap', '-')
-    inst_own = enriched.get('inst_own', '-')
-    inst_trans = enriched.get('inst_trans', '-')
-    insider_own = enriched.get('insider_own', '-')
-    insider_trans = enriched.get('insider_trans', '-')
-    lines.append(f"🏦 Inst: {inst_own} ({inst_trans}) | Insider: {insider_own} ({insider_trans})")
-    lines.append(f"💼 MCap: {mcap}")
-
-    # Fundamentals
-    lines.append(f"\n📊 Float: {enriched['float']} | Short: {enriched['short']}")
-    lines.append(f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}")
-    lines.append(f"📅 Earnings: {enriched['earnings']}")
-
-    # Volume
-    vol = enriched.get('volume', '-')
-    avg_vol = enriched.get('avg_volume', '-')
-    lines.append(f"📈 Vol: {vol} | Avg: {avg_vol}")
-
-    # Volatility & 52W
-    vol_w = enriched.get('volatility_w', '-')
-    vol_m = enriched.get('volatility_m', '-')
-    hi52 = str(enriched.get('high_52w', '-')).split()[0]
-    lo52 = str(enriched.get('low_52w', '-')).split()[0]
-    lines.append(f"📉 Volatility: W {vol_w} | M {vol_m}")
-    lines.append(f"🎯 52W: ↑${hi52} | ↓${lo52}")
-
-    # MA resistance summary
-    if ma_summary:
-        lines.append(f"\n📈 Resist: {ma_summary}")
+    # Resist line
+    if resist_str:
+        lines.append(f"📉 Resist: {resist_str}")
+    else:
+        lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
     # News (Hebrew)
     if enriched['news']:
         lines.append("")
-        for n in enriched['news'][:3]:
-            lines.append(f"📰 {n['title_he']}")
+        lines.append(f"📰 <b>חדשות:</b>")
+        for n in enriched['news']:
+            lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
 
-    caption = "\n".join(lines)
+    send_telegram("\n".join(lines))
 
-    # ── Single message: fib chart + caption ──
+    # ── Fib chart image ──
+    cached = _fib_cache.get(sym)
     if not cached:
-        send_telegram(caption)
         return
 
     all_levels = cached[2]
     ratio_map = cached[3]
 
-    df_chart = ma_frames.get('5m') if ma_rows else None
-    if df_chart is not None:
-        img = generate_fib_chart(sym, df_chart, all_levels, price,
+    df_5min = ma_frames.get('5m')
+    if df_5min is not None:
+        img = generate_fib_chart(sym, df_5min, all_levels, price,
                                  ratio_map=ratio_map)
         if img:
-            send_telegram_photo(img, caption)
-            return
-
-    # Fallback: no chart available, send text only
-    send_telegram(caption)
+            send_telegram_photo(img, f"📐 {sym} — 5min + Fibonacci ${price:.2f}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1123,6 +1019,24 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     return below, above
 
 
+def format_fib_levels(symbol: str, current_price: float,
+                      below: list[float], above: list[float]) -> str:
+    """Format fib levels for Telegram message."""
+    lines = [f"📐 <b>{symbol} — פיבונאצ'י</b>  (${current_price:.2f})"]
+
+    if above:
+        above_str = "  ".join(f"${p:.4f}" for p in above)
+        lines.append(f"  ⬆️ מעל: {above_str}")
+
+    if below:
+        below_str = "  ".join(f"${p:.4f}" for p in below)
+        lines.append(f"  ⬇️ מתחת: {below_str}")
+
+    if not above and not below:
+        lines.append("  ❌ אין נתונים")
+
+    return "\n".join(lines)
+
 
 # ── Fib Touch Detection ─────────────────────────────────
 
@@ -1176,9 +1090,7 @@ def check_fib_touch(symbol: str, price: float) -> str | None:
     # Clear old alerts if price moved away from all alerted levels
     to_clear = set()
     for alerted_lv in _fib_alerted[symbol]:
-        # Use the level's own price for threshold calculation (not current price)
-        level_threshold = alerted_lv * FIB_TOUCH_PCT / 100
-        if abs(price - alerted_lv) > level_threshold * 3:
+        if abs(price - alerted_lv) > threshold * 3:
             to_clear.add(alerted_lv)
     _fib_alerted[symbol] -= to_clear
 
@@ -1194,9 +1106,24 @@ PCT_JUMP_THRESHOLD = 5.0    # % change jumps by 5+ between scans
 PRICE_JUMP_THRESHOLD = 3.0  # price moves 3%+ between scans
 
 def detect_anomalies(current: dict, previous: dict) -> list[dict]:
-    """Detect big price/pct moves between scans (new stocks handled separately)."""
+    """Only flag truly unusual events."""
     alerts = []
 
+    # New stock appeared in scanner
+    for sym in set(current) - set(previous):
+        d = current[sym]
+        alerts.append({
+            'type': 'new',
+            'symbol': sym,
+            'price': d['price'],
+            'pct': d['pct'],
+            'volume': d.get('volume', ''),
+            'float': d.get('float', ''),
+            'fetch_news': True,
+            'msg': f"🆕 {sym} appeared: ${d['price']:.2f}  {d['pct']:+.1f}%  Vol:{d.get('volume','-')}  Float:{d.get('float','-')}"
+        })
+
+    # Existing stocks — check for big moves
     for sym in current:
         if sym not in previous:
             continue
@@ -1322,8 +1249,7 @@ class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
                  on_status=None, on_stocks=None,
                  order_queue: queue.Queue | None = None,
-                 on_account=None, on_order_result=None,
-                 on_top_movers=None):
+                 on_account=None, on_order_result=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
@@ -1333,7 +1259,6 @@ class ScannerThread(threading.Thread):
         self.order_queue = order_queue
         self.on_account = on_account          # callback(net_liq, buying_power, positions)
         self.on_order_result = on_order_result  # callback(msg, success)
-        self.on_top_movers = on_top_movers    # callback(list[dict]) top movers
         self.running = False
         self.previous: dict = {}
         self.count = 0
@@ -1344,11 +1269,6 @@ class ScannerThread(threading.Thread):
     def run(self):
         self.running = True
         log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
-        # Fetch account data immediately so GUI has buying power before first cycle
-        try:
-            self._fetch_account_data()
-        except Exception as e:
-            log.debug(f"Initial account fetch: {e}")
         while self.running:
             try:
                 self._cycle()
@@ -1376,20 +1296,19 @@ class ScannerThread(threading.Thread):
     def _execute_order(self, req: dict):
         """Place an order via IBKR.
 
-        Standard: req = {sym, action, qty, order_type, lmt_price, aux_price, tif, outside_rth}
+        Standard: req = {sym, action, qty, price}
         Fib DT:   req = {sym, action, qty, price, strategy='fib_dt',
                          stop_price, target_price, half, other_half}
         """
         sym = req['sym']
         action = req['action']  # 'BUY' or 'SELL'
         qty = req['qty']
+        price = req['price']
 
         ib = _get_ibkr()
         if not ib:
-            msg = "IBKR not connected — cannot place order"
-            log.error(msg)
             if self.on_order_result:
-                self.on_order_result(msg, False)
+                self.on_order_result("IBKR not connected", False)
             return
 
         if req.get('strategy') == 'fib_dt':
@@ -1399,54 +1318,19 @@ class ScannerThread(threading.Thread):
         try:
             contract = Stock(sym, 'SMART', 'USD')
             ib.qualifyContracts(contract)
-            if not contract.conId:
-                msg = f"Order failed: {sym} — symbol not found (qualifyContracts returned no conId)"
-                log.error(msg)
-                if self.on_order_result:
-                    self.on_order_result(msg, False)
-                return
-            log.info(f"Order: qualified {sym} conId={contract.conId}")
-
-            order_type = req.get('order_type', 'MKT')
-            tif = req.get('tif', 'DAY')
-            outside_rth = req.get('outside_rth', False)
-            lmt_price = req.get('lmt_price', 0)
-            aux_price = req.get('aux_price', 0)
-
-            if order_type == 'MKT':
-                order = MarketOrder(action, qty)
-                order_desc = f"MKT {action}"
-            elif order_type == 'LMT':
-                order = LimitOrder(action, qty, lmt_price)
-                order_desc = f"LMT {action} @ ${lmt_price:.2f}"
-            elif order_type == 'STP':
-                order = StopOrder(action, qty, aux_price)
-                order_desc = f"STP {action} trigger ${aux_price:.2f}"
-            elif order_type == 'STP LMT':
-                order = Order()
-                order.action = action
-                order.totalQuantity = qty
-                order.orderType = 'STP LMT'
-                order.lmtPrice = lmt_price
-                order.auxPrice = aux_price
-                order_desc = f"STP LMT {action} stop ${aux_price:.2f} lmt ${lmt_price:.2f}"
-            else:
-                order = MarketOrder(action, qty)
-                order_desc = f"MKT {action}"
-
-            order.tif = tif
-            order.outsideRth = outside_rth
-
+            order = LimitOrder(action, qty, price)
+            order.outsideRth = True
+            order.tif = 'DAY'
             trade = ib.placeOrder(contract, order)
-            msg = f"{order_desc} {qty} {sym} — {trade.orderStatus.status}"
+            msg = f"{action} {qty} {sym} @ ${price:.2f} — {trade.orderStatus.status}"
             log.info(f"Order placed: {msg}")
             if self.on_order_result:
                 self.on_order_result(msg, True)
             send_telegram(
                 f"📋 <b>Order Placed</b>\n"
-                f"  {order_desc} {qty} {sym}\n"
+                f"  {action} {qty} {sym} @ ${price:.2f}\n"
                 f"  Status: {trade.orderStatus.status}\n"
-                f"  TIF: {tif}  |  outsideRTH: {'✓' if outside_rth else '✗'}"
+                f"  outsideRth: ✓  |  TIF: DAY"
             )
         except Exception as e:
             msg = f"Order failed: {action} {qty} {sym} — {e}"
@@ -1466,65 +1350,45 @@ class ScannerThread(threading.Thread):
         try:
             contract = Stock(sym, 'SMART', 'USD')
             ib.qualifyContracts(contract)
-            if not contract.conId:
-                msg = f"FIB DT failed: {sym} — symbol not found"
-                log.error(msg)
-                if self.on_order_result:
-                    self.on_order_result(msg, False)
-                return
 
-            session = _market_session()
-            entry_price = req['price']
-
-            # 1. Entry buy — market during RTH, limit outside
-            if session == 'rth':
-                buy_order = MarketOrder('BUY', qty)
-                buy_order.outsideRth = False
-                buy_order.tif = 'DAY'
-                entry_desc = "MKT"
-            else:
-                buy_order = LimitOrder('BUY', qty, entry_price)
-                buy_order.outsideRth = True
-                buy_order.tif = 'DAY'
-                entry_desc = f"LMT @ ${entry_price:.2f}"
+            # 1. Market buy full qty
+            buy_order = MarketOrder('BUY', qty)
+            buy_order.outsideRth = True
             buy_trade = ib.placeOrder(contract, buy_order)
-            log.info(f"FIB DT: {entry_desc} BUY {qty} {sym} — {buy_trade.orderStatus.status}")
+            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_trade.orderStatus.status}")
 
             # 2. OCA bracket for first half
-            #    Stop orders only work during RTH.
-            #    Outside RTH use stop-limit (STP LMT) with outsideRth=True.
             oca_group = f"FibDT_{sym}_{int(time.time())}"
 
             oca_stop = StopOrder('SELL', half, stop_price)
+            oca_stop.outsideRth = True
             oca_stop.ocaGroup = oca_group
             oca_stop.ocaType = 1  # cancel others on fill
             oca_stop.tif = 'GTC'
-            # Stop orders only trigger during RTH; outsideRth not supported
-            oca_stop.outsideRth = False
             ib.placeOrder(contract, oca_stop)
 
             oca_target = LimitOrder('SELL', half, target_price)
+            oca_target.outsideRth = True
             oca_target.ocaGroup = oca_group
             oca_target.ocaType = 1
             oca_target.tif = 'GTC'
-            oca_target.outsideRth = True  # limit can fill outside RTH
             ib.placeOrder(contract, oca_target)
 
-            # 3. Standalone stop for other half (RTH only)
+            # 3. Standalone stop for other half
             solo_stop = StopOrder('SELL', other_half, stop_price)
+            solo_stop.outsideRth = True
             solo_stop.tif = 'GTC'
-            solo_stop.outsideRth = False
             ib.placeOrder(contract, solo_stop)
 
-            msg = (f"FIB DT: {entry_desc} BUY {qty} {sym} | "
+            msg = (f"FIB DT: BUY {qty} {sym} | "
                    f"OCA {half}sh stop ${stop_price:.2f}/target ${target_price:.2f} | "
                    f"Solo stop {other_half}sh ${stop_price:.2f}")
             log.info(msg)
             if self.on_order_result:
                 self.on_order_result(msg, True)
             send_telegram(
-                f"📐 <b>FIB DT Order ({session})</b>\n"
-                f"  {entry_desc} BUY {qty} {sym}\n"
+                f"📐 <b>FIB DT Order</b>\n"
+                f"  Market BUY {qty} {sym}\n"
                 f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
                 f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
                 f"  outsideRth: ✓  |  TIF: GTC"
@@ -1541,9 +1405,6 @@ class ScannerThread(threading.Thread):
         if not ib or not self.on_account:
             return
         try:
-            # Process pending IBKR messages to get fresh data
-            ib.sleep(0.1)
-
             acct_vals = ib.accountValues()
             net_liq = 0.0
             buying_power = 0.0
@@ -1553,13 +1414,11 @@ class ScannerThread(threading.Thread):
                 elif av.tag == 'BuyingPower' and av.currency == 'USD':
                     buying_power = float(av.value)
 
-            if net_liq == 0 and buying_power == 0:
-                log.warning("Account data empty — accountValues returned no USD values")
-
             positions = {}
+            # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
             for item in ib.portfolio():
                 if item.position == 0:
-                    continue
+                    continue  # skip closed positions
                 s = item.contract.symbol
                 positions[s] = (
                     int(item.position),
@@ -1568,10 +1427,9 @@ class ScannerThread(threading.Thread):
                     round(item.unrealizedPNL, 2),
                 )
 
-            log.info(f"Account: NLV=${net_liq:,.0f} BP=${buying_power:,.0f} positions={len(positions)}")
             self.on_account(net_liq, buying_power, positions)
         except Exception as e:
-            log.warning(f"Account fetch failed: {e}")
+            log.debug(f"Account fetch: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -1584,14 +1442,6 @@ class ScannerThread(threading.Thread):
         return merged
 
     def _cycle(self):
-        # ── Skip scanning when market is closed (20:00–04:00 ET) ──
-        if _market_session() == 'closed':
-            if self.on_status:
-                self.on_status("Market closed (20:00\u201304:00 ET)")
-            self._fetch_account_data()
-            return
-
-        _cleanup_caches()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
             if self.on_status:
@@ -1603,11 +1453,6 @@ class ScannerThread(threading.Thread):
 
         for sym, d in current.items():
             stock_history.record(sym, d['price'], d['pct'])
-
-        # ── Update top 24h movers ──
-        top_movers.update(current)
-        if self.on_top_movers:
-            self.on_top_movers(top_movers.get_top())
 
         file_logger.log_scan(ts, current)
 
@@ -1666,9 +1511,8 @@ class ScannerThread(threading.Thread):
                 e = _enrichment.get(sym, {})
                 flt = e.get('float', '-')
                 short = e.get('short', '-')
-                label = _sym_label(sym, d.get('volume_raw', 0), e)
                 summary_lines.append(
-                    f"  {label} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
+                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
                 )
             if len(current) > 5:
                 summary_lines.append(f"  ... +{len(current)-5} more")
@@ -1677,22 +1521,21 @@ class ScannerThread(threading.Thread):
         # ── Anomaly detection (only after baseline) ──
         if not is_baseline and current:
             alerts = detect_anomalies(current, self.previous)
-            if alerts:
+            # Filter: only price/pct jumps (new stocks handled above)
+            jump_alerts = [a for a in alerts if a['type'] != 'new']
+            if jump_alerts:
                 header = f"🔔 <b>Alert</b> — {datetime.now().strftime('%H:%M:%S')}\n"
                 lines = []
-                for a in alerts:
+                for a in jump_alerts:
                     sym = a.get('symbol', '')
-                    d = current.get(sym, {})
-                    e = _enrichment.get(sym, {})
-                    label = _sym_label(sym, d.get('volume_raw', 0), e)
-                    line = a['msg'].replace(sym, label, 1)
+                    line = a['msg']
                     mom = stock_history.format_momentum(sym)
                     if mom:
                         line += f"\n   📊 {mom}"
                     lines.append(line)
                     file_logger.log_alert(ts, a)
                 send_telegram(header + "\n".join(lines))
-                status += f"  🔔{len(alerts)}"
+                status += f"  🔔{len(jump_alerts)}"
             else:
                 status += "  ✓"
 
@@ -1702,6 +1545,14 @@ class ScannerThread(threading.Thread):
             if ms_msg:
                 send_telegram(ms_msg)
                 status += f"  📈{sym}"
+
+        # ── Volume anomaly checks ──
+        for sym, d in current.items():
+            if sym in _enrichment and d.get('volume_raw', 0) > 0:
+                vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
+                if vol_msg:
+                    send_telegram(vol_msg)
+                    status += f"  🔥{sym}"
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
@@ -1744,8 +1595,6 @@ class App:
         self._rendered_order: list[str] = []       # last symbol render order
         self._portfolio_widgets: dict[str, dict] = {}  # sym → cached portfolio widgets
         self._portfolio_order: list[str] = []
-        self._top_movers_widgets: list[dict] = []  # cached top movers row widgets
-        self._top_movers_data: list[dict] = []     # current top movers list
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
@@ -1756,37 +1605,37 @@ class App:
         self.root.resizable(True, True)
 
         # Header
-        tk.Label(self.root, text="IBKR SCANNER MONITOR", font=("Helvetica", 24, "bold"),
-                 bg=self.BG, fg=self.ACCENT).pack(pady=(6, 0))
+        tk.Label(self.root, text="IBKR SCANNER MONITOR", font=("Helvetica", 36, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(pady=(10, 0))
         tk.Label(self.root, text="Scanner  |  Anomaly  |  Fib  |  Telegram",
-                 font=("Helvetica", 12), bg=self.BG, fg="#888").pack()
+                 font=("Helvetica", 18), bg=self.BG, fg="#888").pack()
 
-        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=10, pady=4)
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=8)
 
         # Connection status
         self.conn_var = tk.StringVar(value="IBKR: Checking...")
         self.conn_label = tk.Label(self.root, textvariable=self.conn_var,
-                                   font=("Courier", 14, "bold"), bg=self.BG, fg="#888")
-        self.conn_label.pack(padx=10, anchor='w')
+                                   font=("Courier", 20, "bold"), bg=self.BG, fg="#888")
+        self.conn_label.pack(padx=12, anchor='w')
 
-        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
+        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=12, pady=4)
 
         # Stock table header
-        tk.Label(self.root, text="Tracked Stocks:", font=("Helvetica", 16, "bold"),
-                 bg=self.BG, fg=self.FG).pack(padx=10, anchor='w')
+        tk.Label(self.root, text="Tracked Stocks:", font=("Helvetica", 22, "bold"),
+                 bg=self.BG, fg=self.FG).pack(padx=12, anchor='w')
 
         # Column headers
         hdr_frame = tk.Frame(self.root, bg=self.BG)
-        hdr_frame.pack(fill='x', padx=10)
+        hdr_frame.pack(fill='x', padx=12)
         for text, w in [("SYM", 6), ("PRICE", 8), ("CHG%", 8), ("VOL", 7), ("RVOL", 6), ("FLOAT", 9), ("SHORT", 7)]:
-            tk.Label(hdr_frame, text=text, font=("Courier", 13, "bold"),
+            tk.Label(hdr_frame, text=text, font=("Courier", 18, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
 
         # Scrollable stock list
         list_frame = tk.Frame(self.root, bg=self.BG)
-        list_frame.pack(fill='both', expand=True, padx=10, pady=2)
+        list_frame.pack(fill='both', expand=True, padx=12, pady=2)
 
-        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=160)
+        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=250)
         scrollbar = tk.Scrollbar(list_frame, orient='vertical', command=self.canvas.yview)
         self.stock_frame = tk.Frame(self.canvas, bg=self.BG)
 
@@ -1798,100 +1647,93 @@ class App:
         self.canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        # ── Top 24h Movers Panel ──
-        tk.Frame(self.root, bg="#ffaa00", height=2).pack(fill='x', padx=10, pady=2)
-        tk.Label(self.root, text="Top 24h Movers:", font=("Helvetica", 14, "bold"),
-                 bg=self.BG, fg="#ffaa00").pack(padx=10, anchor='w')
-        tm_hdr = tk.Frame(self.root, bg=self.BG)
-        tm_hdr.pack(fill='x', padx=10)
-        for text, w in [("SYM", 8), ("PEAK%", 8), ("PRICE", 8), ("VOL", 10), ("FIRST SEEN", 12)]:
-            tk.Label(tm_hdr, text=text, font=("Courier", 12, "bold"),
-                     bg=self.BG, fg="#ffaa00", width=w, anchor='w').pack(side='left')
-        self._top_movers_frame = tk.Frame(self.root, bg=self.BG)
-        self._top_movers_frame.pack(fill='x', padx=10, pady=1)
-
         # ── Portfolio Panel ──
-        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=10, pady=2)
-        tk.Label(self.root, text="Portfolio:", font=("Helvetica", 14, "bold"),
-                 bg=self.BG, fg=self.FG).pack(padx=10, anchor='w')
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=4)
+        tk.Label(self.root, text="Portfolio:", font=("Helvetica", 20, "bold"),
+                 bg=self.BG, fg=self.FG).pack(padx=12, anchor='w')
         # Portfolio column headers
         port_hdr = tk.Frame(self.root, bg=self.BG)
-        port_hdr.pack(fill='x', padx=10)
+        port_hdr.pack(fill='x', padx=12)
         for text, w in [("SYM", 6), ("QTY", 6), ("AVG", 8), ("PRICE", 8), ("P&L", 10), ("P&L%", 7)]:
-            tk.Label(port_hdr, text=text, font=("Courier", 12, "bold"),
+            tk.Label(port_hdr, text=text, font=("Courier", 16, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
         self._portfolio_frame = tk.Frame(self.root, bg=self.BG)
-        self._portfolio_frame.pack(fill='x', padx=10, pady=1)
-        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=10, pady=2)
+        self._portfolio_frame.pack(fill='x', padx=12, pady=2)
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=4)
 
         # ── Trading Panel ──
         self._build_trading_panel()
 
-        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=10, pady=3)
+        tk.Frame(self.root, bg=self.ACCENT, height=2).pack(fill='x', padx=12, pady=6)
 
-        # Settings row: Freq + Alert % + Price Min + Price Max + Size — all in one row
-        fs = tk.Frame(self.root, bg=self.BG)
-        fs.pack(fill='x', padx=10, pady=2)
+        # Settings row 1: Freq + Alert %
+        fs1 = tk.Frame(self.root, bg=self.BG)
+        fs1.pack(fill='x', padx=12, pady=2)
 
-        tk.Label(fs, text="Freq(s):", font=("Helvetica", 13),
+        tk.Label(fs1, text="Freq (s):", font=("Helvetica", 20),
                  bg=self.BG, fg=self.FG).pack(side='left')
         self.freq = tk.IntVar(value=MONITOR_DEFAULT_FREQ)
-        tk.Spinbox(fs, from_=10, to=600, increment=10, textvariable=self.freq,
-                   width=4, font=("Helvetica", 13), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(2, 10))
+        tk.Spinbox(fs1, from_=10, to=600, increment=10, textvariable=self.freq,
+                   width=4, font=("Helvetica", 20), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(2, 15))
 
-        tk.Label(fs, text="Alert%:", font=("Helvetica", 13),
+        tk.Label(fs1, text="Alert %:", font=("Helvetica", 20),
                  bg=self.BG, fg=self.FG).pack(side='left')
         self.thresh = tk.DoubleVar(value=MONITOR_DEFAULT_ALERT_PCT)
-        tk.Spinbox(fs, from_=1, to=50, increment=1, textvariable=self.thresh,
-                   width=4, font=("Helvetica", 13), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(2, 10))
+        tk.Spinbox(fs1, from_=1, to=50, increment=1, textvariable=self.thresh,
+                   width=4, font=("Helvetica", 20), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=2)
 
-        tk.Label(fs, text="Min$:", font=("Helvetica", 13),
+        # Settings row 2: Price Min + Max
+        fs2 = tk.Frame(self.root, bg=self.BG)
+        fs2.pack(fill='x', padx=12, pady=2)
+
+        tk.Label(fs2, text="Price Min:", font=("Helvetica", 20),
                  bg=self.BG, fg=self.FG).pack(side='left')
         self.price_min = tk.DoubleVar(value=MONITOR_PRICE_MIN)
-        tk.Spinbox(fs, from_=0.01, to=100, increment=0.5, textvariable=self.price_min,
-                   width=5, font=("Helvetica", 13), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(2, 10))
+        tk.Spinbox(fs2, from_=0.01, to=100, increment=0.5, textvariable=self.price_min,
+                   width=6, font=("Helvetica", 20), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(2, 15))
 
-        tk.Label(fs, text="Max$:", font=("Helvetica", 13),
+        tk.Label(fs2, text="Price Max:", font=("Helvetica", 20),
                  bg=self.BG, fg=self.FG).pack(side='left')
         self.price_max = tk.DoubleVar(value=MONITOR_PRICE_MAX)
-        tk.Spinbox(fs, from_=1, to=500, increment=1, textvariable=self.price_max,
-                   width=5, font=("Helvetica", 13), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(2, 10))
+        tk.Spinbox(fs2, from_=1, to=500, increment=1, textvariable=self.price_max,
+                   width=6, font=("Helvetica", 20), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=2)
 
-        # Window size preset
+        # Settings row 3: Window size preset
         self._size_presets = {
             "Small (1100x700)": "1100x700",
             "Medium (1400x900)": "1400x900",
             "Large (1800x1050)": "1800x1050",
         }
-        tk.Label(fs, text="Size:", font=("Helvetica", 13),
+        fs3 = tk.Frame(self.root, bg=self.BG)
+        fs3.pack(fill='x', padx=12, pady=2)
+
+        tk.Label(fs3, text="Size:", font=("Helvetica", 20),
                  bg=self.BG, fg=self.FG).pack(side='left')
         self.size_var = tk.StringVar(value="Medium (1400x900)")
-        size_menu = tk.OptionMenu(fs, self.size_var, *self._size_presets.keys(),
+        size_menu = tk.OptionMenu(fs3, self.size_var, *self._size_presets.keys(),
                                   command=self._apply_size)
-        size_menu.config(font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
+        size_menu.config(font=("Helvetica", 18), bg=self.ROW_BG, fg=self.FG,
                          activebackground=self.ROW_BG, activeforeground=self.FG,
                          highlightthickness=0, relief='flat')
         size_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
                                  activebackground=self.ACCENT, activeforeground="white")
         size_menu.pack(side='left', padx=2)
 
-        # Start/Stop + Status in one row
-        bottom = tk.Frame(self.root, bg=self.BG)
-        bottom.pack(fill='x', padx=10, pady=(3, 4))
-
-        self.btn = tk.Button(bottom, text="START", font=("Helvetica", 18, "bold"),
+        # Start/Stop
+        self.btn = tk.Button(self.root, text="START", font=("Helvetica", 28, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
-                             relief='flat', activebackground="#00a844", width=12)
-        self.btn.pack(side='left', ipady=3)
+                             relief='flat', activebackground="#00a844")
+        self.btn.pack(fill='x', padx=12, ipady=5, pady=(6, 0))
 
+        # Status
         self.status = tk.StringVar(value="Ready")
-        tk.Label(bottom, textvariable=self.status, font=("Courier", 13),
-                 bg=self.BG, fg="#888", wraplength=1000, justify='left'
-                 ).pack(side='left', padx=(12, 0))
+        tk.Label(self.root, textvariable=self.status, font=("Courier", 18),
+                 bg=self.BG, fg="#888", wraplength=1300, justify='left'
+                 ).pack(padx=12, pady=6, anchor='w')
 
         self._load()
         self.root.after(500, self._check_connection)
@@ -1982,38 +1824,38 @@ class App:
         row1.pack(fill='x', pady=0)
         row1.bind('<Button-1>', _click)
 
-        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 14, "bold"),
+        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 20, "bold"),
                            bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
         sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
 
-        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 14),
+        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 20),
                              bg=rd['bg'], fg=self.FG, width=8, anchor='w')
         price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
 
-        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 14, "bold"),
+        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 20, "bold"),
                            bg=rd['bg'], fg=rd['pct_fg'], width=8, anchor='w')
         pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click)
 
-        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 13),
+        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 18),
                            bg=rd['bg'], fg=rd['vol_fg'], width=12, anchor='w')
         vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click)
 
-        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 13, "bold"),
+        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 18, "bold"),
                             bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
         rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click)
 
-        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 13),
+        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 18),
                              bg=rd['bg'], fg="#cca0ff", width=8, anchor='w')
         float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click)
 
-        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 13),
+        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 18),
                              bg=rd['bg'], fg="#ffaa00", width=7, anchor='w')
         short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click)
 
         # Fib row
         row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row2.pack(fill='x', pady=0)
-        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 12),
+        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 16),
                            bg=rd['bg'], fg="#66cccc", anchor='w')
         fib_lbl.pack(side='left', padx=(12, 0))
         if not rd['fib_text']:
@@ -2140,27 +1982,27 @@ class App:
                 row.pack(fill='x', pady=0)
                 row.bind('<Button-1>', _click)
 
-                sym_lbl = tk.Label(row, text=sym, font=("Courier", 13, "bold"),
+                sym_lbl = tk.Label(row, text=sym, font=("Courier", 18, "bold"),
                                    bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
 
-                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 13),
+                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 18),
                                    bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
 
-                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 13),
+                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 18),
                                    bg=rd['bg'], fg="#aaa", width=8, anchor='w')
                 avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
 
-                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 13),
+                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 18),
                                      bg=rd['bg'], fg=self.FG, width=8, anchor='w')
                 price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
 
-                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 13, "bold"),
+                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 18, "bold"),
                                    bg=rd['bg'], fg=rd['pnl_fg'], width=10, anchor='w')
                 pnl_lbl.pack(side='left'); pnl_lbl.bind('<Button-1>', _click)
 
-                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 13, "bold"),
+                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 18, "bold"),
                                        bg=rd['bg'], fg=rd['pnl_fg'], width=7, anchor='w')
                 pnl_pct_lbl.pack(side='left'); pnl_pct_lbl.bind('<Button-1>', _click)
 
@@ -2170,282 +2012,77 @@ class App:
                     'pnl_lbl': pnl_lbl, 'pnl_pct_lbl': pnl_pct_lbl,
                 }
 
-    # ── Top 24h Movers Panel ─────────────────────────────────
-
-    def _on_top_movers(self, movers: list[dict]):
-        """Callback from scanner thread — schedule GUI update."""
-        self._top_movers_data = movers
-        self.root.after(0, self._render_top_movers)
-
-    def _render_top_movers(self):
-        """Render the top 24h movers list."""
-        movers = self._top_movers_data
-        if not movers:
-            for w in self._top_movers_frame.winfo_children():
-                w.destroy()
-            self._top_movers_widgets.clear()
-            return
-
-        # Always full rebuild (max 10 rows, lightweight)
-        for w in self._top_movers_frame.winfo_children():
-            w.destroy()
-        self._top_movers_widgets.clear()
-
-        for i, m in enumerate(movers[:10]):
-            sym = m['symbol']
-            bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
-            _click = lambda e, s=sym: self._select_stock(s)
-
-            row = tk.Frame(self._top_movers_frame, bg=bg)
-            row.pack(fill='x', pady=0)
-            row.bind('<Button-1>', _click)
-
-            sym_lbl = tk.Label(row, text=sym, font=("Courier", 13, "bold"),
-                               bg=bg, fg=self.FG, width=8, anchor='w')
-            sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
-
-            peak_pct = m.get('peak_pct', 0)
-            pct_fg = self.GREEN if peak_pct > 0 else self.RED
-            pct_lbl = tk.Label(row, text=f"{peak_pct:+.1f}%", font=("Courier", 13, "bold"),
-                               bg=bg, fg=pct_fg, width=8, anchor='w')
-            pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click)
-
-            price_lbl = tk.Label(row, text=f"${m.get('price', 0):.2f}", font=("Courier", 13),
-                                 bg=bg, fg=self.FG, width=8, anchor='w')
-            price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
-
-            vol_lbl = tk.Label(row, text=str(m.get('volume', '')), font=("Courier", 12),
-                               bg=bg, fg="#aaa", width=10, anchor='w')
-            vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click)
-
-            # Format first_seen as HH:MM
-            first_seen = m.get('first_seen', '')
-            try:
-                fs_dt = datetime.fromisoformat(first_seen)
-                fs_text = fs_dt.strftime('%H:%M')
-            except (ValueError, TypeError):
-                fs_text = first_seen[:5] if first_seen else ''
-            fs_lbl = tk.Label(row, text=fs_text, font=("Courier", 12),
-                              bg=bg, fg="#888", width=12, anchor='w')
-            fs_lbl.pack(side='left'); fs_lbl.bind('<Button-1>', _click)
-
-            self._top_movers_widgets.append({
-                'row': row, 'sym_lbl': sym_lbl, 'pct_lbl': pct_lbl,
-                'price_lbl': price_lbl, 'vol_lbl': vol_lbl, 'fs_lbl': fs_lbl,
-            })
-
     # ── Trading Panel ──────────────────────────────────────
 
     def _build_trading_panel(self):
-        """Build TWS-style Order Entry panel."""
-        # Outer frame with accent border
-        outer = tk.Frame(self.root, bg=self.ACCENT, bd=1)
-        outer.pack(fill='x', padx=10, pady=2)
-        panel = tk.Frame(outer, bg=self.BG)
-        panel.pack(fill='x', padx=1, pady=1)
+        """Build the trading panel UI between stock table and settings."""
+        panel = tk.Frame(self.root, bg=self.BG)
+        panel.pack(fill='x', padx=12, pady=2)
 
-        # Title
-        title_row = tk.Frame(panel, bg=self.BG)
-        title_row.pack(fill='x', padx=6, pady=(2, 0))
-        tk.Label(title_row, text="ORDER ENTRY", font=("Helvetica", 14, "bold"),
-                 bg=self.BG, fg=self.ACCENT).pack(side='left')
-        self._account_var = tk.StringVar(value="Account: ---")
-        tk.Label(title_row, textvariable=self._account_var,
-                 font=("Courier", 12), bg=self.BG, fg="#aaa").pack(side='right')
-        tk.Frame(panel, bg="#444", height=1).pack(fill='x', padx=6, pady=1)
-
-        # Row 1: Symbol | Action | Order Type | TIF
+        # Row 1: Selected symbol + price + position + account
         row1 = tk.Frame(panel, bg=self.BG)
-        row1.pack(fill='x', padx=6, pady=1)
+        row1.pack(fill='x', pady=2)
 
-        tk.Label(row1, text="Symbol:", font=("Helvetica", 12),
+        tk.Label(row1, text="Selected:", font=("Helvetica", 18),
                  bg=self.BG, fg="#888").pack(side='left')
         self._selected_sym = tk.StringVar(value="---")
         tk.Label(row1, textvariable=self._selected_sym,
-                 font=("Courier", 13, "bold"), bg=self.BG, fg=self.ACCENT
-                 ).pack(side='left', padx=(4, 12))
+                 font=("Courier", 20, "bold"), bg=self.BG, fg=self.ACCENT
+                 ).pack(side='left', padx=(4, 16))
 
-        tk.Label(row1, text="Action:", font=("Helvetica", 12),
+        tk.Label(row1, text="Price:", font=("Helvetica", 18),
                  bg=self.BG, fg="#888").pack(side='left')
-        self._action_var = tk.StringVar(value="BUY")
-        action_menu = tk.OptionMenu(row1, self._action_var, "BUY", "SELL")
-        action_menu.config(font=("Helvetica", 12, "bold"), bg="#1b5e20", fg="white",
-                           activebackground="#2e7d32", activeforeground="white",
-                           highlightthickness=0, relief='flat', width=4)
-        action_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
-                                   activebackground=self.ACCENT, activeforeground="white",
-                                   font=("Helvetica", 12))
-        action_menu.pack(side='left', padx=(4, 12))
-        self._action_menu = action_menu
-        self._action_var.trace_add('write', self._on_action_change)
-
-        tk.Label(row1, text="Type:", font=("Helvetica", 12),
-                 bg=self.BG, fg="#888").pack(side='left')
-        self._order_type_var = tk.StringVar(value="MKT")
-        type_menu = tk.OptionMenu(row1, self._order_type_var,
-                                  "MKT", "LMT", "STP", "STP LMT",
-                                  command=self._on_order_type_change)
-        type_menu.config(font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                         activebackground=self.ROW_BG, activeforeground=self.FG,
-                         highlightthickness=0, relief='flat', width=8)
-        type_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
-                                 activebackground=self.ACCENT, activeforeground="white",
-                                 font=("Helvetica", 12))
-        type_menu.pack(side='left', padx=(4, 12))
-
-        tk.Label(row1, text="TIF:", font=("Helvetica", 12),
-                 bg=self.BG, fg="#888").pack(side='left')
-        self._tif_var = tk.StringVar(value="DAY")
-        tif_menu = tk.OptionMenu(row1, self._tif_var, "DAY", "GTC", "IOC")
-        tif_menu.config(font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                        activebackground=self.ROW_BG, activeforeground=self.FG,
-                        highlightthickness=0, relief='flat', width=4)
-        tif_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
-                                activebackground=self.ACCENT, activeforeground="white",
-                                font=("Helvetica", 12))
-        tif_menu.pack(side='left', padx=4)
-
-        # Row 2: Qty + % buttons + Lmt Price + Stop Price
-        row2 = tk.Frame(panel, bg=self.BG)
-        row2.pack(fill='x', padx=6, pady=1)
-
-        tk.Label(row2, text="Qty:", font=("Helvetica", 12),
-                 bg=self.BG, fg="#888").pack(side='left')
-        self._qty_var = tk.StringVar(value="")
-        tk.Entry(row2, textvariable=self._qty_var, font=("Courier", 13),
+        self._trade_price = tk.StringVar(value="")
+        tk.Entry(row1, textvariable=self._trade_price, font=("Courier", 20),
                  bg=self.ROW_BG, fg=self.FG, insertbackground=self.FG,
-                 width=8, relief='flat').pack(side='left', padx=(4, 4))
+                 width=10, relief='flat').pack(side='left', padx=(4, 16))
+
+        self._position_var = tk.StringVar(value="Position: ---")
+        tk.Label(row1, textvariable=self._position_var,
+                 font=("Courier", 18), bg=self.BG, fg="#cca0ff"
+                 ).pack(side='left', padx=(0, 16))
+
+        self._account_var = tk.StringVar(value="Account: ---")
+        tk.Label(row1, textvariable=self._account_var,
+                 font=("Courier", 18), bg=self.BG, fg="#aaa"
+                 ).pack(side='left')
+
+        # Row 2: BUY + SELL buttons
+        row2 = tk.Frame(panel, bg=self.BG)
+        row2.pack(fill='x', pady=4)
 
         for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"{pct}%", font=("Helvetica", 11),
-                      bg=self.ROW_BG, fg=self.FG, activebackground=self.ACCENT,
-                      relief='flat', width=3,
-                      command=lambda p=pct: self._set_qty_pct(p / 100)
-                      ).pack(side='left', padx=1)
+            tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 18, "bold"),
+                      bg="#1b5e20", fg="white", activebackground="#2e7d32",
+                      relief='flat', width=8,
+                      command=lambda p=pct: self._place_order('BUY', p / 100)
+                      ).pack(side='left', padx=2)
 
         tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
 
-        self._lmt_label = tk.Label(row2, text="Lmt Price:", font=("Helvetica", 12),
-                                   bg=self.BG, fg="#444")
-        self._lmt_label.pack(side='left')
-        self._trade_price = tk.StringVar(value="")
-        self._lmt_entry = tk.Entry(row2, textvariable=self._trade_price,
-                                   font=("Courier", 13), bg=self.ROW_BG, fg="#555",
-                                   insertbackground=self.FG, width=10, relief='flat',
-                                   state='disabled')
-        self._lmt_entry.pack(side='left', padx=(4, 8))
-
-        self._aux_label = tk.Label(row2, text="Stop Price:", font=("Helvetica", 12),
-                                   bg=self.BG, fg="#444")
-        self._aux_label.pack(side='left')
-        self._aux_price = tk.StringVar(value="")
-        self._aux_entry = tk.Entry(row2, textvariable=self._aux_price,
-                                   font=("Courier", 13), bg=self.ROW_BG, fg="#555",
-                                   insertbackground=self.FG, width=10, relief='flat',
-                                   state='disabled')
-        self._aux_entry.pack(side='left', padx=4)
-
-        # Row 3: Outside RTH + Position + SUBMIT + FIB DT
-        row3 = tk.Frame(panel, bg=self.BG)
-        row3.pack(fill='x', padx=6, pady=(1, 2))
-
-        self._outside_rth = tk.BooleanVar(value=False)
-        tk.Checkbutton(row3, text="Outside RTH", variable=self._outside_rth,
-                       font=("Helvetica", 12), bg=self.BG, fg=self.FG,
-                       selectcolor=self.ROW_BG, activebackground=self.BG,
-                       activeforeground=self.FG).pack(side='left', padx=(0, 12))
-
-        self._position_var = tk.StringVar(value="Position: ---")
-        tk.Label(row3, textvariable=self._position_var,
-                 font=("Courier", 12), bg=self.BG, fg="#cca0ff"
-                 ).pack(side='left', padx=(0, 12))
-
-        self._submit_btn = tk.Button(
-            row3, text="SUBMIT", font=("Helvetica", 14, "bold"),
-            bg=self.GREEN, fg="white", activebackground="#00a844",
-            relief='flat', width=10, command=self._submit_order)
-        self._submit_btn.pack(side='right', padx=4)
-
-        tk.Button(row3, text="FIB DT", font=("Helvetica", 13, "bold"),
+        tk.Button(row2, text="FIB DT", font=("Helvetica", 18, "bold"),
                   bg="#00838f", fg="white", activebackground="#00acc1",
                   relief='flat', width=8,
-                  command=self._place_fib_dt_order).pack(side='right', padx=4)
+                  command=self._place_fib_dt_order).pack(side='left', padx=2)
 
-        # Row 4: Order status
-        row4 = tk.Frame(panel, bg=self.BG)
-        row4.pack(fill='x', padx=6, pady=(0, 2))
+        tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
+
+        for pct in [25, 50, 75, 100]:
+            tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 18, "bold"),
+                      bg="#b71c1c", fg="white", activebackground="#c62828",
+                      relief='flat', width=8,
+                      command=lambda p=pct: self._place_order('SELL', p / 100)
+                      ).pack(side='left', padx=2)
+
+        # Row 3: Order status
+        row3 = tk.Frame(panel, bg=self.BG)
+        row3.pack(fill='x', pady=2)
 
         self._order_status_var = tk.StringVar(value="")
         self._order_status_label = tk.Label(
-            row4, textvariable=self._order_status_var,
-            font=("Courier", 12), bg=self.BG, fg="#888", anchor='w')
+            row3, textvariable=self._order_status_var,
+            font=("Courier", 18), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(side='left')
-
-    def _on_action_change(self, *_args):
-        """Update action dropdown color when BUY/SELL changes."""
-        action = self._action_var.get()
-        bg = "#1b5e20" if action == "BUY" else "#b71c1c"
-        self._action_menu.config(bg=bg)
-
-    def _on_order_type_change(self, order_type: str):
-        """Enable/disable price fields based on order type."""
-        show_lmt = order_type in ('LMT', 'STP LMT')
-        show_aux = order_type in ('STP', 'STP LMT')
-
-        lmt_state = 'normal' if show_lmt else 'disabled'
-        aux_state = 'normal' if show_aux else 'disabled'
-        lmt_fg = self.FG if show_lmt else '#555'
-        aux_fg = self.FG if show_aux else '#555'
-
-        self._lmt_entry.config(state=lmt_state, fg=lmt_fg)
-        self._lmt_label.config(fg='#888' if show_lmt else '#444')
-        self._aux_entry.config(state=aux_state, fg=aux_fg)
-        self._aux_label.config(fg='#888' if show_aux else '#444')
-
-    def _set_qty_pct(self, pct: float):
-        """Set qty based on percentage of buying power (BUY) or position (SELL)."""
-        sym = self._selected_symbol_name
-        if not sym or sym == "---":
-            self._warn("Select a stock first.")
-            return
-
-        action = self._action_var.get()
-
-        if action == 'BUY':
-            bp = self._cached_buying_power
-            # Use lmt price if available, otherwise try scanner price
-            try:
-                price = float(self._trade_price.get())
-            except (ValueError, TypeError):
-                price = 0
-            if price <= 0:
-                d = self._stock_data.get(sym)
-                if d:
-                    price = d['price']
-            if bp <= 0 or price <= 0:
-                self._warn("No buying power or price data.")
-                return
-            qty = int(bp * pct / price)
-        else:  # SELL
-            pos = self._cached_positions.get(sym)
-            if not pos or pos[0] == 0:
-                self._warn(f"No position in {sym}.")
-                return
-            qty = max(1, int(abs(pos[0]) * pct))
-
-        self._qty_var.set(str(qty))
-
-    def _warn(self, msg: str):
-        """Show warning in the order status bar (no popup)."""
-        self._order_status_var.set(msg)
-        self._order_status_label.config(fg=self.RED)
-
-    def _confirm(self, title: str, msg: str) -> bool:
-        """Show confirmation dialog, temporarily lowering topmost so it's visible."""
-        self.root.attributes('-topmost', False)
-        result = messagebox.askokcancel(title, msg, parent=self.root)
-        self.root.attributes('-topmost', True)
-        return result
 
     def _select_stock(self, sym: str):
         """Handle stock row click — populate trading panel fields."""
@@ -2453,15 +2090,10 @@ class App:
         self._selected_sym.set(sym)
         # Look up price from scanner data first, then portfolio
         d = self._stock_data.get(sym)
-        price_str = ""
         if d:
-            price_str = f"{d['price']:.2f}"
+            self._trade_price.set(f"{d['price']:.2f}")
         elif sym in self._cached_positions and len(self._cached_positions[sym]) >= 3:
-            price_str = f"{self._cached_positions[sym][2]:.2f}"
-        # Set price even if entry is disabled (StringVar works regardless)
-        self._trade_price.set(price_str)
-        self._aux_price.set("")
-        self._qty_var.set("")
+            self._trade_price.set(f"{self._cached_positions[sym][2]:.2f}")
         self._update_position_display()
         # Re-render table to update highlight
         self._render_stock_table()
@@ -2509,96 +2141,67 @@ class App:
             self._order_status_label.config(fg=self.GREEN if success else self.RED)
         self.root.after(0, _update)
 
-    def _submit_order(self):
-        """Validate and queue an order based on Order Entry panel fields."""
+    def _place_order(self, action: str, pct: float):
+        """Validate and queue a BUY or SELL order."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            self._warn("Select a stock first.")
+            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
+            return
+
+        try:
+            price = float(self._trade_price.get())
+            if price <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
         if not self.scanner or not self.scanner.running:
-            self._warn("Start the scanner first.")
+            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
             return
 
-        action = self._action_var.get()
-        order_type = self._order_type_var.get()
-        tif = self._tif_var.get()
-        outside_rth = self._outside_rth.get()
-
-        # Validate qty
-        try:
-            qty = int(self._qty_var.get())
+        if action == 'BUY':
+            bp = self._cached_buying_power
+            if bp <= 0:
+                messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
+                return
+            qty = int(bp * pct / price)
             if qty <= 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            self._warn("Enter a valid quantity.")
-            return
-
-        # Validate prices based on order type
-        lmt_price = 0.0
-        aux_price = 0.0
-
-        if order_type in ('LMT', 'STP LMT'):
-            try:
-                lmt_price = float(self._trade_price.get())
-                if lmt_price <= 0:
-                    raise ValueError
-            except (ValueError, TypeError):
-                self._warn("Enter a valid limit price.")
+                messagebox.showwarning("Qty Too Low",
+                                       f"Not enough buying power for {pct*100:.0f}%.",
+                                       parent=self.root)
                 return
-
-        if order_type in ('STP', 'STP LMT'):
-            try:
-                aux_price = float(self._aux_price.get())
-                if aux_price <= 0:
-                    raise ValueError
-            except (ValueError, TypeError):
-                self._warn("Enter a valid stop price.")
+        else:  # SELL
+            pos = self._cached_positions.get(sym)
+            if not pos or pos[0] == 0:
+                messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
                 return
+            # abs() handles both long (positive) and short (negative) positions
+            qty = max(1, int(abs(pos[0]) * pct))
 
-        # Build order description
-        if order_type == 'MKT':
-            desc = f"MKT {action} {qty} {sym}"
-        elif order_type == 'LMT':
-            desc = f"LMT {action} {qty} {sym} @ ${lmt_price:.2f}"
-        elif order_type == 'STP':
-            desc = f"STP {action} {qty} {sym} trigger ${aux_price:.2f}"
-        else:  # STP LMT
-            desc = f"STP LMT {action} {qty} {sym} stop ${aux_price:.2f} lmt ${lmt_price:.2f}"
-
-        desc += f"  TIF:{tif}"
-        if outside_rth:
-            desc += "  outsideRTH"
-
-        # Estimate total for confirmation
-        est_price = lmt_price or aux_price
-        if est_price <= 0:
-            d = self._stock_data.get(sym)
-            est_price = d['price'] if d else 0
-        total_str = f"~${qty * est_price:,.2f}" if est_price > 0 else "Market Price"
-
-        if not self._confirm(
+        # Confirmation dialog
+        confirm = messagebox.askokcancel(
             "Confirm Order",
-            f"{desc}\n\n"
-            f"Total: {total_str}\n\n"
+            f"{action} {qty} {sym} @ ${price:.2f}\n"
+            f"Total: ${qty * price:,.2f}\n\n"
+            f"outsideRth=True (pre/post market OK)\n"
             f"Continue?",
-        ):
+            parent=self.root,
+        )
+        if not confirm:
             return
 
         self._order_queue.put({
-            'sym': sym, 'action': action, 'qty': qty,
-            'order_type': order_type,
-            'lmt_price': lmt_price, 'aux_price': aux_price,
-            'tif': tif, 'outside_rth': outside_rth,
+            'sym': sym, 'action': action, 'qty': qty, 'price': price,
         })
-        self._order_status_var.set(f"Queued: {desc}")
+        self._order_status_var.set(f"Queued: {action} {qty} {sym} @ ${price:.2f}...")
         self._order_status_label.config(fg="#ffcc00")
 
     def _place_fib_dt_order(self):
         """Validate and queue a Fib Double-Touch split-exit bracket order."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            self._warn("Select a stock first.")
+            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
             return
 
         try:
@@ -2606,28 +2209,32 @@ class App:
             if entry_price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            self._warn("Enter a valid price.")
+            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
         if not self.scanner or not self.scanner.running:
-            self._warn("Start the scanner first.")
+            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
             return
 
         # Look up fib levels
         cached = _fib_cache.get(sym)
         if not cached:
-            self._warn(f"No Fibonacci data for {sym}. Wait for enrichment.")
+            messagebox.showwarning("No Fib Data",
+                                   f"No Fibonacci data for {sym}.\nWait for enrichment.",
+                                   parent=self.root)
             return
 
         _anchor_low, _anchor_high, all_levels, _ratio_map = cached
         if not all_levels:
-            self._warn(f"Empty fib levels for {sym}.")
+            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.",
+                                   parent=self.root)
             return
 
         # Nearest support fib = max level <= entry_price
         supports = [lv for lv in all_levels if lv <= entry_price]
         if not supports:
-            self._warn(f"No fib support below ${entry_price:.2f}.")
+            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.",
+                                   parent=self.root)
             return
         nearest_support = supports[-1]  # all_levels is sorted
 
@@ -2637,38 +2244,42 @@ class App:
         # Target = Nth fib level above entry
         above_levels = [lv for lv in all_levels if lv > entry_price]
         if len(above_levels) < FIB_DT_LIVE_TARGET_LEVELS:
-            self._warn(f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
-                       f"only {len(above_levels)} available.")
+            messagebox.showwarning("Not Enough Levels",
+                                   f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
+                                   f"only {len(above_levels)} available.",
+                                   parent=self.root)
             return
         target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
 
         # Qty = 100% of buying power
         bp = self._cached_buying_power
         if bp <= 0:
-            self._warn("Waiting for account data...")
+            messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
             return
         qty = int(bp / entry_price)
         if qty <= 0:
-            self._warn("Not enough buying power.")
+            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
             return
 
         half = qty // 2
         other_half = qty - half
 
         # Confirmation dialog
-        if not self._confirm(
+        confirm = messagebox.askokcancel(
             "FIB DT Order",
             f"FIB DOUBLE-TOUCH — {sym}\n\n"
             f"Entry: MARKET BUY {qty} shares\n"
             f"Support: ${nearest_support:.4f}\n"
-            f"Stop: ${stop_price:.2f} ({FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
+            f"Stop: ${stop_price:.2f} (−{FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
             f"Target: ${target_price:.2f} (fib #{FIB_DT_LIVE_TARGET_LEVELS})\n\n"
             f"Split exit:\n"
             f"  OCA half: {half} shares (stop + target)\n"
             f"  Standalone stop: {other_half} shares\n\n"
             f"outsideRth=True\n"
             f"Continue?",
-        ):
+            parent=self.root,
+        )
+        if not confirm:
             return
 
         self._order_queue.put({
@@ -2703,15 +2314,10 @@ class App:
                 order_queue=self._order_queue,
                 on_account=self._on_account_data,
                 on_order_result=self._on_order_result,
-                on_top_movers=self._on_top_movers,
             )
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
             self.status.set("Scanner running...")
-            # Show any persisted top movers immediately
-            existing = top_movers.get_top()
-            if existing:
-                self._on_top_movers(existing)
 
     def _apply_size(self, choice: str):
         geo = self._size_presets.get(choice, "1400x900")
