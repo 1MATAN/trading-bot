@@ -1933,8 +1933,10 @@ class ScannerThread(threading.Thread):
             log.info(msg)
             if self.on_order_result:
                 self.on_order_result(msg, True)
+            now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
             send_telegram(
-                f"📐 <b>FIB DT Order</b>\n"
+                f"📐 <b>FIB DT Entry</b>\n"
+                f"  🕐 {now_et}\n"
                 f"  Market BUY {qty} {sym}\n"
                 f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
                 f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
@@ -2051,20 +2053,22 @@ class ScannerThread(threading.Thread):
 
             # ── 4. Execute entries ──
             for req in entry_requests:
+                now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
                 log.info(
-                    f"FIB DT ENTRY SIGNAL: {req.symbol} "
+                    f"FIB DT ENTRY SIGNAL [{now_et}]: {req.symbol} "
                     f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
                     f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}"
                 )
                 success = self._fib_dt_entry.execute_entry(req)
                 if success:
-                    log.info(f"FIB DT: Entry executed for {req.symbol}")
+                    log.info(f"FIB DT: Entry executed for {req.symbol} [{now_et}]")
                 else:
-                    log.warning(f"FIB DT: Entry failed for {req.symbol}")
+                    log.warning(f"FIB DT: Entry failed for {req.symbol} [{now_et}]")
 
             # ── 5. Execute trailing exits ──
             for exit_sig in trailing_exits:
-                log.info(f"FIB DT TRAILING EXIT: {exit_sig.symbol} — {exit_sig.reason}")
+                now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
+                log.info(f"FIB DT TRAILING EXIT [{now_et}]: {exit_sig.symbol} — {exit_sig.reason}")
                 self._fib_dt_entry.execute_trailing_exit(exit_sig)
 
         except Exception as e:

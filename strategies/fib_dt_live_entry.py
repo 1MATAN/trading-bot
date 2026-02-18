@@ -9,6 +9,7 @@ places a market buy, then split exit orders:
 import logging
 import time as _time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from ib_insync import IB, MarketOrder, StopOrder, LimitOrder
 
@@ -381,8 +382,10 @@ class FibDTLiveEntrySync:
                             pass
 
             if self._send_telegram:
+                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S ET')
                 self._send_telegram(
-                    f"📐 <b>FIB DT Trailing Exit</b>\n"
+                    f"📐 <b>FIB DT Exit</b>\n"
+                    f"  🕐 {now_et}\n"
                     f"  SELL {qty_to_sell} {symbol}\n"
                     f"  Reason: {exit_signal.reason}"
                 )
