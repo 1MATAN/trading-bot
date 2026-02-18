@@ -1700,6 +1700,8 @@ class ScannerThread(threading.Thread):
         # Cache scanner contracts for FIB DT (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
+        # Track FIB DT open positions for order fill monitoring
+        self._fib_dt_positions: dict[str, dict] = {}  # symbol -> entry_info
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
@@ -2023,7 +2025,7 @@ class ScannerThread(threading.Thread):
                 prev_close = d.get('prev_close', 0)
                 contract = d.get('contract')
 
-                if pct < 16 or price <= 0 or prev_close <= 0 or not contract:
+                if pct < 20 or price <= 0 or prev_close <= 0 or not contract:
                     continue
                 if vwap > 0 and price <= vwap:
                     continue
@@ -2089,6 +2091,11 @@ class ScannerThread(threading.Thread):
                 success = self._fib_dt_entry.execute_entry(req)
                 if success:
                     log.info(f"FIB DT: Entry executed for {req.symbol} [{now_et}]")
+                    # Track position for order fill monitoring
+                    info = self._fib_dt_entry.last_entry_info
+                    if info:
+                        self._fib_dt_positions[req.symbol] = dict(info)
+                        log.info(f"FIB DT: Tracking position {req.symbol} for fill monitoring")
                 else:
                     log.warning(f"FIB DT: Entry failed for {req.symbol} [{now_et}]")
 
@@ -2097,9 +2104,155 @@ class ScannerThread(threading.Thread):
                 now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
                 log.info(f"FIB DT TRAILING EXIT [{now_et}]: {exit_sig.symbol} — {exit_sig.reason}")
                 self._fib_dt_entry.execute_trailing_exit(exit_sig)
+                # Clean up tracking
+                if exit_sig.symbol in self._fib_dt_positions:
+                    self._fib_dt_positions[exit_sig.symbol]['phase'] = 'CLOSED'
 
         except Exception as e:
             log.error(f"FIB DT cycle error: {e}")
+
+    def _monitor_fib_dt_positions(self):
+        """Monitor FIB DT positions for order fills and position changes.
+
+        Detects:
+        - OCA target filled → mark_trailing (start no-new-high exit for remaining half)
+        - OCA stop filled → half stopped (other half still has its own stop)
+        - Position qty → 0 → fully closed, clean up
+        """
+        if not self._fib_dt_positions:
+            return
+
+        ib = _get_ibkr()
+        if not ib:
+            return
+
+        # Build lookup: symbol → actual position qty
+        pos_by_sym: dict[str, int] = {}
+        try:
+            for item in ib.portfolio():
+                if item.position > 0:
+                    pos_by_sym[item.contract.symbol] = int(item.position)
+        except Exception as e:
+            log.debug(f"FIB DT monitor: portfolio fetch error: {e}")
+            return
+
+        closed_symbols = []
+
+        for sym, info in self._fib_dt_positions.items():
+            phase = info.get('phase', '')
+            if phase == 'CLOSED':
+                closed_symbols.append(sym)
+                continue
+
+            actual_qty = pos_by_sym.get(sym, 0)
+
+            # ── Position fully closed ──
+            if actual_qty == 0:
+                now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
+                log.info(f"FIB DT MONITOR: {sym} position closed (qty=0)")
+                self._fib_dt_strategy.mark_position_closed(sym)
+                info['phase'] = 'CLOSED'
+                closed_symbols.append(sym)
+
+                # Cancel any remaining open orders for this symbol
+                self._cancel_symbol_orders(ib, sym)
+
+                if self._send_telegram_fn:
+                    self._send_telegram_fn(
+                        f"📐 <b>FIB DT Position Closed</b>\n"
+                        f"  🕐 {now_str}\n"
+                        f"  {sym} — all shares sold\n"
+                        f"  Entry was ${info.get('entry_price', 0):.2f}"
+                    )
+                continue
+
+            # ── Check order fills for IN_POSITION phase ──
+            if phase == 'IN_POSITION':
+                expected_qty = info.get('qty', 0)
+
+                # If qty decreased, an exit order filled
+                if actual_qty < expected_qty:
+                    # Check which order filled
+                    oca_target_trade = info.get('oca_target_trade')
+                    oca_stop_trade = info.get('oca_stop_trade')
+
+                    target_filled = (
+                        oca_target_trade and
+                        oca_target_trade.orderStatus.status == 'Filled'
+                    )
+                    stop_filled = (
+                        oca_stop_trade and
+                        oca_stop_trade.orderStatus.status == 'Filled'
+                    )
+
+                    if target_filled:
+                        now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
+                        half = info.get('half', 0)
+                        target_px = info.get('target_price', 0)
+                        entry_px = info.get('entry_price', 0)
+                        profit = (target_px - entry_px) * half
+                        log.info(
+                            f"FIB DT MONITOR: {sym} OCA TARGET filled — "
+                            f"{half}sh @ ${target_px:.2f} (+${profit:.2f})"
+                        )
+                        self._fib_dt_strategy.mark_trailing(sym)
+                        info['phase'] = 'TRAILING'
+
+                        if self._send_telegram_fn:
+                            self._send_telegram_fn(
+                                f"📐 <b>FIB DT Target Hit</b> 🎯\n"
+                                f"  🕐 {now_str}\n"
+                                f"  {sym}: {half}sh sold @ ${target_px:.2f}\n"
+                                f"  Profit: +${profit:.2f}\n"
+                                f"  Trailing {info.get('other_half', 0)}sh remaining"
+                            )
+
+                    elif stop_filled:
+                        now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
+                        half = info.get('half', 0)
+                        stop_px = info.get('stop_price', 0)
+                        entry_px = info.get('entry_price', 0)
+                        loss = (stop_px - entry_px) * half
+                        log.info(
+                            f"FIB DT MONITOR: {sym} OCA STOP filled — "
+                            f"{half}sh @ ${stop_px:.2f} (${loss:.2f})"
+                        )
+                        info['phase'] = 'HALF_STOPPED'
+
+                        if self._send_telegram_fn:
+                            self._send_telegram_fn(
+                                f"📐 <b>FIB DT Half Stopped</b> 🛑\n"
+                                f"  🕐 {now_str}\n"
+                                f"  {sym}: {half}sh stopped @ ${stop_px:.2f}\n"
+                                f"  Loss: ${loss:.2f}\n"
+                                f"  {info.get('other_half', 0)}sh still held (stop active)"
+                            )
+
+            # ── HALF_STOPPED: other half still has solo stop, just watch for close ──
+            # (actual_qty == 0 is already handled above)
+
+        # Clean up fully closed positions
+        for sym in closed_symbols:
+            del self._fib_dt_positions[sym]
+
+    @property
+    def _send_telegram_fn(self):
+        """Return the telegram send function."""
+        return self._fib_dt_entry._send_telegram
+
+    @staticmethod
+    def _cancel_symbol_orders(ib: IB, symbol: str):
+        """Cancel all open orders for a given symbol."""
+        try:
+            for trade_obj in ib.openTrades():
+                if trade_obj.contract.symbol == symbol:
+                    try:
+                        ib.cancelOrder(trade_obj.order)
+                        log.info(f"FIB DT: Cancelled order {trade_obj.order.orderId} for {symbol}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"FIB DT: Error cancelling orders for {symbol}: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -2247,6 +2400,9 @@ class ScannerThread(threading.Thread):
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()
+
+        # ── Monitor FIB DT open positions for fills ──
+        self._monitor_fib_dt_positions()
 
         # ── FIB DT Auto-Strategy ──
         self._run_fib_dt_cycle(current, status)

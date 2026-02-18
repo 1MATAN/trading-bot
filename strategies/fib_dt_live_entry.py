@@ -240,6 +240,7 @@ class FibDTLiveEntrySync:
         self._strategy = strategy
         self._buying_power_getter = buying_power_getter
         self._send_telegram = send_telegram_fn
+        self.last_entry_info: dict | None = None
 
     def execute_entry(self, request: DTEntryRequest) -> bool:
         """Execute a DTEntryRequest synchronously.
@@ -290,20 +291,20 @@ class FibDTLiveEntrySync:
             oca_stop.ocaGroup = oca_group
             oca_stop.ocaType = 1
             oca_stop.tif = 'GTC'
-            ib.placeOrder(contract, oca_stop)
+            oca_stop_trade = ib.placeOrder(contract, oca_stop)
 
             oca_target = LimitOrder('SELL', half, request.target_price)
             oca_target.outsideRth = True
             oca_target.ocaGroup = oca_group
             oca_target.ocaType = 1
             oca_target.tif = 'GTC'
-            ib.placeOrder(contract, oca_target)
+            oca_target_trade = ib.placeOrder(contract, oca_target)
 
             # 3. Standalone stop for other half
             solo_stop = StopOrder('SELL', other_half, request.stop_price)
             solo_stop.outsideRth = True
             solo_stop.tif = 'GTC'
-            ib.placeOrder(contract, solo_stop)
+            solo_stop_trade = ib.placeOrder(contract, solo_stop)
 
             msg = (
                 f"FIB DT: BUY {qty} {symbol} @ ~${fill_price:.2f} | "
@@ -311,6 +312,23 @@ class FibDTLiveEntrySync:
                 f"Solo stop {other_half}sh ${request.stop_price:.2f}"
             )
             logger.info(msg)
+
+            # Store order info for position monitoring
+            self.last_entry_info = {
+                'symbol': symbol,
+                'contract': contract,
+                'qty': qty,
+                'half': half,
+                'other_half': other_half,
+                'entry_price': fill_price,
+                'stop_price': request.stop_price,
+                'target_price': request.target_price,
+                'oca_group': oca_group,
+                'oca_target_trade': oca_target_trade,
+                'oca_stop_trade': oca_stop_trade,
+                'solo_stop_trade': solo_stop_trade,
+                'phase': 'IN_POSITION',
+            }
 
             # Update strategy state
             self._strategy.record_entry()
