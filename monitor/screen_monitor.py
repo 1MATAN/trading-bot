@@ -28,6 +28,7 @@ import time
 import tkinter as tk
 from collections import defaultdict
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from tkinter import messagebox
 
 import matplotlib
@@ -37,7 +38,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import requests
-from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
+from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, Order, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
 
@@ -80,45 +81,68 @@ logging.basicConfig(
 log = logging.getLogger("monitor")
 
 
+_ET = ZoneInfo("US/Eastern")
+
+
+def _market_session() -> str:
+    """Return current market session: 'rth', 'extended', or 'closed'."""
+    now = datetime.now(_ET)
+    h, m = now.hour, now.minute
+    t = h * 60 + m  # minutes since midnight
+    if 570 <= t < 960:      # 9:30 – 16:00
+        return 'rth'
+    elif 240 <= t < 570:    # 4:00 – 9:30
+        return 'extended'
+    elif 960 <= t < 1200:   # 16:00 – 20:00
+        return 'extended'
+    else:                   # 20:00 – 4:00
+        return 'closed'
+
+
 # ══════════════════════════════════════════════════════════
 #  IBKR Connection (single synchronous IB instance)
 # ══════════════════════════════════════════════════════════
 
 _ibkr: IB | None = None
+_ibkr_lock = threading.Lock()
 
 
 def _get_ibkr() -> IB | None:
     """Get/create a dedicated IBKR connection for the monitor."""
     global _ibkr
-    if _ibkr and _ibkr.isConnected():
-        return _ibkr
-    try:
-        # Ensure an asyncio event loop exists in this thread
-        # (ib_insync needs one; non-main threads don't get one by default)
+    with _ibkr_lock:
+        if _ibkr and _ibkr.isConnected():
+            return _ibkr
         try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-        _ibkr = IB()
-        _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
-        log.info("IBKR connection established (monitor)")
-        accts = _ibkr.managedAccounts() or []
-        acct = accts[0] if accts else "?"
-        ok = send_telegram(
-            f"✅ <b>Monitor Online</b>\n"
-            f"  IBKR: מחובר ✓  |  Account: {acct}\n"
-            f"  Telegram: מחובר ✓\n"
-            f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        if ok:
-            log.info("Startup notification sent to Telegram")
-        else:
-            log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
-        return _ibkr
-    except Exception as e:
-        log.warning(f"IBKR connect failed: {e}")
-        _ibkr = None
-        return None
+            # Ensure an asyncio event loop exists in this thread
+            # (ib_insync needs one; non-main threads don't get one by default)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            _ibkr = IB()
+            _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
+            log.info("IBKR connection established (monitor)")
+            accts = _ibkr.managedAccounts() or []
+            acct = accts[0] if accts else "?"
+            # Subscribe to account updates so accountValues()/portfolio() return data
+            _ibkr.reqAccountUpdates(account=acct if acct != "?" else "")
+            _ibkr.sleep(0.5)  # let account data arrive
+            ok = send_telegram(
+                f"✅ <b>Monitor Online</b>\n"
+                f"  IBKR: מחובר ✓  |  Account: {acct}\n"
+                f"  Telegram: מחובר ✓\n"
+                f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            if ok:
+                log.info("Startup notification sent to Telegram")
+            else:
+                log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
+            return _ibkr
+        except Exception as e:
+            log.warning(f"IBKR connect failed: {e}")
+            _ibkr = None
+            return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -232,9 +256,10 @@ class StockHistory:
         self.data = defaultdict(list)
 
     def record(self, symbol: str, price: float, pct: float):
-        self.data[symbol].append((datetime.now(), price, pct))
+        now = datetime.now()
+        self.data[symbol].append((now, price, pct))
         # Keep last 2 hours max
-        cutoff = datetime.now() - timedelta(hours=2)
+        cutoff = now - timedelta(hours=2)
         self.data[symbol] = [(t, p, pc) for t, p, pc in self.data[symbol] if t > cutoff]
 
     def get_momentum(self, symbol: str) -> dict:
@@ -246,9 +271,10 @@ class StockHistory:
         now_pct = pts[-1][2]
         now_price = pts[-1][1]
         momentum = {}
+        now = datetime.now()
 
         for label, minutes in [('1m', 1), ('5m', 5), ('15m', 15), ('30m', 30), ('1h', 60)]:
-            target_time = datetime.now() - timedelta(minutes=minutes)
+            target_time = now - timedelta(minutes=minutes)
             # Find closest point to target_time
             closest = min(pts, key=lambda x: abs((x[0] - target_time).total_seconds()))
             age = abs((closest[0] - target_time).total_seconds())
@@ -284,7 +310,14 @@ stock_history = StockHistory()
 #  News Fetcher
 # ══════════════════════════════════════════════════════════
 
-_translator = GoogleTranslator(source='en', target='iw')
+_translator = None
+
+
+def _get_translator():
+    global _translator
+    if _translator is None:
+        _translator = GoogleTranslator(source='en', target='iw')
+    return _translator
 
 
 def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
@@ -309,7 +342,7 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
             if not title_en:
                 continue
             try:
-                title_he = _translator.translate(title_en)
+                title_he = _get_translator().translate(title_en)
             except Exception:
                 title_he = title_en
             date_str = str(row.get('Date', ''))[:10]
@@ -323,35 +356,6 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
 
     return result
 
-
-def format_stock_info(symbol: str, info: dict) -> str:
-    """Format fundamentals + news for Telegram (Hebrew)."""
-    f = info.get('fundamentals', {})
-
-    # Earnings indicator
-    eps = f.get('eps', '-')
-    try:
-        eps_val = float(str(eps).replace(',', ''))
-        eps_icon = "🟢" if eps_val > 0 else "🔴"
-    except (ValueError, TypeError):
-        eps_icon = "⚪"
-
-    lines = [f"📊 <b>{symbol}</b>"]
-    lines.append(f"  Float: {f.get('float', '-')}  |  Short: {f.get('short_float', '-')}")
-    lines.append(f"  Cash: ${f.get('cash_per_share', '-')}  |  {eps_icon} EPS: {eps}")
-    lines.append(f"  Income: {f.get('income', '-')}  |  Earnings: {f.get('earnings_date', '-')}")
-
-    return "\n".join(lines)
-
-
-def format_news_only(symbol: str, news: list[dict]) -> str:
-    """Format news as a separate message."""
-    if not news:
-        return ""
-    lines = [f"📰 <b>{symbol} — חדשות:</b>"]
-    for n in news:
-        lines.append(f"  • {n['title_he']}  <i>({n['date']})</i>")
-    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════
@@ -392,9 +396,6 @@ def check_milestone(sym: str, pct: float) -> str | None:
 
 HIGH_TURNOVER_PCT = 10.0  # volume > 10% of float = unusual
 
-# {symbol} — already alerted for high volume this session
-_vol_alerted: set[str] = set()
-
 
 def _parse_float_to_shares(flt_str: str) -> float:
     """Parse Finviz float string like '2.14M' or '120.5K' to share count."""
@@ -413,28 +414,20 @@ def _parse_float_to_shares(flt_str: str) -> float:
         return 0
 
 
-def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
-    """Check if volume is unusually high relative to float.
-
-    Returns alert message or None. Only alerts once per symbol per session.
-    """
-    if sym in _vol_alerted:
-        return None
-
-    float_shares = _parse_float_to_shares(enrich.get('float', '-'))
+def _is_hot_volume(volume_raw: int, float_str: str) -> bool:
+    """Check if volume turnover >= 10% of float."""
+    float_shares = _parse_float_to_shares(float_str)
     if float_shares <= 0 or volume_raw <= 0:
-        return None
+        return False
+    return (volume_raw / float_shares) * 100 >= HIGH_TURNOVER_PCT
 
-    turnover_pct = (volume_raw / float_shares) * 100
 
-    if turnover_pct >= HIGH_TURNOVER_PCT:
-        _vol_alerted.add(sym)
-        return (
-            f"🔥 <b>{sym}</b> — ווליום חריג!\n"
-            f"  Vol: {volume_raw:,.0f}  |  Float: {enrich['float']}\n"
-            f"  Turnover: {turnover_pct:.0f}% מהפלוט"
-        )
-    return None
+def _sym_label(sym: str, volume_raw: int = 0, enrich: dict | None = None) -> str:
+    """Return symbol name with 🔥 prefix when volume is hot."""
+    if enrich and volume_raw > 0:
+        if _is_hot_volume(volume_raw, enrich.get('float', '-')):
+            return f"🔥{sym}"
+    return sym
 
 
 # ══════════════════════════════════════════════════════════
@@ -443,6 +436,23 @@ def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
 
 # {symbol: {float, short, eps, income, earnings, cash, fib_below, fib_above, news}}
 _enrichment: dict[str, dict] = {}
+# Timestamps for cache TTL (2 hours)
+_enrichment_ts: dict[str, float] = {}
+_CACHE_TTL_SEC = 2 * 3600  # 2 hours
+
+
+def _cleanup_caches():
+    """Remove stale entries from enrichment, fib, and daily caches."""
+    now = time.time()
+    stale = [sym for sym, ts in _enrichment_ts.items()
+             if now - ts > _CACHE_TTL_SEC]
+    for sym in stale:
+        _enrichment.pop(sym, None)
+        _enrichment_ts.pop(sym, None)
+        _fib_cache.pop(sym, None)
+        _daily_cache.pop(sym, None)
+    if stale:
+        log.info(f"Cache cleanup: removed {len(stale)} stale symbols: {stale}")
 
 
 def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
@@ -487,6 +497,7 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
             log.error(f"Fib {sym}: {e}")
 
     _enrichment[sym] = data
+    _enrichment_ts[sym] = time.time()
     log.info(f"Enriched {sym}: float={data['float']} short={data['short']} fib={len(data['fib_below'])}↓{len(data['fib_above'])}↑")
     return data
 
@@ -500,7 +511,7 @@ def _calc_ma_table(current_price: float,
     Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    tf_order = ['5m', '15m', '1h', '4h', 'D']
     rows = []
     for tf in tf_order:
         frame = ma_frames.get(tf)
@@ -516,73 +527,10 @@ def _calc_ma_table(current_price: float,
     return rows
 
 
-def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
-                       ma_type: str, x_start: float, y_start: float):
-    """Render a compact MA table overlay on the chart axes.
-
-    ``ma_type``: 'sma' or 'ema' — which column to display.
-    ``x_start``, ``y_start``: top-left corner in axes coordinates.
-    """
-    green, red, grey = '#26a69a', '#ef5350', '#555'
-    periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
-
-    ma_lookup = {}
-    for r in ma_rows:
-        ma_lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
-
-    # Background box
-    from matplotlib.patches import FancyBboxPatch
-    box_w, box_h = 0.30, 0.52
-    bg = FancyBboxPatch((x_start - 0.005, y_start - box_h),
-                        box_w, box_h,
-                        boxstyle="round,pad=0.005",
-                        facecolor='#0e1117', edgecolor='#333',
-                        alpha=0.88, linewidth=0.5,
-                        transform=ax.transAxes, zorder=5)
-    ax.add_patch(bg)
-
-    z = 6  # zorder for text (above bg)
-    y = y_start - 0.015
-    lbl = ma_type.upper()
-    ax.text(x_start + box_w / 2, y, lbl, transform=ax.transAxes,
-            fontsize=7, fontweight='bold', color='#00d4ff',
-            ha='center', va='top', zorder=z)
-
-    # Column headers
-    col_offsets = [0.055, 0.105, 0.155, 0.21, 0.265]
-    y -= 0.025
-    for co, p in zip(col_offsets, periods):
-        ax.text(x_start + co, y, str(p), transform=ax.transAxes,
-                fontsize=5.5, fontweight='bold', color='#888',
-                ha='center', va='top', zorder=z)
-
-    # Data rows
-    key = 0 if ma_type == 'sma' else 1
-    for tf in tf_order:
-        y -= 0.023
-        ax.text(x_start + 0.005, y, tf, transform=ax.transAxes,
-                fontsize=5.5, fontweight='bold', color='#aaa',
-                va='top', zorder=z)
-        for co, p in zip(col_offsets, periods):
-            val = ma_lookup.get((tf, p), (None, None))[key]
-            if val is not None:
-                clr = green if current_price >= val else red
-                ax.text(x_start + co, y, f'{val:.2f}', transform=ax.transAxes,
-                        fontsize=5, color=clr, ha='center', va='top',
-                        fontfamily='monospace', zorder=z)
-            else:
-                ax.text(x_start + co, y, '—', transform=ax.transAxes,
-                        fontsize=5, color=grey, ha='center', va='top', zorder=z)
-
-
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float,
-                       ratio_map: dict | None = None,
-                       ma_frames: dict | None = None) -> Path | None:
-    """Generate a 5-min candlestick chart with Fibonacci levels + MA overlays.
-
-    Two compact MA tables overlaid on chart: SMA top-left, EMA bottom-left.
+                       ratio_map: dict | None = None) -> Path | None:
+    """Generate a 5-min candlestick chart with Fibonacci levels.
 
     Returns path to saved PNG or None on failure.
     """
@@ -595,21 +543,30 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         fig, ax = plt.subplots(figsize=(14, 8), facecolor='#0e1117')
         ax.set_facecolor('#0e1117')
 
-        # ── Candlestick chart ──
+        # ── Candlestick chart (vectorized) ──
         x = np.arange(len(df))
         dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
 
+        opens = df['open'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+
+        up = closes >= opens
+        down = ~up
         width = 0.6
-        for i, (_, row) in enumerate(df.iterrows()):
-            o, h, l, c = row['open'], row['high'], row['low'], row['close']
-            color = '#26a69a' if c >= o else '#ef5350'
-            ax.plot([i, i], [l, h], color=color, linewidth=0.8)
-            body_bottom = min(o, c)
-            body_height = abs(c - o)
-            if body_height < 0.001:
-                body_height = 0.001
-            ax.bar(i, body_height, bottom=body_bottom, width=width,
-                   color=color, edgecolor=color, linewidth=0.5)
+
+        # Wicks
+        ax.vlines(x[up], lows[up], highs[up], color='#26a69a', linewidth=0.8)
+        ax.vlines(x[down], lows[down], highs[down], color='#ef5350', linewidth=0.8)
+
+        # Bodies
+        body_bottom = np.minimum(opens, closes)
+        body_height = np.maximum(np.abs(closes - opens), 0.001)
+        ax.bar(x[up], body_height[up], bottom=body_bottom[up], width=width,
+               color='#26a69a', edgecolor='#26a69a', linewidth=0.5)
+        ax.bar(x[down], body_height[down], bottom=body_bottom[down], width=width,
+               color='#ef5350', edgecolor='#ef5350', linewidth=0.5)
 
         # Filter fib levels to visible price range (with margin)
         price_min = df['low'].min()
@@ -724,7 +681,7 @@ def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
     Only shows MA values ABOVE the current price (resistance levels).
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '2h', '4h', 'D', 'W', 'M']
+    tf_order = ['5m', '15m', '1h', '4h', 'D']
     key = 0 if ma_type == 'sma' else 1
 
     lookup = {}
@@ -762,10 +719,11 @@ def _format_ma_telegram(sym: str, price: float, ma_rows: list[dict],
 def _send_stock_report(sym: str, stock: dict, enriched: dict):
     """Send comprehensive Telegram report for a newly discovered stock."""
     msgs = []
+    label = _sym_label(sym, stock.get('volume_raw', 0), enriched)
 
     # 1. Alert line
     msgs.append(
-        f"🆕 <b>{sym}</b> — ${stock['price']:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume','-')}"
+        f"🆕 <b>{label}</b> — ${stock['price']:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume','-')}"
     )
 
     # 2. Fundamentals
@@ -800,17 +758,13 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     all_levels = cached[2]
     ratio_map = cached[3]
 
-    # Download all timeframes for MA messages
+    # Download key timeframes for MA messages (4 API calls instead of 8)
     ma_frames: dict[str, pd.DataFrame | None] = {}
     _tf_specs = [
-        ('1m',  '1 min',   '2 D'),
         ('5m',  '5 mins',  '5 D'),
         ('15m', '15 mins', '2 W'),
         ('1h',  '1 hour',  '3 M'),
-        ('2h',  '2 hours', '6 M'),
-        ('4h',  '4 hours', '1 Y'),
-        ('W',   '1 week',  '5 Y'),
-        ('M',   '1 month', '5 Y'),
+        ('4h',  '4 hours', '6 M'),
     ]
     for tf_key, bar_size, duration in _tf_specs:
         ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
@@ -946,24 +900,6 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     return below, above
 
 
-def format_fib_levels(symbol: str, current_price: float,
-                      below: list[float], above: list[float]) -> str:
-    """Format fib levels for Telegram message."""
-    lines = [f"📐 <b>{symbol} — פיבונאצ'י</b>  (${current_price:.2f})"]
-
-    if above:
-        above_str = "  ".join(f"${p:.4f}" for p in above)
-        lines.append(f"  ⬆️ מעל: {above_str}")
-
-    if below:
-        below_str = "  ".join(f"${p:.4f}" for p in below)
-        lines.append(f"  ⬇️ מתחת: {below_str}")
-
-    if not above and not below:
-        lines.append("  ❌ אין נתונים")
-
-    return "\n".join(lines)
-
 
 # ── Fib Touch Detection ─────────────────────────────────
 
@@ -1017,7 +953,9 @@ def check_fib_touch(symbol: str, price: float) -> str | None:
     # Clear old alerts if price moved away from all alerted levels
     to_clear = set()
     for alerted_lv in _fib_alerted[symbol]:
-        if abs(price - alerted_lv) > threshold * 3:
+        # Use the level's own price for threshold calculation (not current price)
+        level_threshold = alerted_lv * FIB_TOUCH_PCT / 100
+        if abs(price - alerted_lv) > level_threshold * 3:
             to_clear.add(alerted_lv)
     _fib_alerted[symbol] -= to_clear
 
@@ -1033,24 +971,9 @@ PCT_JUMP_THRESHOLD = 5.0    # % change jumps by 5+ between scans
 PRICE_JUMP_THRESHOLD = 3.0  # price moves 3%+ between scans
 
 def detect_anomalies(current: dict, previous: dict) -> list[dict]:
-    """Only flag truly unusual events."""
+    """Detect big price/pct moves between scans (new stocks handled separately)."""
     alerts = []
 
-    # New stock appeared in scanner
-    for sym in set(current) - set(previous):
-        d = current[sym]
-        alerts.append({
-            'type': 'new',
-            'symbol': sym,
-            'price': d['price'],
-            'pct': d['pct'],
-            'volume': d.get('volume', ''),
-            'float': d.get('float', ''),
-            'fetch_news': True,
-            'msg': f"🆕 {sym} appeared: ${d['price']:.2f}  {d['pct']:+.1f}%  Vol:{d.get('volume','-')}  Float:{d.get('float','-')}"
-        })
-
-    # Existing stocks — check for big moves
     for sym in current:
         if sym not in previous:
             continue
@@ -1196,6 +1119,11 @@ class ScannerThread(threading.Thread):
     def run(self):
         self.running = True
         log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
+        # Fetch account data immediately so GUI has buying power before first cycle
+        try:
+            self._fetch_account_data()
+        except Exception as e:
+            log.debug(f"Initial account fetch: {e}")
         while self.running:
             try:
                 self._cycle()
@@ -1223,19 +1151,20 @@ class ScannerThread(threading.Thread):
     def _execute_order(self, req: dict):
         """Place an order via IBKR.
 
-        Standard: req = {sym, action, qty, price}
+        Standard: req = {sym, action, qty, order_type, lmt_price, aux_price, tif, outside_rth}
         Fib DT:   req = {sym, action, qty, price, strategy='fib_dt',
                          stop_price, target_price, half, other_half}
         """
         sym = req['sym']
         action = req['action']  # 'BUY' or 'SELL'
         qty = req['qty']
-        price = req['price']
 
         ib = _get_ibkr()
         if not ib:
+            msg = "IBKR not connected — cannot place order"
+            log.error(msg)
             if self.on_order_result:
-                self.on_order_result("IBKR not connected", False)
+                self.on_order_result(msg, False)
             return
 
         if req.get('strategy') == 'fib_dt':
@@ -1245,19 +1174,54 @@ class ScannerThread(threading.Thread):
         try:
             contract = Stock(sym, 'SMART', 'USD')
             ib.qualifyContracts(contract)
-            order = LimitOrder(action, qty, price)
-            order.outsideRth = True
-            order.tif = 'DAY'
+            if not contract.conId:
+                msg = f"Order failed: {sym} — symbol not found (qualifyContracts returned no conId)"
+                log.error(msg)
+                if self.on_order_result:
+                    self.on_order_result(msg, False)
+                return
+            log.info(f"Order: qualified {sym} conId={contract.conId}")
+
+            order_type = req.get('order_type', 'MKT')
+            tif = req.get('tif', 'DAY')
+            outside_rth = req.get('outside_rth', False)
+            lmt_price = req.get('lmt_price', 0)
+            aux_price = req.get('aux_price', 0)
+
+            if order_type == 'MKT':
+                order = MarketOrder(action, qty)
+                order_desc = f"MKT {action}"
+            elif order_type == 'LMT':
+                order = LimitOrder(action, qty, lmt_price)
+                order_desc = f"LMT {action} @ ${lmt_price:.2f}"
+            elif order_type == 'STP':
+                order = StopOrder(action, qty, aux_price)
+                order_desc = f"STP {action} trigger ${aux_price:.2f}"
+            elif order_type == 'STP LMT':
+                order = Order()
+                order.action = action
+                order.totalQuantity = qty
+                order.orderType = 'STP LMT'
+                order.lmtPrice = lmt_price
+                order.auxPrice = aux_price
+                order_desc = f"STP LMT {action} stop ${aux_price:.2f} lmt ${lmt_price:.2f}"
+            else:
+                order = MarketOrder(action, qty)
+                order_desc = f"MKT {action}"
+
+            order.tif = tif
+            order.outsideRth = outside_rth
+
             trade = ib.placeOrder(contract, order)
-            msg = f"{action} {qty} {sym} @ ${price:.2f} — {trade.orderStatus.status}"
+            msg = f"{order_desc} {qty} {sym} — {trade.orderStatus.status}"
             log.info(f"Order placed: {msg}")
             if self.on_order_result:
                 self.on_order_result(msg, True)
             send_telegram(
                 f"📋 <b>Order Placed</b>\n"
-                f"  {action} {qty} {sym} @ ${price:.2f}\n"
+                f"  {order_desc} {qty} {sym}\n"
                 f"  Status: {trade.orderStatus.status}\n"
-                f"  outsideRth: ✓  |  TIF: DAY"
+                f"  TIF: {tif}  |  outsideRTH: {'✓' if outside_rth else '✗'}"
             )
         except Exception as e:
             msg = f"Order failed: {action} {qty} {sym} — {e}"
@@ -1277,45 +1241,65 @@ class ScannerThread(threading.Thread):
         try:
             contract = Stock(sym, 'SMART', 'USD')
             ib.qualifyContracts(contract)
+            if not contract.conId:
+                msg = f"FIB DT failed: {sym} — symbol not found"
+                log.error(msg)
+                if self.on_order_result:
+                    self.on_order_result(msg, False)
+                return
 
-            # 1. Market buy full qty
-            buy_order = MarketOrder('BUY', qty)
-            buy_order.outsideRth = True
+            session = _market_session()
+            entry_price = req['price']
+
+            # 1. Entry buy — market during RTH, limit outside
+            if session == 'rth':
+                buy_order = MarketOrder('BUY', qty)
+                buy_order.outsideRth = False
+                buy_order.tif = 'DAY'
+                entry_desc = "MKT"
+            else:
+                buy_order = LimitOrder('BUY', qty, entry_price)
+                buy_order.outsideRth = True
+                buy_order.tif = 'DAY'
+                entry_desc = f"LMT @ ${entry_price:.2f}"
             buy_trade = ib.placeOrder(contract, buy_order)
-            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_trade.orderStatus.status}")
+            log.info(f"FIB DT: {entry_desc} BUY {qty} {sym} — {buy_trade.orderStatus.status}")
 
             # 2. OCA bracket for first half
+            #    Stop orders only work during RTH.
+            #    Outside RTH use stop-limit (STP LMT) with outsideRth=True.
             oca_group = f"FibDT_{sym}_{int(time.time())}"
 
             oca_stop = StopOrder('SELL', half, stop_price)
-            oca_stop.outsideRth = True
             oca_stop.ocaGroup = oca_group
             oca_stop.ocaType = 1  # cancel others on fill
             oca_stop.tif = 'GTC'
+            # Stop orders only trigger during RTH; outsideRth not supported
+            oca_stop.outsideRth = False
             ib.placeOrder(contract, oca_stop)
 
             oca_target = LimitOrder('SELL', half, target_price)
-            oca_target.outsideRth = True
             oca_target.ocaGroup = oca_group
             oca_target.ocaType = 1
             oca_target.tif = 'GTC'
+            oca_target.outsideRth = True  # limit can fill outside RTH
             ib.placeOrder(contract, oca_target)
 
-            # 3. Standalone stop for other half
+            # 3. Standalone stop for other half (RTH only)
             solo_stop = StopOrder('SELL', other_half, stop_price)
-            solo_stop.outsideRth = True
             solo_stop.tif = 'GTC'
+            solo_stop.outsideRth = False
             ib.placeOrder(contract, solo_stop)
 
-            msg = (f"FIB DT: BUY {qty} {sym} | "
+            msg = (f"FIB DT: {entry_desc} BUY {qty} {sym} | "
                    f"OCA {half}sh stop ${stop_price:.2f}/target ${target_price:.2f} | "
                    f"Solo stop {other_half}sh ${stop_price:.2f}")
             log.info(msg)
             if self.on_order_result:
                 self.on_order_result(msg, True)
             send_telegram(
-                f"📐 <b>FIB DT Order</b>\n"
-                f"  Market BUY {qty} {sym}\n"
+                f"📐 <b>FIB DT Order ({session})</b>\n"
+                f"  {entry_desc} BUY {qty} {sym}\n"
                 f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
                 f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
                 f"  outsideRth: ✓  |  TIF: GTC"
@@ -1332,6 +1316,9 @@ class ScannerThread(threading.Thread):
         if not ib or not self.on_account:
             return
         try:
+            # Process pending IBKR messages to get fresh data
+            ib.sleep(0.1)
+
             acct_vals = ib.accountValues()
             net_liq = 0.0
             buying_power = 0.0
@@ -1341,11 +1328,13 @@ class ScannerThread(threading.Thread):
                 elif av.tag == 'BuyingPower' and av.currency == 'USD':
                     buying_power = float(av.value)
 
+            if net_liq == 0 and buying_power == 0:
+                log.warning("Account data empty — accountValues returned no USD values")
+
             positions = {}
-            # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
             for item in ib.portfolio():
                 if item.position == 0:
-                    continue  # skip closed positions
+                    continue
                 s = item.contract.symbol
                 positions[s] = (
                     int(item.position),
@@ -1354,9 +1343,10 @@ class ScannerThread(threading.Thread):
                     round(item.unrealizedPNL, 2),
                 )
 
+            log.info(f"Account: NLV=${net_liq:,.0f} BP=${buying_power:,.0f} positions={len(positions)}")
             self.on_account(net_liq, buying_power, positions)
         except Exception as e:
-            log.debug(f"Account fetch: {e}")
+            log.warning(f"Account fetch failed: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -1369,6 +1359,7 @@ class ScannerThread(threading.Thread):
         return merged
 
     def _cycle(self):
+        _cleanup_caches()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
             if self.on_status:
@@ -1438,8 +1429,9 @@ class ScannerThread(threading.Thread):
                 e = _enrichment.get(sym, {})
                 flt = e.get('float', '-')
                 short = e.get('short', '-')
+                label = _sym_label(sym, d.get('volume_raw', 0), e)
                 summary_lines.append(
-                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
+                    f"  {label} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
                 )
             if len(current) > 5:
                 summary_lines.append(f"  ... +{len(current)-5} more")
@@ -1448,21 +1440,22 @@ class ScannerThread(threading.Thread):
         # ── Anomaly detection (only after baseline) ──
         if not is_baseline and current:
             alerts = detect_anomalies(current, self.previous)
-            # Filter: only price/pct jumps (new stocks handled above)
-            jump_alerts = [a for a in alerts if a['type'] != 'new']
-            if jump_alerts:
+            if alerts:
                 header = f"🔔 <b>Alert</b> — {datetime.now().strftime('%H:%M:%S')}\n"
                 lines = []
-                for a in jump_alerts:
+                for a in alerts:
                     sym = a.get('symbol', '')
-                    line = a['msg']
+                    d = current.get(sym, {})
+                    e = _enrichment.get(sym, {})
+                    label = _sym_label(sym, d.get('volume_raw', 0), e)
+                    line = a['msg'].replace(sym, label, 1)
                     mom = stock_history.format_momentum(sym)
                     if mom:
                         line += f"\n   📊 {mom}"
                     lines.append(line)
                     file_logger.log_alert(ts, a)
                 send_telegram(header + "\n".join(lines))
-                status += f"  🔔{len(jump_alerts)}"
+                status += f"  🔔{len(alerts)}"
             else:
                 status += "  ✓"
 
@@ -1472,14 +1465,6 @@ class ScannerThread(threading.Thread):
             if ms_msg:
                 send_telegram(ms_msg)
                 status += f"  📈{sym}"
-
-        # ── Volume anomaly checks ──
-        for sym, d in current.items():
-            if sym in _enrichment and d.get('volume_raw', 0) > 0:
-                vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
-                if vol_msg:
-                    send_telegram(vol_msg)
-                    status += f"  🔥{sym}"
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
@@ -1942,74 +1927,215 @@ class App:
     # ── Trading Panel ──────────────────────────────────────
 
     def _build_trading_panel(self):
-        """Build the trading panel UI between stock table and settings."""
-        panel = tk.Frame(self.root, bg=self.BG)
-        panel.pack(fill='x', padx=12, pady=2)
+        """Build TWS-style Order Entry panel."""
+        # Outer frame with accent border
+        outer = tk.Frame(self.root, bg=self.ACCENT, bd=1)
+        outer.pack(fill='x', padx=12, pady=2)
+        panel = tk.Frame(outer, bg=self.BG)
+        panel.pack(fill='x', padx=1, pady=1)
 
-        # Row 1: Selected symbol + price + position + account
+        # Title
+        title_row = tk.Frame(panel, bg=self.BG)
+        title_row.pack(fill='x', padx=8, pady=(4, 0))
+        tk.Label(title_row, text="ORDER ENTRY", font=("Helvetica", 20, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left')
+        self._account_var = tk.StringVar(value="Account: ---")
+        tk.Label(title_row, textvariable=self._account_var,
+                 font=("Courier", 16), bg=self.BG, fg="#aaa").pack(side='right')
+        tk.Frame(panel, bg="#444", height=1).pack(fill='x', padx=8, pady=2)
+
+        # Row 1: Symbol | Action | Order Type | TIF
         row1 = tk.Frame(panel, bg=self.BG)
-        row1.pack(fill='x', pady=2)
+        row1.pack(fill='x', padx=8, pady=2)
 
-        tk.Label(row1, text="Selected:", font=("Helvetica", 18),
+        tk.Label(row1, text="Symbol:", font=("Helvetica", 16),
                  bg=self.BG, fg="#888").pack(side='left')
         self._selected_sym = tk.StringVar(value="---")
         tk.Label(row1, textvariable=self._selected_sym,
-                 font=("Courier", 20, "bold"), bg=self.BG, fg=self.ACCENT
+                 font=("Courier", 18, "bold"), bg=self.BG, fg=self.ACCENT
                  ).pack(side='left', padx=(4, 16))
 
-        tk.Label(row1, text="Price:", font=("Helvetica", 18),
+        tk.Label(row1, text="Action:", font=("Helvetica", 16),
                  bg=self.BG, fg="#888").pack(side='left')
-        self._trade_price = tk.StringVar(value="")
-        tk.Entry(row1, textvariable=self._trade_price, font=("Courier", 20),
+        self._action_var = tk.StringVar(value="BUY")
+        action_menu = tk.OptionMenu(row1, self._action_var, "BUY", "SELL")
+        action_menu.config(font=("Helvetica", 16, "bold"), bg="#1b5e20", fg="white",
+                           activebackground="#2e7d32", activeforeground="white",
+                           highlightthickness=0, relief='flat', width=4)
+        action_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
+                                   activebackground=self.ACCENT, activeforeground="white",
+                                   font=("Helvetica", 16))
+        action_menu.pack(side='left', padx=(4, 16))
+        self._action_menu = action_menu
+        self._action_var.trace_add('write', self._on_action_change)
+
+        tk.Label(row1, text="Type:", font=("Helvetica", 16),
+                 bg=self.BG, fg="#888").pack(side='left')
+        self._order_type_var = tk.StringVar(value="MKT")
+        type_menu = tk.OptionMenu(row1, self._order_type_var,
+                                  "MKT", "LMT", "STP", "STP LMT",
+                                  command=self._on_order_type_change)
+        type_menu.config(font=("Helvetica", 16), bg=self.ROW_BG, fg=self.FG,
+                         activebackground=self.ROW_BG, activeforeground=self.FG,
+                         highlightthickness=0, relief='flat', width=8)
+        type_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
+                                 activebackground=self.ACCENT, activeforeground="white",
+                                 font=("Helvetica", 16))
+        type_menu.pack(side='left', padx=(4, 16))
+
+        tk.Label(row1, text="TIF:", font=("Helvetica", 16),
+                 bg=self.BG, fg="#888").pack(side='left')
+        self._tif_var = tk.StringVar(value="DAY")
+        tif_menu = tk.OptionMenu(row1, self._tif_var, "DAY", "GTC", "IOC")
+        tif_menu.config(font=("Helvetica", 16), bg=self.ROW_BG, fg=self.FG,
+                        activebackground=self.ROW_BG, activeforeground=self.FG,
+                        highlightthickness=0, relief='flat', width=4)
+        tif_menu["menu"].config(bg=self.ROW_BG, fg=self.FG,
+                                activebackground=self.ACCENT, activeforeground="white",
+                                font=("Helvetica", 16))
+        tif_menu.pack(side='left', padx=4)
+
+        # Row 2: Qty + % buttons + Lmt Price + Stop Price
+        row2 = tk.Frame(panel, bg=self.BG)
+        row2.pack(fill='x', padx=8, pady=2)
+
+        tk.Label(row2, text="Qty:", font=("Helvetica", 16),
+                 bg=self.BG, fg="#888").pack(side='left')
+        self._qty_var = tk.StringVar(value="")
+        tk.Entry(row2, textvariable=self._qty_var, font=("Courier", 18),
                  bg=self.ROW_BG, fg=self.FG, insertbackground=self.FG,
-                 width=10, relief='flat').pack(side='left', padx=(4, 16))
+                 width=8, relief='flat').pack(side='left', padx=(4, 4))
+
+        for pct in [25, 50, 75, 100]:
+            tk.Button(row2, text=f"{pct}%", font=("Helvetica", 14),
+                      bg=self.ROW_BG, fg=self.FG, activebackground=self.ACCENT,
+                      relief='flat', width=3,
+                      command=lambda p=pct: self._set_qty_pct(p / 100)
+                      ).pack(side='left', padx=1)
+
+        tk.Label(row2, text="  ", bg=self.BG).pack(side='left')
+
+        self._lmt_label = tk.Label(row2, text="Lmt Price:", font=("Helvetica", 16),
+                                   bg=self.BG, fg="#444")
+        self._lmt_label.pack(side='left')
+        self._trade_price = tk.StringVar(value="")
+        self._lmt_entry = tk.Entry(row2, textvariable=self._trade_price,
+                                   font=("Courier", 18), bg=self.ROW_BG, fg="#555",
+                                   insertbackground=self.FG, width=10, relief='flat',
+                                   state='disabled')
+        self._lmt_entry.pack(side='left', padx=(4, 12))
+
+        self._aux_label = tk.Label(row2, text="Stop Price:", font=("Helvetica", 16),
+                                   bg=self.BG, fg="#444")
+        self._aux_label.pack(side='left')
+        self._aux_price = tk.StringVar(value="")
+        self._aux_entry = tk.Entry(row2, textvariable=self._aux_price,
+                                   font=("Courier", 18), bg=self.ROW_BG, fg="#555",
+                                   insertbackground=self.FG, width=10, relief='flat',
+                                   state='disabled')
+        self._aux_entry.pack(side='left', padx=4)
+
+        # Row 3: Outside RTH + Position + SUBMIT + FIB DT
+        row3 = tk.Frame(panel, bg=self.BG)
+        row3.pack(fill='x', padx=8, pady=4)
+
+        self._outside_rth = tk.BooleanVar(value=False)
+        tk.Checkbutton(row3, text="Outside RTH", variable=self._outside_rth,
+                       font=("Helvetica", 16), bg=self.BG, fg=self.FG,
+                       selectcolor=self.ROW_BG, activebackground=self.BG,
+                       activeforeground=self.FG).pack(side='left', padx=(0, 16))
 
         self._position_var = tk.StringVar(value="Position: ---")
-        tk.Label(row1, textvariable=self._position_var,
-                 font=("Courier", 18), bg=self.BG, fg="#cca0ff"
+        tk.Label(row3, textvariable=self._position_var,
+                 font=("Courier", 16), bg=self.BG, fg="#cca0ff"
                  ).pack(side='left', padx=(0, 16))
 
-        self._account_var = tk.StringVar(value="Account: ---")
-        tk.Label(row1, textvariable=self._account_var,
-                 font=("Courier", 18), bg=self.BG, fg="#aaa"
-                 ).pack(side='left')
+        self._submit_btn = tk.Button(
+            row3, text="SUBMIT", font=("Helvetica", 20, "bold"),
+            bg=self.GREEN, fg="white", activebackground="#00a844",
+            relief='flat', width=10, command=self._submit_order)
+        self._submit_btn.pack(side='right', padx=4)
 
-        # Row 2: BUY + SELL buttons
-        row2 = tk.Frame(panel, bg=self.BG)
-        row2.pack(fill='x', pady=4)
-
-        for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 18, "bold"),
-                      bg="#1b5e20", fg="white", activebackground="#2e7d32",
-                      relief='flat', width=8,
-                      command=lambda p=pct: self._place_order('BUY', p / 100)
-                      ).pack(side='left', padx=2)
-
-        tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
-
-        tk.Button(row2, text="FIB DT", font=("Helvetica", 18, "bold"),
+        tk.Button(row3, text="FIB DT", font=("Helvetica", 18, "bold"),
                   bg="#00838f", fg="white", activebackground="#00acc1",
                   relief='flat', width=8,
-                  command=self._place_fib_dt_order).pack(side='left', padx=2)
+                  command=self._place_fib_dt_order).pack(side='right', padx=4)
 
-        tk.Label(row2, text=" ", bg=self.BG).pack(side='left')
-
-        for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 18, "bold"),
-                      bg="#b71c1c", fg="white", activebackground="#c62828",
-                      relief='flat', width=8,
-                      command=lambda p=pct: self._place_order('SELL', p / 100)
-                      ).pack(side='left', padx=2)
-
-        # Row 3: Order status
-        row3 = tk.Frame(panel, bg=self.BG)
-        row3.pack(fill='x', pady=2)
+        # Row 4: Order status
+        row4 = tk.Frame(panel, bg=self.BG)
+        row4.pack(fill='x', padx=8, pady=(0, 4))
 
         self._order_status_var = tk.StringVar(value="")
         self._order_status_label = tk.Label(
-            row3, textvariable=self._order_status_var,
-            font=("Courier", 18), bg=self.BG, fg="#888", anchor='w')
+            row4, textvariable=self._order_status_var,
+            font=("Courier", 16), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(side='left')
+
+    def _on_action_change(self, *_args):
+        """Update action dropdown color when BUY/SELL changes."""
+        action = self._action_var.get()
+        bg = "#1b5e20" if action == "BUY" else "#b71c1c"
+        self._action_menu.config(bg=bg)
+
+    def _on_order_type_change(self, order_type: str):
+        """Enable/disable price fields based on order type."""
+        show_lmt = order_type in ('LMT', 'STP LMT')
+        show_aux = order_type in ('STP', 'STP LMT')
+
+        lmt_state = 'normal' if show_lmt else 'disabled'
+        aux_state = 'normal' if show_aux else 'disabled'
+        lmt_fg = self.FG if show_lmt else '#555'
+        aux_fg = self.FG if show_aux else '#555'
+
+        self._lmt_entry.config(state=lmt_state, fg=lmt_fg)
+        self._lmt_label.config(fg='#888' if show_lmt else '#444')
+        self._aux_entry.config(state=aux_state, fg=aux_fg)
+        self._aux_label.config(fg='#888' if show_aux else '#444')
+
+    def _set_qty_pct(self, pct: float):
+        """Set qty based on percentage of buying power (BUY) or position (SELL)."""
+        sym = self._selected_symbol_name
+        if not sym or sym == "---":
+            self._warn("Select a stock first.")
+            return
+
+        action = self._action_var.get()
+
+        if action == 'BUY':
+            bp = self._cached_buying_power
+            # Use lmt price if available, otherwise try scanner price
+            try:
+                price = float(self._trade_price.get())
+            except (ValueError, TypeError):
+                price = 0
+            if price <= 0:
+                d = self._stock_data.get(sym)
+                if d:
+                    price = d['price']
+            if bp <= 0 or price <= 0:
+                self._warn("No buying power or price data.")
+                return
+            qty = int(bp * pct / price)
+        else:  # SELL
+            pos = self._cached_positions.get(sym)
+            if not pos or pos[0] == 0:
+                self._warn(f"No position in {sym}.")
+                return
+            qty = max(1, int(abs(pos[0]) * pct))
+
+        self._qty_var.set(str(qty))
+
+    def _warn(self, msg: str):
+        """Show warning in the order status bar (no popup)."""
+        self._order_status_var.set(msg)
+        self._order_status_label.config(fg=self.RED)
+
+    def _confirm(self, title: str, msg: str) -> bool:
+        """Show confirmation dialog, temporarily lowering topmost so it's visible."""
+        self.root.attributes('-topmost', False)
+        result = messagebox.askokcancel(title, msg, parent=self.root)
+        self.root.attributes('-topmost', True)
+        return result
 
     def _select_stock(self, sym: str):
         """Handle stock row click — populate trading panel fields."""
@@ -2017,10 +2143,15 @@ class App:
         self._selected_sym.set(sym)
         # Look up price from scanner data first, then portfolio
         d = self._stock_data.get(sym)
+        price_str = ""
         if d:
-            self._trade_price.set(f"{d['price']:.2f}")
+            price_str = f"{d['price']:.2f}"
         elif sym in self._cached_positions and len(self._cached_positions[sym]) >= 3:
-            self._trade_price.set(f"{self._cached_positions[sym][2]:.2f}")
+            price_str = f"{self._cached_positions[sym][2]:.2f}"
+        # Set price even if entry is disabled (StringVar works regardless)
+        self._trade_price.set(price_str)
+        self._aux_price.set("")
+        self._qty_var.set("")
         self._update_position_display()
         # Re-render table to update highlight
         self._render_stock_table()
@@ -2068,67 +2199,96 @@ class App:
             self._order_status_label.config(fg=self.GREEN if success else self.RED)
         self.root.after(0, _update)
 
-    def _place_order(self, action: str, pct: float):
-        """Validate and queue a BUY or SELL order."""
+    def _submit_order(self):
+        """Validate and queue an order based on Order Entry panel fields."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
-            return
-
-        try:
-            price = float(self._trade_price.get())
-            if price <= 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
+            self._warn("Select a stock first.")
             return
 
         if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
+            self._warn("Start the scanner first.")
             return
 
-        if action == 'BUY':
-            bp = self._cached_buying_power
-            if bp <= 0:
-                messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
-                return
-            qty = int(bp * pct / price)
-            if qty <= 0:
-                messagebox.showwarning("Qty Too Low",
-                                       f"Not enough buying power for {pct*100:.0f}%.",
-                                       parent=self.root)
-                return
-        else:  # SELL
-            pos = self._cached_positions.get(sym)
-            if not pos or pos[0] == 0:
-                messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
-                return
-            # abs() handles both long (positive) and short (negative) positions
-            qty = max(1, int(abs(pos[0]) * pct))
+        action = self._action_var.get()
+        order_type = self._order_type_var.get()
+        tif = self._tif_var.get()
+        outside_rth = self._outside_rth.get()
 
-        # Confirmation dialog
-        confirm = messagebox.askokcancel(
+        # Validate qty
+        try:
+            qty = int(self._qty_var.get())
+            if qty <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            self._warn("Enter a valid quantity.")
+            return
+
+        # Validate prices based on order type
+        lmt_price = 0.0
+        aux_price = 0.0
+
+        if order_type in ('LMT', 'STP LMT'):
+            try:
+                lmt_price = float(self._trade_price.get())
+                if lmt_price <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                self._warn("Enter a valid limit price.")
+                return
+
+        if order_type in ('STP', 'STP LMT'):
+            try:
+                aux_price = float(self._aux_price.get())
+                if aux_price <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                self._warn("Enter a valid stop price.")
+                return
+
+        # Build order description
+        if order_type == 'MKT':
+            desc = f"MKT {action} {qty} {sym}"
+        elif order_type == 'LMT':
+            desc = f"LMT {action} {qty} {sym} @ ${lmt_price:.2f}"
+        elif order_type == 'STP':
+            desc = f"STP {action} {qty} {sym} trigger ${aux_price:.2f}"
+        else:  # STP LMT
+            desc = f"STP LMT {action} {qty} {sym} stop ${aux_price:.2f} lmt ${lmt_price:.2f}"
+
+        desc += f"  TIF:{tif}"
+        if outside_rth:
+            desc += "  outsideRTH"
+
+        # Estimate total for confirmation
+        est_price = lmt_price or aux_price
+        if est_price <= 0:
+            d = self._stock_data.get(sym)
+            est_price = d['price'] if d else 0
+        total_str = f"~${qty * est_price:,.2f}" if est_price > 0 else "Market Price"
+
+        if not self._confirm(
             "Confirm Order",
-            f"{action} {qty} {sym} @ ${price:.2f}\n"
-            f"Total: ${qty * price:,.2f}\n\n"
-            f"outsideRth=True (pre/post market OK)\n"
+            f"{desc}\n\n"
+            f"Total: {total_str}\n\n"
             f"Continue?",
-            parent=self.root,
-        )
-        if not confirm:
+        ):
             return
 
         self._order_queue.put({
-            'sym': sym, 'action': action, 'qty': qty, 'price': price,
+            'sym': sym, 'action': action, 'qty': qty,
+            'order_type': order_type,
+            'lmt_price': lmt_price, 'aux_price': aux_price,
+            'tif': tif, 'outside_rth': outside_rth,
         })
-        self._order_status_var.set(f"Queued: {action} {qty} {sym} @ ${price:.2f}...")
+        self._order_status_var.set(f"Queued: {desc}")
         self._order_status_label.config(fg="#ffcc00")
 
     def _place_fib_dt_order(self):
         """Validate and queue a Fib Double-Touch split-exit bracket order."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
+            self._warn("Select a stock first.")
             return
 
         try:
@@ -2136,32 +2296,28 @@ class App:
             if entry_price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
+            self._warn("Enter a valid price.")
             return
 
         if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
+            self._warn("Start the scanner first.")
             return
 
         # Look up fib levels
         cached = _fib_cache.get(sym)
         if not cached:
-            messagebox.showwarning("No Fib Data",
-                                   f"No Fibonacci data for {sym}.\nWait for enrichment.",
-                                   parent=self.root)
+            self._warn(f"No Fibonacci data for {sym}. Wait for enrichment.")
             return
 
         _anchor_low, _anchor_high, all_levels, _ratio_map = cached
         if not all_levels:
-            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.",
-                                   parent=self.root)
+            self._warn(f"Empty fib levels for {sym}.")
             return
 
         # Nearest support fib = max level <= entry_price
         supports = [lv for lv in all_levels if lv <= entry_price]
         if not supports:
-            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.",
-                                   parent=self.root)
+            self._warn(f"No fib support below ${entry_price:.2f}.")
             return
         nearest_support = supports[-1]  # all_levels is sorted
 
@@ -2171,42 +2327,38 @@ class App:
         # Target = Nth fib level above entry
         above_levels = [lv for lv in all_levels if lv > entry_price]
         if len(above_levels) < FIB_DT_LIVE_TARGET_LEVELS:
-            messagebox.showwarning("Not Enough Levels",
-                                   f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
-                                   f"only {len(above_levels)} available.",
-                                   parent=self.root)
+            self._warn(f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
+                       f"only {len(above_levels)} available.")
             return
         target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
 
         # Qty = 100% of buying power
         bp = self._cached_buying_power
         if bp <= 0:
-            messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
+            self._warn("Waiting for account data...")
             return
         qty = int(bp / entry_price)
         if qty <= 0:
-            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
+            self._warn("Not enough buying power.")
             return
 
         half = qty // 2
         other_half = qty - half
 
         # Confirmation dialog
-        confirm = messagebox.askokcancel(
+        if not self._confirm(
             "FIB DT Order",
             f"FIB DOUBLE-TOUCH — {sym}\n\n"
             f"Entry: MARKET BUY {qty} shares\n"
             f"Support: ${nearest_support:.4f}\n"
-            f"Stop: ${stop_price:.2f} (−{FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
+            f"Stop: ${stop_price:.2f} ({FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
             f"Target: ${target_price:.2f} (fib #{FIB_DT_LIVE_TARGET_LEVELS})\n\n"
             f"Split exit:\n"
             f"  OCA half: {half} shares (stop + target)\n"
             f"  Standalone stop: {other_half} shares\n\n"
             f"outsideRth=True\n"
             f"Continue?",
-            parent=self.root,
-        )
-        if not confirm:
+        ):
             return
 
         self._order_queue.put({
