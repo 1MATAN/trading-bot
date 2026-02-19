@@ -223,7 +223,8 @@ class FibDTLiveEntrySync:
     """
 
     def __init__(self, ib_getter, strategy: FibDTLiveStrategySync,
-                 buying_power_getter=None, send_telegram_fn=None) -> None:
+                 buying_power_getter=None, send_telegram_fn=None,
+                 dry_run: bool = False) -> None:
         """
         Parameters
         ----------
@@ -235,11 +236,14 @@ class FibDTLiveEntrySync:
             Zero-arg function returning current buying power as float.
         send_telegram_fn : callable or None
             Function(text: str) -> bool for Telegram notifications.
+        dry_run : bool
+            If True, simulate trades without placing real orders.
         """
         self._ib_getter = ib_getter
         self._strategy = strategy
         self._buying_power_getter = buying_power_getter
         self._send_telegram = send_telegram_fn
+        self._dry_run = dry_run
         self.last_entry_info: dict | None = None
 
     def execute_entry(self, request: DTEntryRequest) -> bool:
@@ -267,7 +271,41 @@ class FibDTLiveEntrySync:
 
         half = qty // 2
         other_half = qty - half
+        fill_price = request.entry_price
 
+        # ── Dry-run mode: simulate without placing orders ──
+        if self._dry_run:
+            msg = (
+                f"FIB DT [SIM]: BUY {qty} {symbol} @ ~${fill_price:.2f} | "
+                f"OCA {half}sh stop ${request.stop_price:.2f}/target ${request.target_price:.2f} | "
+                f"Solo stop {other_half}sh ${request.stop_price:.2f}"
+            )
+            logger.info(msg)
+
+            self.last_entry_info = {
+                'symbol': symbol,
+                'contract': request.contract,
+                'qty': qty,
+                'half': half,
+                'other_half': other_half,
+                'entry_price': fill_price,
+                'stop_price': request.stop_price,
+                'target_price': request.target_price,
+                'oca_group': f"SIM_{symbol}_{int(_time.time())}",
+                'oca_target_trade': None,
+                'oca_stop_trade': None,
+                'solo_stop_trade': None,
+                'phase': 'IN_POSITION',
+                'dry_run': True,
+            }
+
+            self._strategy.record_entry()
+            self._strategy.mark_in_position(symbol)
+
+            # Dry-run: log only, no Telegram
+            return True
+
+        # ── Live mode: place real orders ──
         try:
             contract = request.contract
 
@@ -279,7 +317,6 @@ class FibDTLiveEntrySync:
             logger.info(f"[{symbol}] Limit BUY {qty} shares @ ${request.entry_price:.2f} — {buy_trade.orderStatus.status}")
 
             # Get fill price
-            fill_price = request.entry_price
             if buy_trade.orderStatus.status == "Filled":
                 fill_price = buy_trade.orderStatus.avgFillPrice
             elif buy_trade.fills:
@@ -361,6 +398,18 @@ class FibDTLiveEntrySync:
         Returns True on success.
         """
         symbol = exit_signal.symbol
+
+        # ── Dry-run mode: simulate exit ──
+        if self._dry_run:
+            entry = self.last_entry_info or {}
+            qty_to_sell = entry.get('other_half', 0)
+            logger.info(
+                f"[{symbol}] TRAILING EXIT [SIM]: SELL {qty_to_sell} shares — {exit_signal.reason}"
+            )
+            self._strategy.mark_position_closed(symbol)
+            return True
+
+        # ── Live mode ──
         ib = self._ib_getter()
         if not ib:
             logger.error(f"[{symbol}] No IBKR connection for trailing exit")

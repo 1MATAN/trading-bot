@@ -1008,7 +1008,7 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
 
         if not suppress_send:
             btn = _make_lookup_button(sym)
-            send_telegram("\n".join(lines), reply_markup=btn)
+            send_telegram_alert("\n".join(lines), reply_markup=btn)
         log.info(f"News alert: {sym} — {len(new_headlines)} new headlines{' (warmup)' if suppress_send else ''}")
 
     # Clean up symbols that dropped below threshold
@@ -2750,9 +2750,9 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
 def _send_stock_report(sym: str, stock: dict, enriched: dict):
     """Send comprehensive Telegram report for a newly discovered stock."""
     text, chart_path = _build_stock_report(sym, stock, enriched)
-    send_telegram(text)
+    send_telegram_alert(text)
     if chart_path:
-        send_telegram_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
+        send_telegram_alert_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -2995,24 +2995,71 @@ def _split_telegram_message(text: str) -> list[str]:
 
 
 def _send_telegram_raw(text: str, reply_markup: dict | None = None) -> bool:
-    """Send a single message (no splitting)."""
-    ok = False
-    for cid in [CHAT_ID, GROUP_CHAT_ID]:
-        if not cid:
-            continue
-        try:
-            payload: dict = {'chat_id': cid, 'text': text, 'parse_mode': 'HTML'}
-            if reply_markup:
-                payload['reply_markup'] = reply_markup
+    """Send a single message to private chat only (system messages)."""
+    if not CHAT_ID:
+        return False
+    try:
+        payload: dict = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload, timeout=10,
+        )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram ({CHAT_ID}): {e}")
+        return False
+
+
+def send_telegram_alert(text: str, reply_markup: dict | None = None) -> bool:
+    """Send alert message to group chat only (stock alerts, momentum, etc.)."""
+    if not BOT_TOKEN or not GROUP_CHAT_ID:
+        return False
+
+    if len(text) > _TG_MAX_LEN:
+        chunks = _split_telegram_message(text)
+        ok = True
+        for i, chunk in enumerate(chunks):
+            rm = reply_markup if i == len(chunks) - 1 else None
+            ok = _send_alert_raw(chunk, rm) and ok
+        return ok
+
+    return _send_alert_raw(text, reply_markup)
+
+
+def _send_alert_raw(text: str, reply_markup: dict | None = None) -> bool:
+    """Send a single alert message to group chat."""
+    try:
+        payload: dict = {'chat_id': GROUP_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload, timeout=10,
+        )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram alert ({GROUP_CHAT_ID}): {e}")
+        return False
+
+
+def send_telegram_alert_photo(image_path: Path, caption: str = "") -> bool:
+    """Send a photo alert to group chat only."""
+    if not BOT_TOKEN or not GROUP_CHAT_ID:
+        return False
+    try:
+        with open(image_path, 'rb') as photo:
             resp = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json=payload, timeout=10,
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data={'chat_id': GROUP_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
+                files={'photo': photo},
+                timeout=30,
             )
-            if cid == CHAT_ID:
-                ok = resp.ok
-        except Exception as e:
-            log.error(f"Telegram ({cid}): {e}")
-    return ok
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram alert photo ({GROUP_CHAT_ID}): {e}")
+        return False
 
 
 def _make_lookup_button(sym: str) -> dict:
@@ -3026,26 +3073,21 @@ def _make_lookup_button(sym: str) -> dict:
 
 
 def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
-    """Send a photo to personal chat and group (if configured)."""
+    """Send a photo to private chat only (system messages)."""
     if not BOT_TOKEN or not CHAT_ID:
         return False
-    ok = False
-    for cid in [CHAT_ID, GROUP_CHAT_ID]:
-        if not cid:
-            continue
-        try:
-            with open(image_path, 'rb') as photo:
-                resp = requests.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={'chat_id': cid, 'caption': caption, 'parse_mode': 'HTML'},
-                    files={'photo': photo},
-                    timeout=30,
-                )
-            if cid == CHAT_ID:
-                ok = resp.ok
-        except Exception as e:
-            log.error(f"Telegram photo ({cid}): {e}")
-    return ok
+    try:
+        with open(image_path, 'rb') as photo:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
+                files={'photo': photo},
+                timeout=30,
+            )
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram photo ({CHAT_ID}): {e}")
+        return False
 
 
 def send_telegram_to(chat_id: str, text: str, reply_to: int | None = None) -> bool:
@@ -3319,13 +3361,14 @@ class ScannerThread(threading.Thread):
         self.previous: dict = {}
         self.count = 0
         self._warmup = True   # suppress alerts on first cycle
+        self._last_session: str = _get_market_session()  # track session transitions
         # ── FIB DT Auto-Strategy ──
         self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
         self._fib_dt_entry = FibDTLiveEntrySync(
             ib_getter=_get_ibkr,
             strategy=self._fib_dt_strategy,
             buying_power_getter=self._get_net_liq,
-            send_telegram_fn=send_telegram,
+            send_telegram_fn=send_telegram_alert,
         )
         self._fib_dt_current_sym: str | None = None  # best turnover symbol
         # Cache scanner contracts for FIB DT (symbol -> Contract)
@@ -3774,6 +3817,26 @@ class ScannerThread(threading.Thread):
         _check_holiday_alerts()
         _reset_alerts_if_new_day()
 
+        # ── Session transition detection ──
+        current_session = _get_market_session()
+        if current_session != self._last_session and current_session != 'closed':
+            prev_label = {'pre_market': 'Pre-Market', 'market': 'Market',
+                          'after_hours': 'After-Hours', 'closed': 'Closed'}
+            cur_label = prev_label.get(current_session, current_session)
+            old_label = prev_label.get(self._last_session, self._last_session)
+            log.info(f"Session transition: {self._last_session} → {current_session}")
+            send_telegram(
+                f"🔄 <b>Session changed:</b> {old_label} → {cur_label}\n"
+                f"  Resetting scanner data..."
+            )
+            self.previous.clear()
+            _enrichment.clear()
+            _session_stocks.clear()
+            self._warmup = True  # suppress alerts on first cycle of new session
+            if self.on_status:
+                self.on_status(f"Session: {cur_label} — rescanning...")
+        self._last_session = current_session
+
         # ── Webull OCR scan with IBKR fallback ──
         current = _run_webull_scan(self.price_min, self.price_max)
         scan_source = "Webull"
@@ -3900,7 +3963,7 @@ class ScannerThread(threading.Thread):
                 lines = [a['msg'] for a in mom_alerts]
                 for a in mom_alerts:
                     file_logger.log_alert(ts, a)
-                send_telegram(header + "\n".join(lines))
+                send_telegram_alert(header + "\n".join(lines))
                 status += f"  🔔{len(mom_alerts)}"
             else:
                 status += "  ✓"
@@ -3989,11 +4052,11 @@ class ScannerThread(threading.Thread):
             btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
 
             if len(batch_alerts) == 1:
-                send_telegram(batch_alerts[0], reply_markup=btn)
+                send_telegram_alert(batch_alerts[0], reply_markup=btn)
             else:
                 now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
                 header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
-                send_telegram(header + "\n\n".join(batch_alerts), reply_markup=btn)
+                send_telegram_alert(header + "\n\n".join(batch_alerts), reply_markup=btn)
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()

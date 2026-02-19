@@ -40,7 +40,9 @@ from config.settings import (
     FIB_DT_PROXIMITY_PCT,
     FIB_DT_MIN_BOUNCE_BARS,
     FIB_DT_MAX_ENTRIES_PER_DAY,
+    FIB_DT_GAP_MIN_PCT,
     FIB_DT_GAP_MAX_PCT,
+    FIB_DT_MIN_GAP_VOLUME,
     FIB_DT_ENTRY_WINDOW_START,
     FIB_DT_ENTRY_WINDOW_END,
     FIB_DT_PREFERRED_RATIOS,
@@ -155,7 +157,9 @@ class FibDoubleTouchEngine:
             f"  Stop: {FIB_DT_STOP_PCT:.1%} below fib | "
             f"Target: {FIB_DT_TARGET_LEVELS} fib levels above | "
             f"Proximity: {FIB_DT_PROXIMITY_PCT:.1%} | "
-            f"Min bounce bars: {FIB_DT_MIN_BOUNCE_BARS}"
+            f"Min bounce bars: {FIB_DT_MIN_BOUNCE_BARS} | "
+            f"Gap: {FIB_DT_GAP_MIN_PCT}-{FIB_DT_GAP_MAX_PCT}% | "
+            f"Min volume: {FIB_DT_MIN_GAP_VOLUME:,}"
         )
 
         gappers = self._load_gappers()
@@ -267,10 +271,21 @@ class FibDoubleTouchEngine:
         gap_pct = float(gap["gap_pct"])
         prev_close = float(gap["prev_close"])
         date_str = str(gap["date"])
+        gap_volume = float(gap.get("gap_volume", 0))
+
+        # ── Filter: minimum gap % (need real momentum) ──
+        if gap_pct < FIB_DT_GAP_MIN_PCT:
+            logger.debug(f"  {symbol} {date_str}: gap {gap_pct:.1f}% < min {FIB_DT_GAP_MIN_PCT}%, skipping")
+            return
 
         # ── Filter: skip extreme gaps (poor win rate above 50%) ──
         if gap_pct > FIB_DT_GAP_MAX_PCT:
             logger.debug(f"  {symbol} {date_str}: gap {gap_pct:.1f}% > max {FIB_DT_GAP_MAX_PCT}%, skipping")
+            return
+
+        # ── Filter: minimum volume (filter illiquid stocks) ──
+        if gap_volume < FIB_DT_MIN_GAP_VOLUME:
+            logger.debug(f"  {symbol} {date_str}: volume {gap_volume:,.0f} < min {FIB_DT_MIN_GAP_VOLUME:,}, skipping")
             return
 
         # Find the high of the day for fib range
@@ -795,7 +810,9 @@ class FibDoubleTouchEngine:
         print(f"Fibonacci Double-Touch Backtest (15-sec)")
         print(f"  Double-touch at fib support | {FIB_DT_STOP_PCT:.0%} stop | "
               f"{FIB_DT_TARGET_LEVELS} fib target (50%) + no-new-high exit (50%)")
-        print(f"  Filters: gap<={FIB_DT_GAP_MAX_PCT}% | entries {FIB_DT_ENTRY_WINDOW_START}-{FIB_DT_ENTRY_WINDOW_END} ET | "
+        print(f"  Filters: gap {FIB_DT_GAP_MIN_PCT}-{FIB_DT_GAP_MAX_PCT}% | "
+              f"min vol {FIB_DT_MIN_GAP_VOLUME:,} | "
+              f"entries {FIB_DT_ENTRY_WINDOW_START}-{FIB_DT_ENTRY_WINDOW_END} ET | "
               f"ratio filter={'ON' if FIB_DT_USE_RATIO_FILTER else 'OFF'} | "
               f"S1 only={'ON' if FIB_DT_S1_ONLY else 'OFF'}")
         print(f"{'='*60}")

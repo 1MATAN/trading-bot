@@ -40,7 +40,8 @@ IBKR_MAX_CONCURRENT_HIST = 3  # max concurrent historical data requests
 
 # ── Telegram ───────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")          # private chat — system msgs
+TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "")         # group chat — alerts only
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 # ── Mode ──────────────────────────────────────────────
@@ -228,7 +229,9 @@ FIB_DT_TARGET_LEVELS = 3           # exit 50% at 3rd fib level above
 FIB_DT_PROXIMITY_PCT = 0.008       # 0.8% proximity to fib level
 FIB_DT_MIN_BOUNCE_BARS = 3         # min bars between first and second touch
 FIB_DT_MAX_ENTRIES_PER_DAY = 3     # max entries per gap day
+FIB_DT_GAP_MIN_PCT = 20.0             # skip gaps < 20% (not enough momentum)
 FIB_DT_GAP_MAX_PCT = 50.0             # skip gaps > 50% (poor performance)
+FIB_DT_MIN_GAP_VOLUME = 10_000        # minimum gap-day volume (filter illiquid)
 FIB_DT_ENTRY_WINDOW_START = "08:00"   # no entries before 8 AM ET (pre-market noise)
 FIB_DT_ENTRY_WINDOW_END = "12:00"     # no entries after 12 PM ET
 FIB_DT_PREFERRED_RATIOS = {0.382, 0.618, 2.272, 2.414, 3.272, 3.414, 3.618}
