@@ -271,11 +271,12 @@ class FibDTLiveEntrySync:
         try:
             contract = request.contract
 
-            # 1. Market buy
-            buy_order = MarketOrder('BUY', qty)
+            # 1. Limit buy (works in pre/after market)
+            buy_order = LimitOrder('BUY', qty, request.entry_price)
             buy_order.outsideRth = True
+            buy_order.tif = 'DAY'
             buy_trade = ib.placeOrder(contract, buy_order)
-            logger.info(f"[{symbol}] Market BUY {qty} shares — {buy_trade.orderStatus.status}")
+            logger.info(f"[{symbol}] Limit BUY {qty} shares @ ${request.entry_price:.2f} — {buy_trade.orderStatus.status}")
 
             # Get fill price
             fill_price = request.entry_price

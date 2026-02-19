@@ -255,6 +255,7 @@ class OrderThread(threading.Thread):
         """Execute Fib Double-Touch split-exit bracket order."""
         sym = req['sym']
         qty = req['qty']
+        entry_price = req['price']
         stop_price = req['stop_price']
         target_price = req['target_price']
         half = req['half']
@@ -270,9 +271,10 @@ class OrderThread(threading.Thread):
             if not contract:
                 raise RuntimeError(f"Could not qualify contract for {sym}")
 
-            # 1. Market buy full qty
-            buy_order = MarketOrder('BUY', qty)
+            # 1. Limit buy full qty (works in pre/after market)
+            buy_order = LimitOrder('BUY', qty, entry_price)
             buy_order.outsideRth = True
+            buy_order.tif = 'DAY'
             buy_trade = ib.placeOrder(contract, buy_order)
             ib.sleep(3)
 
@@ -280,16 +282,16 @@ class OrderThread(threading.Thread):
             if buy_status in ('Inactive', 'Cancelled'):
                 err_log = [e for e in buy_trade.log if e.errorCode]
                 reason = err_log[-1].message if err_log else "Unknown"
-                msg = f"FIB DT REJECTED: BUY {qty} {sym} — {reason}"
+                msg = f"FIB DT REJECTED: BUY {qty} {sym} @ ${entry_price:.2f} — {reason}"
                 log.error(msg)
                 self._report(msg, False)
                 self._telegram(
                     f"❌ <b>FIB DT Order Rejected</b>\n"
-                    f"  BUY {qty} {sym}\n"
+                    f"  BUY {qty} {sym} @ ${entry_price:.2f}\n"
                     f"  Reason: {reason}"
                 )
                 return
-            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_status}")
+            log.info(f"FIB DT: Limit BUY {qty} {sym} @ ${entry_price:.2f} — {buy_status}")
 
             # 2. OCA bracket for first half
             oca_group = f"FibDT_{sym}_{int(time_mod.time())}"
@@ -314,7 +316,7 @@ class OrderThread(threading.Thread):
             solo_stop.tif = 'GTC'
             ib.placeOrder(contract, solo_stop)
 
-            msg = (f"FIB DT: BUY {qty} {sym} | "
+            msg = (f"FIB DT: BUY {qty} {sym} @ ${entry_price:.2f} | "
                    f"OCA {half}sh stop ${stop_price:.2f}/target ${target_price:.2f} | "
                    f"Solo stop {other_half}sh ${stop_price:.2f}")
             log.info(msg)
@@ -324,10 +326,10 @@ class OrderThread(threading.Thread):
             self._telegram(
                 f"📐 <b>FIB DT Entry</b>\n"
                 f"  🕐 {now_et}\n"
-                f"  Market BUY {qty} {sym}\n"
+                f"  Limit BUY {qty} {sym} @ ${entry_price:.2f}\n"
                 f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
                 f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
-                f"  outsideRth: ✓  |  TIF: GTC"
+                f"  outsideRth: ✓  |  TIF: DAY"
             )
         except Exception as e:
             msg = f"FIB DT failed: {sym} — {e}"
