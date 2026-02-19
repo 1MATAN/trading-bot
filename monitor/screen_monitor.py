@@ -38,7 +38,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+import subprocess
+import io
 import requests
+from PIL import Image, ImageFilter, ImageOps
+import pytesseract
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
@@ -445,6 +449,329 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
     session = _get_market_session()
     log.info(f"Scanner [{session}]: {len(valid_items)} unique from {len(MONITOR_SCAN_CODES)} scans → {len(stocks)} enriched symbols")
     return stocks
+
+
+# ══════════════════════════════════════════════════════════
+#  Webull Desktop OCR Scanner
+# ══════════════════════════════════════════════════════════
+
+_webull_wid: int | None = None
+_webull_wid_ts: float = 0.0
+_WEBULL_WID_TTL = 300  # 5 minutes
+
+
+def _find_webull_window() -> int | None:
+    """Find the Webull Desktop window ID using xdotool.
+
+    Picks the smallest-area visible window (the scanner pane).
+    Caches WID for 5 minutes, verifies it still exists before reuse.
+    """
+    global _webull_wid, _webull_wid_ts
+
+    # Check cached WID
+    if _webull_wid and (time_mod.time() - _webull_wid_ts < _WEBULL_WID_TTL):
+        # Verify it still exists
+        try:
+            result = subprocess.run(
+                ['xdotool', 'getwindowname', str(_webull_wid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and 'Webull' in result.stdout:
+                return _webull_wid
+        except Exception:
+            pass
+        _webull_wid = None
+
+    # Search for Webull windows
+    try:
+        result = subprocess.run(
+            ['xdotool', 'search', '--name', 'Webull Desktop'],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+    except Exception as e:
+        log.debug(f"xdotool search failed: {e}")
+        return None
+
+    wids = [int(w) for w in result.stdout.strip().split('\n') if w.strip()]
+    if not wids:
+        return None
+
+    # Pick smallest-area window (the scanner pane)
+    best_wid = None
+    best_area = float('inf')
+    for wid in wids:
+        try:
+            geo = subprocess.run(
+                ['xdotool', 'getwindowgeometry', '--shell', str(wid)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if geo.returncode != 0:
+                continue
+            w = h = 0
+            for line in geo.stdout.strip().split('\n'):
+                if line.startswith('WIDTH='):
+                    w = int(line.split('=')[1])
+                elif line.startswith('HEIGHT='):
+                    h = int(line.split('=')[1])
+            area = w * h
+            if area < 10_000:
+                continue  # skip hidden/dummy windows (< ~100x100)
+            if area < best_area:
+                best_area = area
+                best_wid = wid
+        except Exception:
+            continue
+
+    if best_wid:
+        _webull_wid = best_wid
+        _webull_wid_ts = time_mod.time()
+        log.info(f"Webull window found: WID={best_wid} area={best_area}")
+
+    return best_wid
+
+
+def _capture_and_ocr_webull(wid: int) -> str:
+    """Capture Webull window via import(1) and OCR with pytesseract.
+
+    Pipeline: screenshot → 3x resize → grayscale → invert → sharpen → OCR.
+    """
+    try:
+        result = subprocess.run(
+            ['import', '-window', str(wid), 'png:-'],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout:
+            log.warning(f"import -window failed (rc={result.returncode})")
+            return ""
+    except Exception as e:
+        log.warning(f"Window capture failed: {e}")
+        return ""
+
+    img = Image.open(io.BytesIO(result.stdout))
+    # 3x resize for better OCR accuracy
+    img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+    img = img.convert('L')          # grayscale
+    img = ImageOps.invert(img)      # invert (dark bg → light bg)
+    img = img.filter(ImageFilter.SHARPEN)
+
+    text = pytesseract.image_to_string(img, config='--psm 6')
+    return text
+
+
+def _parse_webull_volume(vol_str: str) -> tuple[int, str]:
+    """Parse Webull volume string to (raw_int, display_str).
+
+    Examples: "351.00K" → (351000, "351.0K"), "1.33M" → (1330000, "1.3M")
+    """
+    vol_str = vol_str.strip().upper()
+    multiplier = 1
+    if vol_str.endswith('K'):
+        multiplier = 1_000
+        vol_str = vol_str[:-1]
+    elif vol_str.endswith('M'):
+        multiplier = 1_000_000
+        vol_str = vol_str[:-1]
+    elif vol_str.endswith('B'):
+        multiplier = 1_000_000_000
+        vol_str = vol_str[:-1]
+
+    try:
+        val = float(vol_str.replace(',', ''))
+    except ValueError:
+        return (0, "0")
+
+    raw = int(val * multiplier)
+    return (raw, _format_volume(raw))
+
+
+_WEBULL_LINE_RE = re.compile(
+    r'^([A-Z]{1,5})\s+'           # symbol
+    r'([\d.]+)\s+'                # price
+    r'([+-]?[\d.,]+)%\S*\s+'     # pct change (ignore OCR junk after %)
+    r'([\d.,]+[KMBkmb]?)\s+'     # volume
+    r'([\d.,]+[KMBkmb]?)$',      # float
+    re.MULTILINE,
+)
+
+
+def _parse_ocr_lines(text: str) -> list[dict]:
+    """Parse OCR text into structured stock data.
+
+    Expected format per line: SYMBOL  PRICE  +PCT%  VOLUME  FLOAT
+    """
+    results = []
+    for m in _WEBULL_LINE_RE.finditer(text):
+        sym = m.group(1)
+        try:
+            price = float(m.group(2))
+        except ValueError:
+            continue
+        try:
+            pct = float(m.group(3).replace(',', ''))
+        except ValueError:
+            continue
+
+        vol_raw, vol_display = _parse_webull_volume(m.group(4))
+        flt_raw, flt_display = _parse_webull_volume(m.group(5))
+
+        results.append({
+            'sym': sym,
+            'price': price,
+            'pct': pct,
+            'volume_raw': vol_raw,
+            'volume': vol_display,
+            'float_raw': flt_raw,
+            'float_display': flt_display,
+        })
+    return results
+
+
+def _run_webull_scan(price_min: float = MONITOR_PRICE_MIN,
+                     price_max: float = MONITOR_PRICE_MAX) -> dict:
+    """Scan via Webull Desktop OCR. Returns same dict format as _run_ibkr_scan.
+
+    Falls back to empty dict if Webull window not found or OCR fails.
+    """
+    wid = _find_webull_window()
+    if not wid:
+        log.info("Webull window not found, will fallback to IBKR scan")
+        return {}
+
+    text = _capture_and_ocr_webull(wid)
+    if not text.strip():
+        log.warning("Webull OCR returned empty text")
+        return {}
+
+    parsed = _parse_ocr_lines(text)
+    if not parsed:
+        log.warning(f"Webull OCR: no valid lines parsed from {len(text)} chars")
+        return {}
+
+    stocks: dict[str, dict] = {}
+    for p in parsed:
+        price = p['price']
+        if price < price_min or price > price_max:
+            continue
+
+        pct = p['pct']
+        prev_close = round(price / (1 + pct / 100), 4) if pct != -100 else 0.0
+
+        stocks[p['sym']] = {
+            'price': round(price, 2),
+            'pct': round(pct, 1),
+            'volume': p['volume'],
+            'volume_raw': p['volume_raw'],
+            'rvol': 0.0,
+            'float': p['float_display'],
+            'float_raw': p['float_raw'],
+            'vwap': 0.0,
+            'prev_close': prev_close,
+            'day_high': round(price, 4),
+            'day_low': round(price, 4),
+            'contract': None,
+        }
+
+    session = _get_market_session()
+    log.info(f"Webull OCR [{session}]: {len(parsed)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
+    return stocks
+
+
+def _enrich_with_ibkr(current: dict, syms: list[str]):
+    """Enrich Webull scan results with IBKR data for selected symbols.
+
+    Fetches contract, RVOL, VWAP, prev_close, day_high, day_low.
+    Modifies current dict in-place.
+    """
+    ib = _get_ibkr()
+    if not ib:
+        log.warning("IBKR not available for enrichment")
+        return
+
+    session = _get_market_session()
+    enriched = 0
+
+    for sym in syms:
+        if sym not in current:
+            continue
+        contract = _get_contract(sym)
+        if not contract:
+            log.debug(f"IBKR enrich: no contract for {sym}")
+            continue
+
+        has_cached_avg = sym in _avg_vol_cache
+        duration = "2 D" if has_cached_avg else "12 D"
+
+        try:
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                timeout=15,
+            )
+            if not bars:
+                continue
+
+            last_bar = bars[-1]
+            volume = last_bar.volume
+
+            price, prev_close, ext_high, ext_low, ext_vwap = \
+                _fetch_extended_hours_price(ib, contract, session, bars)
+
+            # RVOL
+            if has_cached_avg:
+                avg_vol = _avg_vol_cache[sym]
+            elif len(bars) >= 2:
+                prev_volumes = [b.volume for b in bars[:-1]]
+                avg_vol = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 0
+                if avg_vol > 0:
+                    _avg_vol_cache[sym] = avg_vol
+            else:
+                avg_vol = 0
+
+            if avg_vol > 0:
+                expected = avg_vol * _expected_volume_fraction()
+                rvol = round(volume / expected, 1) if expected > 0 else 0.0
+            else:
+                rvol = 0.0
+
+            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
+
+            rth_high = round(last_bar.high, 4)
+            rth_low = round(last_bar.low, 4)
+            if session == 'pre_market' and ext_high is not None:
+                day_high = round(ext_high, 4)
+                day_low = round(ext_low, 4)
+                vwap = round(ext_vwap, 4)
+            elif session == 'after_hours' and ext_high is not None:
+                day_high = round(max(rth_high, ext_high), 4)
+                day_low = round(min(rth_low, ext_low), 4)
+                vwap = round(ext_vwap, 4)
+            else:
+                day_high = rth_high
+                day_low = rth_low
+
+            # Update in-place
+            d = current[sym]
+            d['rvol'] = rvol
+            d['vwap'] = vwap
+            d['prev_close'] = round(prev_close, 4)
+            d['day_high'] = day_high
+            d['day_low'] = day_low
+            d['contract'] = contract
+            d['volume'] = _format_volume(volume)
+            d['volume_raw'] = int(volume)
+            enriched += 1
+
+        except Exception as e:
+            log.debug(f"IBKR enrich {sym} failed: {e}")
+            continue
+
+    log.info(f"IBKR enrichment: {enriched}/{len(syms)} symbols enriched")
 
 
 # ══════════════════════════════════════════════════════════
@@ -3429,6 +3756,9 @@ class ScannerThread(threading.Thread):
             merged[sym] = dict(d)
             if sym in _enrichment:
                 merged[sym]['enrich'] = _enrichment[sym]
+            elif d.get('float'):
+                # Webull scan has float data — pass through as minimal enrichment
+                merged[sym]['enrich'] = {'float': d['float']}
         return merged
 
     def _refresh_enrichment_fibs(self, current: dict):
@@ -3450,7 +3780,22 @@ class ScannerThread(threading.Thread):
         _check_market_reminders()
         _check_holiday_alerts()
         _reset_alerts_if_new_day()
-        current = _run_ibkr_scan(self.price_min, self.price_max)
+
+        # ── Webull OCR scan with IBKR fallback ──
+        current = _run_webull_scan(self.price_min, self.price_max)
+        scan_source = "Webull"
+        if not current:
+            current = _run_ibkr_scan(self.price_min, self.price_max)
+            scan_source = "IBKR"
+
+        # IBKR enrichment for momentum stocks from Webull scan
+        if scan_source == "Webull" and current:
+            momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 20.0]
+            if momentum_syms:
+                if self.on_status:
+                    self.on_status(f"Enriching {len(momentum_syms)} momentum stocks via IBKR...")
+                _enrich_with_ibkr(current, momentum_syms)
+
         if not current and not self.previous:
             if self.on_status:
                 self.on_status("No data from scanner")
@@ -3915,7 +4260,7 @@ class App:
         tk.Label(fs, text="Freq:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self.freq = tk.IntVar(value=MONITOR_DEFAULT_FREQ)
-        tk.Spinbox(fs, from_=10, to=600, increment=10, textvariable=self.freq,
+        tk.Spinbox(fs, from_=5, to=600, increment=5, textvariable=self.freq,
                    width=3, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 8))
 
