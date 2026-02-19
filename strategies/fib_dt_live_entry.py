@@ -259,7 +259,7 @@ class FibDTLiveEntrySync:
             logger.warning(f"[{symbol}] No buying power available (NetLiq=${bp:,.0f})")
             return False
 
-        qty = int(bp / request.entry_price)
+        qty = int(bp * 0.95 / request.entry_price)
         logger.info(f"[{symbol}] Position sizing: NetLiq=${bp:,.0f} / ${request.entry_price:.2f} = {qty} shares")
         if qty < 2:
             logger.warning(f"[{symbol}] Position size {qty} too small for split exit")

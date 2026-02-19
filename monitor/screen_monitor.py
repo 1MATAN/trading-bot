@@ -4379,7 +4379,7 @@ class App:
             if nl <= 0:
                 messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
                 return
-            qty = int(nl * pct / price)
+            qty = int(nl * 0.95 * pct / price)
             if qty <= 0:
                 messagebox.showwarning("Qty Too Low",
                                        f"Not enough buying power for {pct*100:.0f}%.",
@@ -4470,7 +4470,7 @@ class App:
         if bp <= 0:
             messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
             return
-        qty = int(bp / entry_price)
+        qty = int(bp * 0.95 / entry_price)
         if qty <= 0:
             messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
             return
