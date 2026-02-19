@@ -3582,7 +3582,7 @@ class App:
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
-        self.root.geometry("1150x780")
+        self.root.geometry("1400x900")
         self.root.attributes('-topmost', True)
         self.root.configure(bg=self.BG, highlightbackground=self.ACCENT,
                             highlightcolor=self.ACCENT, highlightthickness=2)
@@ -3591,13 +3591,13 @@ class App:
         # Header
         hdr = tk.Frame(self.root, bg=self.BG)
         hdr.pack(fill='x', padx=10, pady=(6, 0))
-        tk.Label(hdr, text="IBKR SCANNER", font=("Helvetica", 18, "bold"),
+        tk.Label(hdr, text="IBKR SCANNER", font=("Helvetica", 20, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(side='left')
 
         # Connection status (inline with header)
         self.conn_var = tk.StringVar(value="Checking...")
         self.conn_label = tk.Label(hdr, textvariable=self.conn_var,
-                                   font=("Courier", 12, "bold"), bg=self.BG, fg="#888")
+                                   font=("Courier", 13, "bold"), bg=self.BG, fg="#888")
         self.conn_label.pack(side='right')
 
         tk.Frame(self.root, bg=self.ACCENT, height=1).pack(fill='x', padx=10, pady=3)
@@ -3605,8 +3605,8 @@ class App:
         # Column headers
         hdr_frame = tk.Frame(self.root, bg=self.BG)
         hdr_frame.pack(fill='x', padx=10)
-        for text, w in [("SYM", 7), ("PRICE", 7), ("CHG%", 7), ("VOL", 7), ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
-            tk.Label(hdr_frame, text=text, font=("Courier", 11, "bold"),
+        for text, w in [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7), ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
+            tk.Label(hdr_frame, text=text, font=("Courier", 13, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
 
         # Scrollable stock list
@@ -3637,10 +3637,10 @@ class App:
         tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
         port_hdr = tk.Frame(self.root, bg=self.BG)
         port_hdr.pack(fill='x', padx=10)
-        tk.Label(port_hdr, text="Portfolio", font=("Helvetica", 11, "bold"),
+        tk.Label(port_hdr, text="Portfolio", font=("Helvetica", 12, "bold"),
                  bg=self.BG, fg="#888").pack(side='left', padx=(0, 10))
         for text, w in [("SYM", 6), ("QTY", 6), ("AVG", 7), ("PRICE", 7), ("P&L", 9), ("P&L%", 6)]:
-            tk.Label(port_hdr, text=text, font=("Courier", 10, "bold"),
+            tk.Label(port_hdr, text=text, font=("Courier", 12, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
         self._portfolio_frame = tk.Frame(self.root, bg=self.BG)
         self._portfolio_frame.pack(fill='x', padx=10, pady=1)
@@ -3655,54 +3655,54 @@ class App:
         fs = tk.Frame(self.root, bg=self.BG)
         fs.pack(fill='x', padx=10, pady=1)
 
-        tk.Label(fs, text="Freq:", font=("Helvetica", 11),
+        tk.Label(fs, text="Freq:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self.freq = tk.IntVar(value=MONITOR_DEFAULT_FREQ)
         tk.Spinbox(fs, from_=5, to=600, increment=5, textvariable=self.freq,
-                   width=3, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   width=3, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 8))
 
-        tk.Label(fs, text="Alert%:", font=("Helvetica", 11),
+        tk.Label(fs, text="Alert%:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self.thresh = tk.DoubleVar(value=MONITOR_DEFAULT_ALERT_PCT)
         tk.Spinbox(fs, from_=1, to=50, increment=1, textvariable=self.thresh,
-                   width=3, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   width=3, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 8))
 
-        tk.Label(fs, text="Min$:", font=("Helvetica", 11),
+        tk.Label(fs, text="Min$:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self.price_min = tk.DoubleVar(value=MONITOR_PRICE_MIN)
         tk.Spinbox(fs, from_=0.01, to=100, increment=0.5, textvariable=self.price_min,
-                   width=4, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   width=4, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 8))
 
-        tk.Label(fs, text="Max$:", font=("Helvetica", 11),
+        tk.Label(fs, text="Max$:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self.price_max = tk.DoubleVar(value=MONITOR_PRICE_MAX)
         tk.Spinbox(fs, from_=1, to=500, increment=1, textvariable=self.price_max,
-                   width=4, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   width=4, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
                    buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 8))
 
         # Scanner source slots (up to 3)
         scanner_row = tk.Frame(self.root, bg=self.BG)
         scanner_row.pack(fill='x', padx=10, pady=1)
-        tk.Label(scanner_row, text="Scanners:", font=("Helvetica", 10),
+        tk.Label(scanner_row, text="Scanners:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self._scanner_slot_labels: list[tk.Label] = []
         self._scanner_slot_vars: list[tk.StringVar] = []
         for i in range(_MAX_SCANNER_SOURCES):
             var = tk.StringVar(value=f"S{i+1}: ——")
             lbl = tk.Label(scanner_row, textvariable=var,
-                           font=("Courier", 9), bg=self.BG, fg="#666", width=16, anchor='w')
+                           font=("Courier", 10), bg=self.BG, fg="#666", width=16, anchor='w')
             lbl.pack(side='left', padx=(4, 0))
             self._scanner_slot_vars.append(var)
             self._scanner_slot_labels.append(lbl)
             tk.Button(
-                scanner_row, text="Pick", font=("Helvetica", 8), bg=self.ROW_BG, fg=self.FG,
+                scanner_row, text="Pick", font=("Helvetica", 9), bg=self.ROW_BG, fg=self.FG,
                 command=lambda idx=i: self._pick_scanner(idx), relief='flat', padx=3, pady=0,
             ).pack(side='left', padx=(1, 0))
             tk.Button(
-                scanner_row, text="X", font=("Helvetica", 8), bg=self.ROW_BG, fg=self.RED,
+                scanner_row, text="X", font=("Helvetica", 9), bg=self.ROW_BG, fg=self.RED,
                 command=lambda idx=i: self._clear_scanner(idx), relief='flat', padx=2, pady=0,
             ).pack(side='left', padx=(0, 4))
 
@@ -3710,19 +3710,19 @@ class App:
         ctrl_row = tk.Frame(self.root, bg=self.BG)
         ctrl_row.pack(fill='x', padx=10, pady=(4, 0))
         self._filter_btn = tk.Button(
-            ctrl_row, text="20%+", font=("Helvetica", 10, "bold"),
+            ctrl_row, text="20%+", font=("Helvetica", 11, "bold"),
             bg="#335533", fg=self.GREEN, relief='flat', padx=6, pady=2,
             command=self._toggle_filter,
         )
         self._filter_btn.pack(side='left', padx=(0, 6))
-        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 16, "bold"),
+        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 18, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
                              relief='flat', activebackground="#00a844")
         self.btn.pack(side='left', fill='x', expand=True, ipady=2)
 
         # Status
         self.status = tk.StringVar(value="Ready")
-        tk.Label(self.root, textvariable=self.status, font=("Courier", 10),
+        tk.Label(self.root, textvariable=self.status, font=("Courier", 11),
                  bg=self.BG, fg="#888", wraplength=1000, justify='left'
                  ).pack(padx=10, pady=1, anchor='w')
 
@@ -3730,11 +3730,11 @@ class App:
         tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=1)
         self._alerts_frame = tk.Frame(self.root, bg=self.BG)
         self._alerts_frame.pack(fill='x', padx=10, pady=1)
-        tk.Label(self._alerts_frame, text="Alerts:", font=("Helvetica", 9, "bold"),
+        tk.Label(self._alerts_frame, text="Alerts:", font=("Helvetica", 10, "bold"),
                  bg=self.BG, fg="#888").pack(anchor='w')
         self._alert_labels: list[tk.Label] = []
         for _ in range(5):
-            lbl = tk.Label(self._alerts_frame, text="", font=("Courier", 9),
+            lbl = tk.Label(self._alerts_frame, text="", font=("Courier", 10),
                            bg=self.BG, fg="#aaa", anchor='w', wraplength=900, justify='left')
             lbl.pack(fill='x')
             self._alert_labels.append(lbl)
@@ -3847,44 +3847,44 @@ class App:
         row1.bind('<Button-1>', _click)
         row1.bind('<Double-Button-1>', _dbl_click)
 
-        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 12, "bold"),
-                           bg=rd['bg'], fg=rd['sym_fg'], width=7, anchor='w')
+        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 14, "bold"),
+                           bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
         sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 12),
-                             bg=rd['bg'], fg=self.FG, width=7, anchor='w')
+        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 14),
+                             bg=rd['bg'], fg=self.FG, width=8, anchor='w')
         price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click); price_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 12, "bold"),
-                           bg=rd['bg'], fg=rd['pct_fg'], width=7, anchor='w')
+        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 14, "bold"),
+                           bg=rd['bg'], fg=rd['pct_fg'], width=8, anchor='w')
         pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click); pct_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 11),
+        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 13),
                            bg=rd['bg'], fg=rd['vol_fg'], width=7, anchor='w')
         vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click); vol_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 11, "bold"),
+        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 13, "bold"),
                             bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
         rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click); rvol_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=("Courier", 11),
+        vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=("Courier", 13),
                             bg=rd['bg'], fg=rd.get('vwap_fg', '#555'), width=7, anchor='w')
         vwap_lbl.pack(side='left'); vwap_lbl.bind('<Button-1>', _click); vwap_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 11),
+        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 13),
                              bg=rd['bg'], fg="#cca0ff", width=7, anchor='w')
         float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click); float_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 11),
+        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 13),
                              bg=rd['bg'], fg="#ffaa00", width=6, anchor='w')
         short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click); short_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=("Courier", 11),
+        news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=("Courier", 13),
                             bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
         news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Double-Button-1>', _dbl_click)
 
         # Chart button
-        chart_btn = tk.Button(row1, text="Ch", font=("Helvetica", 8), bg='#333',
+        chart_btn = tk.Button(row1, text="Ch", font=("Helvetica", 9), bg='#333',
                               fg=self.ACCENT, relief='flat', padx=2, pady=0,
                               command=lambda s=sym: self._open_chart_window(s))
         chart_btn.pack(side='left', padx=(2, 0))
@@ -3892,7 +3892,7 @@ class App:
         # Fib row
         row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row2.pack(fill='x', pady=0)
-        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 10),
+        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 11),
                            bg=rd['bg'], fg="#66cccc", anchor='w')
         fib_lbl.pack(side='left', padx=(12, 0))
         if not rd['fib_text']:
@@ -4025,27 +4025,27 @@ class App:
                 row.pack(fill='x', pady=0)
                 row.bind('<Button-1>', _click)
 
-                sym_lbl = tk.Label(row, text=sym, font=("Courier", 11, "bold"),
+                sym_lbl = tk.Label(row, text=sym, font=("Courier", 12, "bold"),
                                    bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
 
-                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 11),
+                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 12),
                                    bg=rd['bg'], fg=self.FG, width=6, anchor='w')
                 qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
 
-                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 11),
+                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 12),
                                    bg=rd['bg'], fg="#aaa", width=7, anchor='w')
                 avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
 
-                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 11),
+                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 12),
                                      bg=rd['bg'], fg=self.FG, width=7, anchor='w')
                 price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
 
-                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 11, "bold"),
+                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 12, "bold"),
                                    bg=rd['bg'], fg=rd['pnl_fg'], width=9, anchor='w')
                 pnl_lbl.pack(side='left'); pnl_lbl.bind('<Button-1>', _click)
 
-                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 11, "bold"),
+                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 12, "bold"),
                                        bg=rd['bg'], fg=rd['pnl_fg'], width=6, anchor='w')
                 pnl_pct_lbl.pack(side='left'); pnl_pct_lbl.bind('<Button-1>', _click)
 
@@ -4066,30 +4066,30 @@ class App:
         row1 = tk.Frame(panel, bg=self.BG)
         row1.pack(fill='x', pady=1)
 
-        tk.Label(row1, text="Sym:", font=("Helvetica", 11),
+        tk.Label(row1, text="Sym:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self._selected_sym = tk.StringVar(value="---")
         self._sym_entry = tk.Entry(row1, textvariable=self._selected_sym,
-                 font=("Courier", 12, "bold"), bg=self.ROW_BG, fg=self.ACCENT,
+                 font=("Courier", 14, "bold"), bg=self.ROW_BG, fg=self.ACCENT,
                  insertbackground=self.ACCENT, width=6, relief='flat')
         self._sym_entry.pack(side='left', padx=(2, 8))
         self._sym_entry.bind('<Return>', self._on_sym_entry)
 
-        tk.Label(row1, text="Price:", font=("Helvetica", 11),
+        tk.Label(row1, text="Price:", font=("Helvetica", 12),
                  bg=self.BG, fg="#888").pack(side='left')
         self._trade_price = tk.StringVar(value="")
-        tk.Entry(row1, textvariable=self._trade_price, font=("Courier", 12),
+        tk.Entry(row1, textvariable=self._trade_price, font=("Courier", 14),
                  bg=self.ROW_BG, fg=self.FG, insertbackground=self.FG,
                  width=8, relief='flat').pack(side='left', padx=(2, 8))
 
         self._position_var = tk.StringVar(value="Pos: ---")
         tk.Label(row1, textvariable=self._position_var,
-                 font=("Courier", 11), bg=self.BG, fg="#cca0ff"
+                 font=("Courier", 13), bg=self.BG, fg="#cca0ff"
                  ).pack(side='left', padx=(0, 8))
 
         self._account_var = tk.StringVar(value="Account: ---")
         tk.Label(row1, textvariable=self._account_var,
-                 font=("Courier", 11), bg=self.BG, fg="#aaa"
+                 font=("Courier", 13), bg=self.BG, fg="#aaa"
                  ).pack(side='left')
 
         # Row 2: BUY + SELL buttons
@@ -4097,19 +4097,19 @@ class App:
         row2.pack(fill='x', pady=2)
 
         for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 11, "bold"),
+            tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#1b5e20", fg="white", activebackground="#2e7d32",
                       relief='flat', padx=6, pady=1,
                       command=lambda p=pct: self._place_order('BUY', p / 100)
                       ).pack(side='left', padx=1)
 
-        tk.Button(row2, text="FIB DT", font=("Helvetica", 11, "bold"),
+        tk.Button(row2, text="FIB DT", font=("Helvetica", 12, "bold"),
                   bg="#00838f", fg="white", activebackground="#00acc1",
                   relief='flat', padx=6, pady=1,
                   command=self._place_fib_dt_order).pack(side='left', padx=4)
 
         for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 11, "bold"),
+            tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#b71c1c", fg="white", activebackground="#c62828",
                       relief='flat', padx=6, pady=1,
                       command=lambda p=pct: self._place_order('SELL', p / 100)
@@ -4119,7 +4119,7 @@ class App:
         self._order_status_var = tk.StringVar(value="")
         self._order_status_label = tk.Label(
             panel, textvariable=self._order_status_var,
-            font=("Courier", 10), bg=self.BG, fg="#888", anchor='w')
+            font=("Courier", 11), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(fill='x', pady=1)
 
     def _open_tradingview(self, sym: str):
@@ -4135,11 +4135,11 @@ class App:
         """
         win = tk.Toplevel(self.root)
         win.title(f"Charts — {sym}")
-        win.geometry("1100x750")
+        win.geometry("1300x850")
         win.configure(bg='#0e1117')
 
         status_var = tk.StringVar(value=f"Loading charts for {sym}...")
-        tk.Label(win, textvariable=status_var, font=("Courier", 11),
+        tk.Label(win, textvariable=status_var, font=("Courier", 12),
                  bg='#0e1117', fg='#888').pack(pady=5)
 
         chart_frame = tk.Frame(win, bg='#0e1117')
@@ -4216,7 +4216,7 @@ class App:
                         lbl.pack(expand=True)
                     else:
                         tk.Label(cell, text=f"No data: {title}",
-                                 font=("Courier", 11), bg='#0e1117', fg='#666').pack(
+                                 font=("Courier", 12), bg='#0e1117', fg='#666').pack(
                                      expand=True)
                 status_var.set(f"Charts loaded for {sym}")
 
