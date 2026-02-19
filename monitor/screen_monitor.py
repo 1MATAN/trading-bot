@@ -2328,10 +2328,11 @@ def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
 
 
 def _make_lookup_button(sym: str) -> dict:
-    """Build InlineKeyboardMarkup with a 'Full Report' button for a symbol."""
+    """Build InlineKeyboardMarkup with Report + TradingView buttons."""
     return {
         'inline_keyboard': [[
             {'text': f'📊 דוח מלא — {sym}', 'callback_data': f'lookup:{sym}'},
+            {'text': f'📈 TradingView', 'url': f'https://www.tradingview.com/chart/?symbol={sym}'},
         ]]
     }
 
