@@ -36,7 +36,6 @@ from tkinter import messagebox
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
@@ -1145,46 +1144,6 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
     return result
 
 
-# ══════════════════════════════════════════════════════════
-#  Milestone Alerts (+5% steps for stocks ≥20%)
-# ══════════════════════════════════════════════════════════
-
-MILESTONE_START_PCT = 20.0  # only track stocks above this %
-MILESTONE_STEP_PCT = 5.0    # alert every 5% step
-MILESTONE_VOL_RATIO = 2.4   # 1-min candle volume must be ≥ 2.4x previous
-
-# {symbol: last milestone alerted (e.g. 25, 30, 35...)}
-_milestone_alerted: dict[str, float] = {}
-
-
-def _check_1min_volume_spike(sym: str) -> tuple[bool, float]:
-    """Check if last 1-min candle volume ≥ MILESTONE_VOL_RATIO × previous candle.
-
-    Returns (spike_detected, ratio).
-    """
-    ib = _get_ibkr()
-    if not ib:
-        return True, 0.0  # no connection — don't block alert
-    try:
-        contract = _get_contract(sym)
-        if not contract:
-            return True, 0.0
-        bars = ib.reqHistoricalData(
-            contract, endDateTime='', durationStr='300 S',
-            barSizeSetting='1 min', whatToShow='TRADES', useRTH=False,
-            timeout=15,
-        )
-        if bars and len(bars) >= 2:
-            prev_vol = bars[-2].volume
-            curr_vol = bars[-1].volume
-            if prev_vol > 0:
-                ratio = curr_vol / prev_vol
-                return ratio >= MILESTONE_VOL_RATIO, round(ratio, 1)
-    except Exception as e:
-        log.debug(f"1min vol check {sym}: {e}")
-    return True, 0.0  # on error — don't block alert
-
-
 def _format_fib_text(sym: str, price: float) -> str:
     """Build compact fib levels text — 3 per row with ratio labels."""
     # Recalculate if needed (auto-advance when price exceeds top level)
@@ -1237,46 +1196,6 @@ def _format_fib_text(sym: str, price: float) -> str:
         lines.append("⬇️ " + " | ".join(_fmt(lv) for lv in below[:3]))
         lines.extend(_rows(below[3:]))
     return "\n".join(lines)
-
-
-def check_milestone(sym: str, pct: float, price: float = 0.0) -> str | None:
-    """Check if stock crossed a +5% milestone up or down.
-
-    Returns alert message or None.
-    E.g. stock at +27% → milestone 25. If last alerted was 20 → alert for 25.
-    Also detects corrections: +30% → +24% alerts "dropped below +25%".
-    """
-    fib_text = _format_fib_text(sym, price) if price > 0 else ""
-
-    if pct < MILESTONE_START_PCT:
-        # Stock dropped below tracking threshold — clear and alert
-        if sym in _milestone_alerted:
-            last = _milestone_alerted.pop(sym)
-            return (
-                f"⚠️ <b>{sym}</b> ירד מתחת ל-+{MILESTONE_START_PCT:.0f}%\n"
-                f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
-                f"{fib_text}"
-            )
-        return None
-
-    current_milestone = int(pct // MILESTONE_STEP_PCT) * MILESTONE_STEP_PCT
-    last = _milestone_alerted.get(sym, MILESTONE_START_PCT - MILESTONE_STEP_PCT)
-
-    if current_milestone > last:
-        _milestone_alerted[sym] = current_milestone
-        return (
-            f"📈 <b>{sym}</b> חצה +{current_milestone:.0f}%!\n"
-            f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
-            f"{fib_text}"
-        )
-    elif current_milestone < last:
-        _milestone_alerted[sym] = current_milestone
-        return (
-            f"📉 <b>{sym}</b> תיקון — ירד מתחת ל-+{last:.0f}%\n"
-            f"  נוכחי: {pct:+.1f}%  |  מחיר: ${price:.2f}"
-            f"{fib_text}"
-        )
-    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -1495,8 +1414,6 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None):
         reverse=True,
     )[:5]
 
-    total_alerts = sum(_daily_alert_count.values())
-
     lines = [
         f"📊 <b>סיכום יומי — {today_str}</b>",
         f"━━━━━━━━━━━━━━━━━━",
@@ -1516,7 +1433,6 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None):
 
     lines.append("")
     lines.append(f"📈 מניות חדשות בסקאנר: {_daily_new_stocks}")
-    lines.append(f"🔔 סה\"כ התראות: {total_alerts}")
 
     # ── P&L if positions exist ──
     if positions:
@@ -1658,17 +1574,6 @@ def _check_session_summary():
         _session_stocks.clear()
 
 
-# ══════════════════════════════════════════════════════════
-#  Volume Anomaly Detection
-# ══════════════════════════════════════════════════════════
-
-HIGH_TURNOVER_PCT = 10.0  # volume > 10% of float = unusual
-
-# {symbol} — already alerted for high volume this session
-_vol_alerted: set[str] = set()
-
-
-
 
 def _parse_float_to_shares(flt_str: str) -> float:
     """Parse Finviz float string like '2.14M' or '120.5K' to share count."""
@@ -1687,328 +1592,25 @@ def _parse_float_to_shares(flt_str: str) -> float:
         return 0
 
 
-def check_volume_anomaly(sym: str, volume_raw: int, enrich: dict) -> str | None:
-    """Check if volume is unusually high relative to float.
-
-    Returns alert message or None. Only alerts once per symbol per session.
-    """
-    if sym in _vol_alerted:
-        return None
-
-    float_shares = _parse_float_to_shares(enrich.get('float', '-'))
-    if float_shares <= 0 or volume_raw <= 0:
-        return None
-
-    turnover_pct = (volume_raw / float_shares) * 100
-
-    if turnover_pct >= HIGH_TURNOVER_PCT:
-        _vol_alerted.add(sym)
-        return (
-            f"🔥 <b>{sym}</b> — ווליום חריג!\n"
-            f"  Vol: {volume_raw:,.0f}  |  Float: {enrich['float']}\n"
-            f"  Turnover: {turnover_pct:.0f}% מהפלוט"
-        )
-    return None
-
-
 # ══════════════════════════════════════════════════════════
-#  Real-Time Trading Alerts (5 types)
+#  Real-Time Trading Alerts (≥20% stocks only)
 # ══════════════════════════════════════════════════════════
+
+ALERT_MIN_PCT = 20.0  # only send alerts for stocks ≥20%
 
 # ── Alert tracking state ──
+_alerts_date: str = ""
 _hod_break_alerted: dict[str, float] = {}              # sym -> last HOD value alerted
 _fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touch_count}
 _lod_touch_tracker: dict[str, int] = {}                 # sym -> touch count at day_low
 _lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD last cycle
 _vwap_side: dict[str, str] = {}                         # sym -> 'above' | 'below'
-_price_1min: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, price)]
-_spike_alerted: set[str] = set()                        # already alerted 8%+ spike
-_multi_signal_alerted: set[str] = set()                 # already sent multi-signal alert today
-_alerts_date: str = ""                                  # date for daily reset
-_halt_alerted: set[str] = set()                         # already alerted halt
-_halt_last_price: dict[str, tuple[float, float]] = {}   # sym → (price, timestamp)
-_daily_alert_count: dict[str, int] = {}                 # sym -> total alerts sent today
-_daily_volume_peak: dict[str, int] = {}                 # sym -> peak volume_raw seen today
+_price_history: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, price)]
+_spike_alerted: dict[str, float] = {}                   # sym -> timestamp (cooldown)
 
-# ── Alert score thresholds ──
-ALERT_MIN_SCORE = 40       # minimum score to send any alert (0-100)
-MULTI_SIGNAL_MIN = 2       # minimum signals for combined alert
-
-# ── News catalyst keywords (bullish / bearish) ──
-# Each tuple: (keyword, points, reason_label)
-# Matched case-insensitively against news headlines (Hebrew + English)
-_NEWS_BULLISH_KW: list[tuple[str, int, str]] = [
-    # ── AI / Tech ──
-    ("artificial intelligence", 20, "AI"),
-    ("בינה מלאכותית", 20, "AI"),
-    (" ai ", 15, "AI"),             # space-padded to avoid matching "said", "laim"
-    ("machine learning", 15, "AI"),
-    ("למידת מכונה", 15, "AI"),
-    ("deep learning", 15, "AI"),
-    ("generative ai", 20, "AI"),
-    ("chatgpt", 15, "AI"),
-    ("openai", 15, "AI"),
-    ("nvidia", 12, "AI"),
-    ("quantum comput", 15, "quantum"),
-    ("מחשוב קוונטי", 15, "quantum"),
-    # ── FDA / Biotech ──
-    ("fda approv", 25, "FDA"),
-    ("אישור fda", 25, "FDA"),
-    ("fda clear", 20, "FDA"),
-    ("breakthrough therapy", 20, "FDA"),
-    ("טיפול פורץ דרך", 20, "FDA"),
-    ("phase 3", 15, "Phase3"),
-    ("phase iii", 15, "Phase3"),
-    ("שלב 3", 15, "Phase3"),
-    ("clinical trial", 10, "clinical"),
-    ("ניסוי קליני", 10, "clinical"),
-    ("positive results", 15, "results+"),
-    ("תוצאות חיוביות", 15, "results+"),
-    ("positive data", 15, "results+"),
-    ("נתונים חיוביים", 15, "results+"),
-    # ── Government / Defense ──
-    ("government contract", 25, "gov"),
-    ("חוזה ממשלתי", 25, "gov"),
-    ("ממשלה", 12, "gov"),
-    ("government", 12, "gov"),
-    ("defense contract", 20, "defense"),
-    ("חוזה ביטחוני", 20, "defense"),
-    ("department of defense", 20, "defense"),
-    ("pentagon", 15, "defense"),
-    ("פנטגון", 15, "defense"),
-    ("military", 12, "defense"),
-    ("צבאי", 12, "defense"),
-    ("nasa", 15, "NASA"),
-    # ── Investment / Institutional ──
-    ("major investor", 20, "investor"),
-    ("משקיע", 15, "investor"),
-    ("institutional buy", 15, "investor"),
-    ("רכישה מוסדית", 15, "investor"),
-    ("13d filing", 15, "investor"),
-    ("activist investor", 18, "investor"),
-    ("warren buffett", 20, "investor"),
-    ("berkshire", 15, "investor"),
-    ("stake", 12, "investor"),
-    ("אחזקה", 10, "investor"),
-    ("insider buy", 15, "insider"),
-    ("רכישת פנים", 15, "insider"),
-    ("buyback", 15, "buyback"),
-    ("רכישה עצמית", 15, "buyback"),
-    ("share repurchase", 15, "buyback"),
-    # ── M&A / Partnerships ──
-    ("partnership", 18, "partnership"),
-    ("שותפות", 18, "partnership"),
-    ("collaboration", 12, "partnership"),
-    ("שיתוף פעולה", 12, "partnership"),
-    ("strategic alliance", 15, "partnership"),
-    ("ברית אסטרטגית", 15, "partnership"),
-    ("acquisition", 18, "M&A"),
-    ("רכישה", 12, "M&A"),
-    ("merger", 18, "M&A"),
-    ("מיזוג", 18, "M&A"),
-    ("buyout", 18, "M&A"),
-    ("takeover", 18, "M&A"),
-    ("השתלטות", 18, "M&A"),
-    # ── Earnings / Revenue ──
-    ("beat estimates", 18, "beat"),
-    ("עלה על התחזיות", 18, "beat"),
-    ("beats expectations", 18, "beat"),
-    ("revenue surge", 15, "revenue+"),
-    ("זינוק בהכנסות", 15, "revenue+"),
-    ("record revenue", 18, "revenue+"),
-    ("הכנסות שיא", 18, "revenue+"),
-    ("record earnings", 18, "earnings+"),
-    ("profit surge", 15, "earnings+"),
-    ("raised guidance", 18, "guidance+"),
-    ("העלאת תחזית", 18, "guidance+"),
-    ("raises guidance", 18, "guidance+"),
-    ("upgrade", 12, "upgrade"),
-    ("העלאת דירוג", 12, "upgrade"),
-    ("price target raised", 15, "PT+"),
-    ("יעד מחיר הועלה", 15, "PT+"),
-    ("price target increase", 15, "PT+"),
-    # ── Regulatory / IP ──
-    ("patent", 12, "patent"),
-    ("פטנט", 12, "patent"),
-    ("patent granted", 18, "patent"),
-    ("patent approved", 18, "patent"),
-    ("license agreement", 12, "license"),
-    ("הסכם רישיון", 12, "license"),
-    # ── Hot sectors ──
-    ("electric vehicle", 12, "EV"),
-    ("רכב חשמלי", 12, "EV"),
-    (" ev ", 10, "EV"),
-    ("solar", 10, "solar"),
-    ("סולארי", 10, "solar"),
-    ("clean energy", 10, "cleanE"),
-    ("אנרגיה נקייה", 10, "cleanE"),
-    ("blockchain", 10, "crypto"),
-    ("בלוקצ'יין", 10, "crypto"),
-    ("bitcoin", 10, "crypto"),
-    ("ביטקוין", 10, "crypto"),
-    ("crypto", 10, "crypto"),
-    ("short squeeze", 20, "squeeze"),
-    ("שורט סקוויז", 20, "squeeze"),
-    ("cannabis", 10, "cannabis"),
-    ("קנאביס", 10, "cannabis"),
-    ("marijuana", 10, "cannabis"),
-    ("legalization", 12, "legal"),
-    ("לגליזציה", 12, "legal"),
-    ("space", 10, "space"),
-    ("חלל", 10, "space"),
-    ("satellite", 10, "space"),
-    ("לוויין", 10, "space"),
-]
-
-# Bearish keywords — subtract points
-_NEWS_BEARISH_KW: list[tuple[str, int, str]] = [
-    ("dilution", -15, "dilution"),
-    ("דילול", -15, "dilution"),
-    ("offering", -12, "offering"),
-    ("הנפק", -10, "offering"),
-    ("shelf registration", -12, "shelf"),
-    ("bankruptcy", -20, "bankrupt"),
-    ("פשיטת רגל", -20, "bankrupt"),
-    ("delisting", -20, "delist"),
-    ("מחיקה מהמסחר", -20, "delist"),
-    ("sec investigation", -15, "SEC"),
-    ("חקירת sec", -15, "SEC"),
-    ("fraud", -18, "fraud"),
-    ("הונאה", -18, "fraud"),
-    ("lawsuit", -8, "lawsuit"),
-    ("תביע", -8, "lawsuit"),
-    ("downgrade", -12, "downgrade"),
-    ("הורדת דירוג", -12, "downgrade"),
-    ("price target cut", -12, "PT-"),
-    ("price target lower", -12, "PT-"),
-    ("missed estimates", -15, "miss"),
-    ("miss expectations", -15, "miss"),
-    ("reverse split", -15, "r/s"),
-    ("איחוד מניות", -15, "r/s"),
-    ("going concern", -18, "concern"),
-]
-
-
-def _score_news_catalysts(sym: str) -> tuple[int, list[str]]:
-    """Score news headlines for bullish/bearish catalysts. Returns (points, [labels])."""
-    enrich = _enrichment.get(sym, {})
-    news_list = enrich.get('news', [])
-    if not news_list:
-        return 0, []
-
-    total = 0
-    seen_labels: set[str] = set()
-    reasons: list[str] = []
-
-    for article in news_list:
-        title = article.get('title_he', '').lower()
-        if not title:
-            continue
-        # Add spaces around title for word-boundary matching
-        padded = f" {title} "
-        for kw, pts, label in _NEWS_BULLISH_KW:
-            if label not in seen_labels and kw.lower() in padded:
-                total += pts
-                seen_labels.add(label)
-                reasons.append(f"📰{label}")
-        for kw, pts, label in _NEWS_BEARISH_KW:
-            if label not in seen_labels and kw.lower() in padded:
-                total += pts  # pts is negative
-                seen_labels.add(label)
-                reasons.append(f"📰⚠️{label}")
-
-    return total, reasons
-
-
-def _calc_alert_score(sym: str, d: dict) -> tuple[int, list[str]]:
-    """Score a stock 0-100 for alert relevance. Higher = more likely to move big.
-
-    Returns (score, [reasons]).
-    Factors: low float, high RVOL, above VWAP, high pct change, near fib, news catalysts.
-    """
-    score = 0
-    reasons = []
-    enrich = _enrichment.get(sym, {})
-
-    # ── Float (0-30 pts) — lower is better ──
-    flt = _parse_float_to_shares(enrich.get('float', '-'))
-    if 0 < flt < 3_000_000:
-        score += 30
-        reasons.append("float<3M")
-    elif 0 < flt < 10_000_000:
-        score += 20
-        reasons.append("float<10M")
-    elif 0 < flt < 30_000_000:
-        score += 10
-        reasons.append("float<30M")
-
-    # ── RVOL (0-25 pts) — higher is better ──
-    rvol = d.get('rvol', 0)
-    if rvol >= 5.0:
-        score += 25
-        reasons.append(f"RVOL {rvol}x")
-    elif rvol >= 3.0:
-        score += 18
-        reasons.append(f"RVOL {rvol}x")
-    elif rvol >= 2.0:
-        score += 10
-        reasons.append(f"RVOL {rvol}x")
-
-    # ── Above VWAP (0-15 pts) ──
-    price = d.get('price', 0)
-    vwap = d.get('vwap', 0)
-    if price > 0 and vwap > 0 and price > vwap:
-        pct_above = (price - vwap) / vwap * 100
-        if pct_above > 5:
-            score += 15
-            reasons.append(f"VWAP+{pct_above:.0f}%")
-        else:
-            score += 8
-            reasons.append("above VWAP")
-
-    # ── Daily % change (0-15 pts) ──
-    pct = d.get('pct', 0)
-    if pct >= 50:
-        score += 15
-        reasons.append(f"{pct:+.0f}%")
-    elif pct >= 30:
-        score += 10
-        reasons.append(f"{pct:+.0f}%")
-    elif pct >= 20:
-        score += 5
-        reasons.append(f"{pct:+.0f}%")
-
-    # ── Short interest (0-10 pts) — squeeze potential ──
-    short_str = enrich.get('short', '-')
-    try:
-        short_pct = float(short_str.replace('%', ''))
-        if short_pct >= 20:
-            score += 10
-            reasons.append(f"short {short_pct:.0f}%")
-        elif short_pct >= 10:
-            score += 5
-            reasons.append(f"short {short_pct:.0f}%")
-    except (ValueError, AttributeError):
-        pass
-
-    # ── Near fib level (0-5 pts) ──
-    cached = _fib_cache.get(sym)
-    if cached and price > 0:
-        _, _, all_levels, *_ = cached
-        threshold = price * 0.008
-        for lv in all_levels:
-            if abs(price - lv) <= threshold:
-                score += 5
-                reasons.append("near fib")
-                break
-
-    # ── News catalysts (up to +25 / down to -20 pts) ──
-    news_pts, news_reasons = _score_news_catalysts(sym)
-    if news_pts != 0:
-        score += news_pts
-        reasons.extend(news_reasons)
-
-    return max(min(score, 100), 0), reasons
+_VWAP_COOLDOWN_SEC = 600    # 10 min between VWAP cross alerts per symbol
+_vwap_last_alert: dict[str, float] = {}
+_SPIKE_COOLDOWN_SEC = 300    # 5 min cooldown per symbol for spike alerts
 
 
 def _reset_alerts_if_new_day():
@@ -2023,15 +1625,8 @@ def _reset_alerts_if_new_day():
         _lod_was_near.clear()
         _vwap_side.clear()
         _vwap_last_alert.clear()
-        _halt_alerted.clear()
-        _halt_last_price.clear()
-        _price_1min.clear()
+        _price_history.clear()
         _spike_alerted.clear()
-        _52w_alerted.clear()
-        _squeeze_alerted.clear()
-        _multi_signal_alerted.clear()
-        _daily_alert_count.clear()
-        _daily_volume_peak.clear()
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
@@ -2043,15 +1638,15 @@ def _reset_alerts_if_new_day():
 
 
 def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
-    """Alert 1: Price broke today's high of day."""
+    """Alert when price breaks today's high of day (≥20% only)."""
+    if current.get('pct', 0) < ALERT_MIN_PCT:
+        return None
     cur_high = current.get('day_high', 0)
     prev_high = previous.get('day_high', 0)
     price = current.get('price', 0)
     if cur_high <= 0 or prev_high <= 0:
         return None
-    # New HOD: today's high is higher than last cycle AND price is at/near the high
     if cur_high > prev_high and price >= cur_high * 0.998:
-        # Only alert once per new high value (allow re-alert if high changes again)
         last_alerted = _hod_break_alerted.get(sym, 0)
         if cur_high <= last_alerted:
             return None
@@ -2059,7 +1654,6 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
         pct = current.get('pct', 0)
         return (
             f"🔺 <b>HOD BREAK — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"💰 ${price:.2f} → שיא יומי חדש!\n"
             f"📊 קודם: ${prev_high:.2f} | שינוי: {pct:+.1f}%"
         )
@@ -2067,8 +1661,8 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
 
 
 def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
-    """Alert 2: 2nd time price touches same fib level (0.8% proximity)."""
-    if price <= 0:
+    """Alert on 2nd+ touch of a Fibonacci level (≥20% only, 0.8% proximity)."""
+    if pct < ALERT_MIN_PCT or price <= 0:
         return None
     if sym not in _fib_cache:
         calc_fib_levels(sym, price)
@@ -2090,20 +1684,17 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
                 if count + 1 == 2:
                     info = ratio_map.get(lv_key)
                     ratio_label = f"{info[0]} {info[1]}" if info else ""
-                    proximity = abs(price - lv) / price * 100
                     return (
                         f"🎯🎯 <b>FIB TOUCH x2 — {sym}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
                         f"📍 רמה: ${lv:.4f} ({ratio_label})\n"
-                        f"💰 מחיר: ${price:.2f} | קרבה: {proximity:.1f}%\n"
-                        f"📊 שינוי: {pct:+.1f}%"
+                        f"💰 ${price:.2f} | שינוי: {pct:+.1f}%"
                     )
     return None
 
 
 def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str | None:
-    """Alert 3: 2nd time price touches day_low (0.5% proximity)."""
-    if price <= 0 or day_low <= 0:
+    """Alert on 2nd touch of day's low (≥20% only, 0.5% proximity)."""
+    if pct < ALERT_MIN_PCT or price <= 0 or day_low <= 0:
         return None
 
     threshold = day_low * 0.005  # 0.5%
@@ -2112,27 +1703,21 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
     was_near = _lod_was_near.get(sym, False)
     _lod_was_near[sym] = near_lod
 
-    # Only count a new touch when transitioning from NOT near to near
     if near_lod and not was_near:
         count = _lod_touch_tracker.get(sym, 0) + 1
         _lod_touch_tracker[sym] = count
         if count == 2:
             return (
                 f"🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
                 f"📍 נמוך יומי: ${day_low:.2f}\n"
-                f"💰 מחיר: ${price:.2f} | שינוי: {pct:+.1f}%\n"
+                f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                 f"⚠️ נגיעה שנייה — תמיכה/שבירה?"
             )
     return None
 
 
-_VWAP_COOLDOWN_SEC = 600  # 10 minutes between VWAP cross alerts per symbol
-_vwap_last_alert: dict[str, float] = {}  # sym → time.time() of last alert
-
-
 def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | None:
-    """Alert 4: Price crosses VWAP (10-min cooldown per symbol)."""
+    """Alert when price crosses VWAP (10-min cooldown per symbol)."""
     if price <= 0 or vwap <= 0:
         return None
 
@@ -2140,196 +1725,77 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
     prev_side = _vwap_side.get(sym)
     _vwap_side[sym] = current_side
 
-    if prev_side is None:
-        return None  # first observation — just record
+    if prev_side is None or prev_side == current_side:
+        return None
 
-    if prev_side == current_side:
-        return None  # no cross
-
-    # Cooldown check
     last = _vwap_last_alert.get(sym, 0)
     if time_mod.time() - last < _VWAP_COOLDOWN_SEC:
         return None
 
     _vwap_last_alert[sym] = time_mod.time()
 
-    if prev_side == 'below' and current_side == 'above':
+    if prev_side == 'below':
         return (
             f"⚡ <b>VWAP CROSS — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"🟢 חצה מעל VWAP!\n"
-            f"💰 ${price:.2f} > VWAP ${vwap:.2f}\n"
-            f"📊 שינוי: {pct:+.1f}%"
+            f"💰 ${price:.2f} > VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
     else:
         return (
             f"⚡ <b>VWAP CROSS — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
             f"🔴 חצה מתחת VWAP!\n"
-            f"💰 ${price:.2f} < VWAP ${vwap:.2f}\n"
-            f"📊 שינוי: {pct:+.1f}%"
+            f"💰 ${price:.2f} < VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
 
 
-def check_1min_spike(sym: str, price: float, pct: float) -> str | None:
-    """Alert 5: Price rose 8%+ compared to ~1 minute ago."""
-    if price <= 0:
+def check_spike(sym: str, price: float, pct: float) -> str | None:
+    """Alert when price rises 8%+ within 1-3 minutes (≥20% only).
+
+    Tracks price history per symbol and compares current price
+    to entries 60-180 seconds ago. Cooldown of 5 min per symbol.
+    """
+    if pct < ALERT_MIN_PCT or price <= 0:
         return None
 
     now = time_mod.time()
-    if sym not in _price_1min:
-        _price_1min[sym] = []
 
-    _price_1min[sym].append((now, price))
-    # Prune entries older than 90 seconds
-    cutoff = now - 90
-    _price_1min[sym] = [(t, p) for t, p in _price_1min[sym] if t > cutoff]
-
-    if sym in _spike_alerted:
+    # Cooldown check
+    last_alert = _spike_alerted.get(sym, 0)
+    if now - last_alert < _SPIKE_COOLDOWN_SEC:
+        # Still record price even during cooldown
+        _price_history.setdefault(sym, []).append((now, price))
         return None
 
-    # Find entry closest to 60 seconds ago (window: 55-65s)
-    target = now - 60
-    candidates = [(t, p) for t, p in _price_1min[sym] if abs(t - target) <= 5]
+    if sym not in _price_history:
+        _price_history[sym] = []
+
+    _price_history[sym].append((now, price))
+    # Prune entries older than 200 seconds
+    cutoff = now - 200
+    _price_history[sym] = [(t, p) for t, p in _price_history[sym] if t > cutoff]
+
+    # Find oldest entry within 60-180s ago window
+    candidates = [(t, p) for t, p in _price_history[sym]
+                  if 60 <= (now - t) <= 180]
     if not candidates:
         return None
 
-    old_t, old_price = min(candidates, key=lambda x: abs(x[0] - target))
+    old_t, old_price = min(candidates, key=lambda x: x[0])  # oldest in window
     if old_price <= 0:
         return None
 
     change_pct = (price - old_price) / old_price * 100
+    elapsed_sec = int(now - old_t)
+    elapsed_min = elapsed_sec / 60
+
     if change_pct >= 8.0:
-        _spike_alerted.add(sym)
+        _spike_alerted[sym] = now
         return (
             f"🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⏱️ עלייה של {change_pct:.1f}% בדקה!\n"
-            f"💰 ${old_price:.2f} → ${price:.2f}\n"
-            f"📊 שינוי יומי: {pct:+.1f}%"
+            f"⏱️ עלייה של {change_pct:.1f}% ב-{elapsed_min:.1f} דקות!\n"
+            f"💰 ${old_price:.2f} → ${price:.2f} | יומי: {pct:+.1f}%"
         )
     return None
-
-
-# ── 52-Week High Breakout ──
-
-_52w_alerted: set[str] = set()  # symbols already alerted today
-
-
-def check_52w_breakout(sym: str, price: float, enrich: dict) -> str | None:
-    """Alert when current price breaks above 52-week high."""
-    if sym in _52w_alerted or price <= 0:
-        return None
-    raw = enrich.get('52w_high', '-')
-    if raw == '-' or not raw:
-        return None
-    try:
-        high_52w = float(str(raw).replace(',', ''))
-    except (ValueError, TypeError):
-        return None
-    if price >= high_52w:
-        _52w_alerted.add(sym)
-        pct_above = (price - high_52w) / high_52w * 100
-        fib_text = _format_fib_text(sym, price)
-        return (
-            f"👑 <b>52W HIGH — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💰 ${price:.2f}  שבר שיא שנתי!\n"
-            f"🎯 שיא קודם: ${high_52w:.2f}  (+{pct_above:.1f}% מעל)"
-            f"{fib_text}"
-        )
-    return None
-
-
-# ── Short Squeeze Detection ──
-
-SQUEEZE_MIN_PCT = 20.0         # stock must be up ≥ 20%
-SQUEEZE_MIN_SHORT_PCT = 15.0   # short interest ≥ 15%
-SQUEEZE_MIN_TURNOVER_PCT = 20.0  # volume ≥ 20% of float
-
-_squeeze_alerted: set[str] = set()
-
-_HALT_STALE_SEC = 90  # if price unchanged for 90s during market hours → likely halted
-
-
-def check_halt(sym: str, price: float) -> str | None:
-    """Detect potential trading halt: price frozen for 90+ seconds during market hours.
-
-    LULD halts freeze the price. If we see the exact same price across
-    multiple scan cycles (90+ seconds), the stock is likely halted.
-    """
-    if _get_market_session() != 'market':
-        return None
-    if price <= 0 or sym in _halt_alerted:
-        return None
-
-    now = time_mod.time()
-    prev = _halt_last_price.get(sym)
-
-    if prev is None:
-        _halt_last_price[sym] = (price, now)
-        return None
-
-    prev_price, prev_ts = prev
-
-    if abs(price - prev_price) > 0.0001:
-        # Price moved — not halted, reset
-        _halt_last_price[sym] = (price, now)
-        return None
-
-    # Price unchanged — check how long
-    elapsed = now - prev_ts
-    if elapsed >= _HALT_STALE_SEC:
-        _halt_alerted.add(sym)
-        mins = int(elapsed / 60)
-        return (
-            f"🚨 <b>HALT — {sym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⛔ מחיר קפוא {mins}+ דקות!\n"
-            f"💰 ${price:.2f} (ללא שינוי)\n"
-            f"⚠️ סביר שהמניה בהשהייה (LULD/T1)"
-        )
-    return None
-
-
-def check_short_squeeze(sym: str, price: float, pct: float,
-                        volume_raw: int, enrich: dict) -> str | None:
-    """Alert when conditions suggest a potential short squeeze."""
-    if sym in _squeeze_alerted or pct < SQUEEZE_MIN_PCT or price <= 0:
-        return None
-
-    # Parse short interest
-    short_str = enrich.get('short', '-')
-    if short_str == '-' or not short_str:
-        return None
-    try:
-        short_pct = float(str(short_str).replace('%', '').replace(',', ''))
-    except (ValueError, TypeError):
-        return None
-    if short_pct < SQUEEZE_MIN_SHORT_PCT:
-        return None
-
-    # Parse float and check turnover
-    flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
-    if flt_shares <= 0:
-        return None
-    turnover_pct = (volume_raw / flt_shares) * 100
-    if turnover_pct < SQUEEZE_MIN_TURNOVER_PCT:
-        return None
-
-    _squeeze_alerted.add(sym)
-    flt = enrich.get('float', '-')
-    vol_str = _format_volume(volume_raw)
-    fib_text = _format_fib_text(sym, price)
-    return (
-        f"🩳🔥 <b>SHORT SQUEEZE — {sym}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 ${price:.2f}  {pct:+.1f}%\n"
-        f"🩳 Short: {short_pct:.1f}%  |  Float: {flt}\n"
-        f"📊 Vol: {vol_str}  ({turnover_pct:.0f}% of float)\n"
-        f"⚡ עלייה + שורט גבוה + ווליום = סחיטה!"
-        f"{fib_text}"
-    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -2676,158 +2142,6 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
 
 
-def _generate_simple_chart(sym: str, df: pd.DataFrame, title: str) -> Figure | None:
-    """Generate a simple candlestick chart (no Fibonacci) as a matplotlib Figure.
-
-    Returns a Figure object for embedding in tkinter, or None on failure.
-    """
-    try:
-        if len(df) < 3:
-            return None
-
-        n_bars = len(df)
-        fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0e1117')
-        ax.set_facecolor('#0e1117')
-
-        width = 0.6
-        for i, (_, row) in enumerate(df.iterrows()):
-            o, h, l, c = row['open'], row['high'], row['low'], row['close']
-            color = '#26a69a' if c >= o else '#ef5350'
-            ax.plot([i, i], [l, h], color=color, linewidth=0.6)
-            body_bottom = min(o, c)
-            body_height = abs(c - o) or 0.001
-            ax.bar(i, body_height, bottom=body_bottom, width=width,
-                   color=color, edgecolor=color, linewidth=0.4)
-
-        # Current price line
-        last_close = df['close'].iloc[-1]
-        ax.axhline(y=last_close, color='white', linewidth=0.8, linestyle='--', alpha=0.7)
-        ax.text(n_bars - 1, last_close, f' ${last_close:.2f}',
-                color='white', fontsize=7, va='bottom', ha='left', fontweight='bold')
-
-        # X-axis labels
-        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
-        tick_step = max(1, n_bars // 6)
-        tick_positions = list(range(0, n_bars, tick_step))
-        tick_labels = []
-        date_list = list(dates)
-        for pos in tick_positions:
-            d = date_list[pos]
-            if hasattr(d, 'strftime'):
-                tick_labels.append(d.strftime('%m/%d'))
-            else:
-                tick_labels.append(str(d)[:5])
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, color='#888', fontsize=6, rotation=30, ha='right')
-
-        ax.tick_params(colors='#888', labelsize=7)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['bottom'].set_color('#333')
-        ax.spines['left'].set_color('#333')
-        ax.set_title(title, color='white', fontsize=10, fontweight='bold', pad=6)
-        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
-        fig.tight_layout()
-        return fig
-
-    except Exception as e:
-        log.error(f"_generate_simple_chart {sym}: {e}")
-        plt.close('all')
-        return None
-
-
-def _generate_fib_chart_figure(sym: str, df: pd.DataFrame, all_levels: list[float],
-                                current_price: float,
-                                ratio_map: dict | None = None) -> Figure | None:
-    """Generate a 5-min candlestick chart with Fibonacci levels as a Figure.
-
-    Similar to generate_fib_chart but returns Figure for tkinter embedding.
-    """
-    try:
-        df = df.tail(120).copy()
-        if len(df) < 5:
-            return None
-
-        n_bars = len(df)
-        right_padding = int(n_bars * 0.3)
-
-        fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0e1117')
-        ax.set_facecolor('#0e1117')
-
-        width = 0.6
-        for i, (_, row) in enumerate(df.iterrows()):
-            o, h, l, c = row['open'], row['high'], row['low'], row['close']
-            color = '#26a69a' if c >= o else '#ef5350'
-            ax.plot([i, i], [l, h], color=color, linewidth=0.6)
-            body_bottom = min(o, c)
-            body_height = abs(c - o) or 0.001
-            ax.bar(i, body_height, bottom=body_bottom, width=width,
-                   color=color, edgecolor=color, linewidth=0.4)
-
-        # Y range
-        vis_max = current_price * 2.5
-        vis_min = max(0, current_price * 0.01)
-        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
-
-        _default_color = '#888888'
-        price_span = vis_max - vis_min
-        min_label_gap = price_span * 0.018
-        last_y = -999.0
-
-        for lv in visible_levels:
-            info = ratio_map.get(round(lv, 4)) if ratio_map else None
-            if isinstance(info, tuple):
-                ratio, series = info
-            elif info is not None:
-                ratio, series = info, "S1"
-            else:
-                ratio, series = None, "S1"
-            color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
-            ax.axhline(y=lv, color=color, linewidth=0.6, alpha=0.7, linestyle='-')
-            if ratio is not None and abs(lv - last_y) >= min_label_gap:
-                ax.text(n_bars + 1, lv, f' {ratio} ${lv:.3f}', color=color,
-                        fontsize=6, va='center', ha='left', fontweight='bold')
-                last_y = lv
-
-        # Current price
-        ax.axhline(y=current_price, color='white', linewidth=0.8, linestyle='--', alpha=0.8)
-        ax.text(0, current_price, f' ${current_price:.2f}',
-                color='white', fontsize=7, va='bottom', ha='left', fontweight='bold')
-
-        # X-axis
-        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
-        tick_step = max(1, n_bars // 8)
-        tick_positions = list(range(0, n_bars, tick_step))
-        tick_labels = []
-        date_list = list(dates)
-        for pos in tick_positions:
-            d = date_list[pos]
-            if hasattr(d, 'strftime'):
-                tick_labels.append(d.strftime('%H:%M'))
-            else:
-                tick_labels.append(str(d)[:5])
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, color='#888', fontsize=6, rotation=30, ha='right')
-
-        ax.set_ylim(vis_min, vis_max)
-        ax.set_xlim(-1, n_bars + right_padding)
-        ax.tick_params(colors='#888', labelsize=7)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['bottom'].set_color('#333')
-        ax.spines['left'].set_color('#333')
-        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
-                     color='white', fontsize=10, fontweight='bold', pad=6)
-        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
-        fig.tight_layout()
-        return fig
-
-    except Exception as e:
-        log.error(f"_generate_fib_chart_figure {sym}: {e}")
-        plt.close('all')
-        return None
-
-
 def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
     """Find the closest SMA and EMA resistances above current price.
 
@@ -3113,58 +2427,6 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
 # ══════════════════════════════════════════════════════════
 #  Anomaly Detection
 # ══════════════════════════════════════════════════════════
-
-# Thresholds
-MOMENTUM_1MIN_PCT = 7.0       # alert when price moves 7%+ in 1 minute
-MOMENTUM_COOLDOWN_SEC = 180   # 3 minute cooldown per symbol
-_momentum_last_alert: dict[str, float] = {}  # {sym: timestamp}
-
-
-def detect_momentum_alerts(current: dict) -> list[dict]:
-    """Detect stocks that moved ≥7% in price over the last 1 minute.
-
-    Uses stock_history data (timestamp, price, pct) to compare current
-    price vs price ~60 seconds ago. Simple, clear, no confusion between
-    points/percent/price.
-    """
-    alerts = []
-    now = time_mod.time()
-
-    for sym, d in current.items():
-        # Cooldown check
-        last = _momentum_last_alert.get(sym, 0)
-        if now - last < MOMENTUM_COOLDOWN_SEC:
-            continue
-
-        mom = stock_history.get_momentum(sym)
-        m1 = mom.get('1m')
-        if not m1:
-            continue
-
-        price_chg = m1['price_delta_pct']  # actual % price change in 1 min
-        if abs(price_chg) >= MOMENTUM_1MIN_PCT:
-            direction = "🚀" if price_chg > 0 else "💥"
-            price = d['price']
-            pct = d.get('pct', 0)
-            vol = d.get('volume', '-')
-            flt = d.get('float', '-')
-            enrich = _enrichment.get(sym, {})
-            if not flt or flt == '-':
-                flt = enrich.get('float', '-')
-
-            alerts.append({
-                'type': 'momentum_1min',
-                'symbol': sym,
-                'change_pct': price_chg,
-                'msg': (
-                    f"{direction} <b>{sym}</b> — {price_chg:+.1f}% בדקה!\n"
-                    f"   💰 ${price:.2f} ({pct:+.1f}% יומי)  Vol: {vol}  Float: {flt}"
-                ),
-            })
-            _momentum_last_alert[sym] = now
-
-    return alerts
-
 
 # ══════════════════════════════════════════════════════════
 #  Telegram
@@ -4170,118 +3432,79 @@ class ScannerThread(threading.Thread):
                 summary_lines.append("  אין מניות מעל 20% כרגע")
             send_telegram("\n".join(summary_lines))
 
-        # ── Momentum alerts: ≥7% price move in 1 minute ──
-        if not is_baseline and current:
-            mom_alerts = detect_momentum_alerts(current)
-            if mom_alerts:
-                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
-                header = f"🔔 <b>מומנטום</b> — {now_et} ET\n"
-                lines = [a['msg'] for a in mom_alerts]
-                for a in mom_alerts:
-                    file_logger.log_alert(ts, a)
-                    if self.on_alert:
-                        self.on_alert(a.get('msg', f"Momentum {a.get('symbol', '?')}"))
-                send_telegram_alert(header + "\n".join(lines))
-                status += f"  🔔{len(mom_alerts)}"
-            else:
-                status += "  ✓"
+        # ── Real-time alerts (enriched ≥20% stocks) ──
+        if not is_baseline and current and not self._warmup:
+            batch_alerts: list[str] = []
+            batch_syms: list[str] = []
 
-        # ── Collect ALL alerts for this cycle into one batch ──
-        batch_alerts: list[str] = []
-        batch_syms: list[str] = []  # unique symbols for keyboard buttons
-
-        # Milestone + Volume + 52W (only enriched momentum stocks)
-        for sym, d in current.items():
-            if sym not in _enrichment:
-                continue
-            ms_msg = check_milestone(sym, d['pct'], d['price'])
-            if ms_msg:
-                spike, ratio = _check_1min_volume_spike(sym)
-                if spike:
-                    batch_alerts.append(ms_msg)
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-                    status += f"  📈{sym}"
-                else:
-                    log.info(f"Milestone {sym} skipped: 1min vol ratio {ratio}x < {MILESTONE_VOL_RATIO}x")
-
-            if sym in _enrichment and d.get('volume_raw', 0) > 0:
-                vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
-                if vol_msg:
-                    batch_alerts.append(vol_msg)
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-                    status += f"  🔥{sym}"
-
-            if sym in _enrichment:
-                w52_msg = check_52w_breakout(sym, d['price'], _enrichment[sym])
-                if w52_msg:
-                    batch_alerts.append(w52_msg)
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-                    status += f"  👑{sym}"
-
-                sq_msg = check_short_squeeze(
-                    sym, d['price'], d.get('pct', 0),
-                    d.get('volume_raw', 0), _enrichment[sym])
-                if sq_msg:
-                    batch_alerts.append(sq_msg)
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-                    status += f"  🩳{sym}"
-
-        # Halt detection (check ALL stocks, not just enriched)
-        for sym, d in current.items():
-            halt_msg = check_halt(sym, d['price'])
-            if halt_msg:
-                batch_alerts.append(halt_msg)
-                if sym not in batch_syms:
-                    batch_syms.append(sym)
-                status += f"  🚨{sym}"
-
-        # Real-time alerts (5 types, score-filtered + multi-signal)
-        if not is_baseline and current:
-            # Update daily volume peaks for enriched stocks only
             for sym, d in current.items():
                 if sym not in _enrichment:
                     continue
-                vol_raw = d.get('volume_raw', 0)
-                if vol_raw > _daily_volume_peak.get(sym, 0):
-                    _daily_volume_peak[sym] = vol_raw
+                price = d.get('price', 0)
+                pct = d.get('pct', 0)
+                prev_d = previous.get(sym, {}) if previous else {}
 
-            # Find top-3 volume stocks for badge
-            vol_top3 = set()
-            if _daily_volume_peak:
-                sorted_vol = sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)
-                vol_top3 = {s for s, _ in sorted_vol[:3]}
+                # HOD break
+                hod_msg = check_hod_break(sym, d, prev_d)
+                if hod_msg:
+                    batch_alerts.append(hod_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
 
-            # NOTE: HOD, VWAP cross, Fib touch, LOD, 1-min spike alerts
-            # removed — replaced by momentum 1-min ≥7% alert above.
+                # Fib 2nd touch
+                fib_msg = check_fib_second_touch(sym, price, pct)
+                if fib_msg:
+                    batch_alerts.append(fib_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
 
-        # ── Send all alerts as one message ──
-        if batch_alerts and not self._warmup:
-            # Push batch alerts to GUI panel
-            if self.on_alert:
-                for ba in batch_alerts:
-                    # Strip HTML tags for GUI display
-                    clean = re.sub(r'<[^>]+>', '', ba)[:100]
-                    self.on_alert(clean)
+                # LOD touch
+                day_low = d.get('day_low', 0)
+                lod_msg = check_lod_touch(sym, price, day_low, pct)
+                if lod_msg:
+                    batch_alerts.append(lod_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
 
-            # Build keyboard with buttons for all symbols
-            keyboard_rows = []
-            for s in batch_syms:
-                keyboard_rows.append([
-                    {'text': f'📊 {s}', 'callback_data': f'lookup:{s}'},
-                    {'text': f'📈 TradingView', 'url': f'https://www.tradingview.com/chart/?symbol={s}'},
-                ])
-            btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
+                # VWAP cross
+                vwap = d.get('vwap', 0)
+                vwap_msg = check_vwap_cross(sym, price, vwap, pct)
+                if vwap_msg:
+                    batch_alerts.append(vwap_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
 
-            if len(batch_alerts) == 1:
-                send_telegram_alert(batch_alerts[0], reply_markup=btn)
+                # Spike 8%+ in 1-3 minutes
+                spike_msg = check_spike(sym, price, pct)
+                if spike_msg:
+                    batch_alerts.append(spike_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
+
+            # Send all alerts as one batch
+            if batch_alerts:
+                if self.on_alert:
+                    for ba in batch_alerts:
+                        clean = re.sub(r'<[^>]+>', '', ba)[:100]
+                        self.on_alert(clean)
+
+                keyboard_rows = []
+                for s in batch_syms:
+                    keyboard_rows.append([
+                        {'text': f'📊 {s}', 'callback_data': f'lookup:{s}'},
+                        {'text': f'📈 TradingView', 'url': f'https://www.tradingview.com/chart/?symbol={s}'},
+                    ])
+                btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
+
+                if len(batch_alerts) == 1:
+                    send_telegram_alert(batch_alerts[0], reply_markup=btn)
+                else:
+                    now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
+                    header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
+                    send_telegram_alert(header + "\n\n".join(batch_alerts), reply_markup=btn)
+                status += f"  🔔{len(batch_alerts)}"
             else:
-                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
-                header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
-                send_telegram_alert(header + "\n\n".join(batch_alerts), reply_markup=btn)
+                status += "  ✓"
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()
@@ -4552,7 +3775,7 @@ class App:
         vol_raw = d.get('volume_raw', 0)
         float_shares = _parse_float_to_shares(enrich.get('float', '-')) if enrich else 0
         turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
-        is_hot = turnover >= HIGH_TURNOVER_PCT
+        is_hot = turnover >= 10.0  # volume > 10% of float
 
         sym_text = f"🔥{sym}" if is_hot else sym
         sym_fg = "#ff6600" if is_hot else self.FG
@@ -5286,8 +4509,6 @@ class App:
             self.btn.config(text="START", bg=self.GREEN)
             self.status.set("Stopped.")
         else:
-            global MOMENTUM_1MIN_PCT
-            MOMENTUM_1MIN_PCT = self.thresh.get()
             self._save()
             self.scanner = ScannerThread(
                 freq=self.freq.get(),
