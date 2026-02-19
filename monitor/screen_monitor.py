@@ -261,6 +261,7 @@ def _format_volume(volume: float) -> str:
 
 # Cache avg volume per symbol so repeat scans only need 2D of data
 _avg_vol_cache: dict[str, float] = {}
+_avg_vol_cache_day: str = ""  # "YYYY-MM-DD" — reset cache daily
 
 
 def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
@@ -897,6 +898,90 @@ def _check_holiday_alerts():
 
 
 # ══════════════════════════════════════════════════════════
+#  "Stocks in Play" — Market Open Summary (9:30 ET)
+# ══════════════════════════════════════════════════════════
+
+_stocks_in_play_sent: str = ""  # "YYYY-MM-DD"
+
+
+def _check_stocks_in_play(current: dict):
+    """Send 'Stocks in Play' summary at market open (9:30-9:32 ET)."""
+    global _stocks_in_play_sent
+
+    now_et = datetime.now(ZoneInfo('US/Eastern'))
+    today_str = now_et.strftime('%Y-%m-%d')
+    if _stocks_in_play_sent == today_str:
+        return
+    if now_et.weekday() >= 5:
+        return
+    t = now_et.time()
+    if not (time(9, 30) <= t <= time(9, 32)):
+        return
+    if not current:
+        return
+
+    _stocks_in_play_sent = today_str
+
+    # Rank by turnover (volume / float) — best momentum indicator
+    ranked = []
+    for sym, d in current.items():
+        pct = d.get('pct', 0)
+        price = d.get('price', 0)
+        vol = d.get('volume_raw', 0)
+        enrich = _enrichment.get(sym, {})
+        flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
+        turnover = (vol / flt_shares * 100) if flt_shares > 0 else 0
+        ranked.append((sym, d, enrich, turnover))
+
+    # Sort by turnover, take top 5
+    ranked.sort(key=lambda x: x[3], reverse=True)
+    top = ranked[:5]
+
+    lines = [
+        f"🔔 <b>Stocks in Play — פתיחת מסחר</b>",
+        f"━━━━━━━━━━━━━━━━━━",
+        f"📈 {len(current)} מניות בסקאנר | טופ 5 לפי turnover:",
+        "",
+    ]
+
+    for i, (sym, d, enrich, turnover) in enumerate(top, 1):
+        pct = d.get('pct', 0)
+        price = d.get('price', 0)
+        vol = d.get('volume_raw', 0)
+        vol_str = _format_volume(vol) if vol else '-'
+        flt = enrich.get('float', '-')
+        short = enrich.get('short', '-')
+        arrow = "🟢" if pct > 0 else "🔴"
+
+        lines.append(
+            f"  {i}. {arrow} <b>{sym}</b>  ${price:.2f}  {pct:+.1f}%"
+        )
+        lines.append(
+            f"      Float:{flt}  Short:{short}  Vol:{vol_str}  Turnover:{turnover:.0f}%"
+        )
+
+        # Latest news
+        news = enrich.get('news', [])
+        if news:
+            title = news[0].get('title_he', news[0].get('title_en', ''))
+            if title:
+                lines.append(f"      📰 {title}")
+        lines.append("")
+
+    # Add buttons for all symbols
+    btn_rows = []
+    for sym, _, _, _ in top:
+        btn_rows.append([
+            {'text': f'📊 {sym}', 'callback_data': f'lookup:{sym}'},
+            {'text': f'📈 TV', 'url': f'https://www.tradingview.com/chart/?symbol={sym}'},
+        ])
+    btn = {'inline_keyboard': btn_rows} if btn_rows else None
+
+    send_telegram("\n".join(lines), reply_markup=btn)
+    log.info(f"Stocks in play sent: {len(top)} stocks")
+
+
+# ══════════════════════════════════════════════════════════
 #  Daily Summary (sent after market close)
 # ══════════════════════════════════════════════════════════
 
@@ -1469,11 +1554,13 @@ def _reset_alerts_if_new_day():
         _price_1min.clear()
         _spike_alerted.clear()
         _52w_alerted.clear()
+        _squeeze_alerted.clear()
         _multi_signal_alerted.clear()
         _daily_alert_count.clear()
         _daily_volume_peak.clear()
         _session_summary_sent.clear()
         _session_stocks.clear()
+        _avg_vol_cache.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -1661,6 +1748,55 @@ def check_52w_breakout(sym: str, price: float, enrich: dict) -> str | None:
             f"{fib_text}"
         )
     return None
+
+
+# ── Short Squeeze Detection ──
+
+SQUEEZE_MIN_PCT = 20.0         # stock must be up ≥ 20%
+SQUEEZE_MIN_SHORT_PCT = 15.0   # short interest ≥ 15%
+SQUEEZE_MIN_TURNOVER_PCT = 20.0  # volume ≥ 20% of float
+
+_squeeze_alerted: set[str] = set()
+
+
+def check_short_squeeze(sym: str, price: float, pct: float,
+                        volume_raw: int, enrich: dict) -> str | None:
+    """Alert when conditions suggest a potential short squeeze."""
+    if sym in _squeeze_alerted or pct < SQUEEZE_MIN_PCT or price <= 0:
+        return None
+
+    # Parse short interest
+    short_str = enrich.get('short', '-')
+    if short_str == '-' or not short_str:
+        return None
+    try:
+        short_pct = float(str(short_str).replace('%', '').replace(',', ''))
+    except (ValueError, TypeError):
+        return None
+    if short_pct < SQUEEZE_MIN_SHORT_PCT:
+        return None
+
+    # Parse float and check turnover
+    flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
+    if flt_shares <= 0:
+        return None
+    turnover_pct = (volume_raw / flt_shares) * 100
+    if turnover_pct < SQUEEZE_MIN_TURNOVER_PCT:
+        return None
+
+    _squeeze_alerted.add(sym)
+    flt = enrich.get('float', '-')
+    vol_str = _format_volume(volume_raw)
+    fib_text = _format_fib_text(sym, price)
+    return (
+        f"🩳🔥 <b>SHORT SQUEEZE — {sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 ${price:.2f}  {pct:+.1f}%\n"
+        f"🩳 Short: {short_pct:.1f}%  |  Float: {flt}\n"
+        f"📊 Vol: {vol_str}  ({turnover_pct:.0f}% of float)\n"
+        f"⚡ עלייה + שורט גבוה + ווליום = סחיטה!"
+        f"{fib_text}"
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -3471,6 +3607,15 @@ class ScannerThread(threading.Thread):
                         batch_syms.append(sym)
                     status += f"  👑{sym}"
 
+                sq_msg = check_short_squeeze(
+                    sym, d['price'], d.get('pct', 0),
+                    d.get('volume_raw', 0), _enrichment[sym])
+                if sq_msg:
+                    batch_alerts.append(sq_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
+                    status += f"  🩳{sym}"
+
         # Real-time alerts (5 types, score-filtered + multi-signal)
         if not is_baseline and current:
             # Update daily volume peaks for all stocks in this cycle
@@ -3623,6 +3768,7 @@ class ScannerThread(threading.Thread):
         new_count = len(set(current) - set(self.previous)) if self.previous else 0
         _track_daily_stats(current, new_count=new_count)
         _track_session_stocks(current)
+        _check_stocks_in_play(current)
         _check_session_summary()
         _check_daily_summary(positions=self._cached_positions)
 
