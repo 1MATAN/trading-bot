@@ -1855,7 +1855,7 @@ def check_halt(sym: str, price: float) -> str | None:
     LULD halts freeze the price. If we see the exact same price across
     multiple scan cycles (90+ seconds), the stock is likely halted.
     """
-    if _get_market_session() not in ('market', 'pre_market', 'after_hours'):
+    if _get_market_session() != 'market':
         return None
     if price <= 0 or sym in _halt_alerted:
         return None
@@ -3175,14 +3175,29 @@ class ScannerThread(threading.Thread):
             order.outsideRth = True
             order.tif = 'DAY'
             trade = ib.placeOrder(contract, order)
-            msg = f"{action} {qty} {sym} @ ${price:.2f} — {trade.orderStatus.status}"
+            ib.sleep(3)  # wait for order status callback
+            status = trade.orderStatus.status
+            if status in ('Inactive', 'Cancelled'):
+                err_log = [e for e in trade.log if e.errorCode]
+                reason = err_log[-1].message if err_log else "Unknown"
+                msg = f"Order REJECTED: {action} {qty} {sym} — {reason}"
+                log.error(msg)
+                if self.on_order_result:
+                    self.on_order_result(msg, False)
+                send_telegram(
+                    f"❌ <b>Order Rejected</b>\n"
+                    f"  {action} {qty} {sym} @ ${price:.2f}\n"
+                    f"  Reason: {reason}"
+                )
+                return
+            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}"
             log.info(f"Order placed: {msg}")
             if self.on_order_result:
                 self.on_order_result(msg, True)
             send_telegram(
                 f"📋 <b>Order Placed</b>\n"
                 f"  {action} {qty} {sym} @ ${price:.2f}\n"
-                f"  Status: {trade.orderStatus.status}\n"
+                f"  Status: {status}\n"
                 f"  outsideRth: ✓  |  TIF: DAY"
             )
         except Exception as e:
@@ -3209,7 +3224,18 @@ class ScannerThread(threading.Thread):
             buy_order = MarketOrder('BUY', qty)
             buy_order.outsideRth = True
             buy_trade = ib.placeOrder(contract, buy_order)
-            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_trade.orderStatus.status}")
+            ib.sleep(3)  # wait for order status callback
+            buy_status = buy_trade.orderStatus.status
+            if buy_status in ('Inactive', 'Cancelled'):
+                err_log = [e for e in buy_trade.log if e.errorCode]
+                reason = err_log[-1].message if err_log else "Unknown"
+                msg = f"FIB DT REJECTED: BUY {qty} {sym} — {reason}"
+                log.error(msg)
+                if self.on_order_result:
+                    self.on_order_result(msg, False)
+                send_telegram(f"❌ <b>FIB DT Order Rejected</b>\n  BUY {qty} {sym}\n  Reason: {reason}")
+                return
+            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_status}")
 
             # 2. OCA bracket for first half
             oca_group = f"FibDT_{sym}_{int(time_mod.time())}"
