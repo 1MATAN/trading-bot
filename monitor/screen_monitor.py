@@ -528,7 +528,7 @@ def _capture_and_ocr(wid: int) -> str:
     """
     try:
         result = subprocess.run(
-            ['import', '-window', str(wid), 'png:-'],
+            ['import', '-silent', '-window', str(wid), 'png:-'],
             capture_output=True, timeout=10,
         )
         if result.returncode != 0 or not result.stdout:
@@ -575,26 +575,27 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
     return (raw, _format_volume(raw))
 
 
-# Generic OCR patterns — 3 formats in priority order
+# Generic OCR patterns — Webull format: SYM +PCT% PRICE VOL FLOAT
+# PCT always starts with +/-, PRICE is plain digits — used to distinguish columns.
 _OCR_RE_5COL = re.compile(
     r'^([A-Z]{1,5})\s+'           # symbol
+    r'([+-][\d.,]+)%?\S*\s+'      # pct change (+/- prefix, optional %, ignore junk)
     r'([\d.]+)\s+'                # price
-    r'([+-]?[\d.,]+)%\S*\s+'     # pct change (ignore OCR junk after %)
     r'([\d.,]+[KMBkmb]?)\s+'     # volume
-    r'([\d.,]+[KMBkmb]?)$',      # float
+    r'([\d.,]+[KMBkmb]?)\s*$',   # float
     re.MULTILINE,
 )
 _OCR_RE_4COL = re.compile(
     r'^([A-Z]{1,5})\s+'
+    r'([+-][\d.,]+)%?\S*\s+'
     r'([\d.]+)\s+'
-    r'([+-]?[\d.,]+)%\S*\s+'
-    r'([\d.,]+[KMBkmb]?)$',
+    r'([\d.,]+[KMBkmb]?)\s*$',
     re.MULTILINE,
 )
 _OCR_RE_3COL = re.compile(
     r'^([A-Z]{1,5})\s+'
-    r'([\d.]+)\s+'
-    r'([+-]?[\d.,]+)%\S*$',
+    r'([+-][\d.,]+)%?\S*\s+'
+    r'([\d.]+)\s*$',
     re.MULTILINE,
 )
 
@@ -602,10 +603,10 @@ _OCR_RE_3COL = re.compile(
 def _parse_ocr_generic(text: str) -> list[dict]:
     """Parse OCR text into structured stock data.
 
-    Tries 3 regex patterns in priority order:
-    1. 5 columns: SYMBOL PRICE PCT% VOLUME FLOAT (Webull style)
-    2. 4 columns: SYMBOL PRICE PCT% VOLUME
-    3. 3 columns: SYMBOL PRICE PCT%
+    Tries 3 regex patterns in priority order (Webull column order):
+    1. 5 columns: SYMBOL PCT% PRICE VOLUME FLOAT
+    2. 4 columns: SYMBOL PCT% PRICE VOLUME
+    3. 3 columns: SYMBOL PCT% PRICE
     """
     results = []
     seen = set()
@@ -616,8 +617,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            price = float(m.group(2))
-            pct = float(m.group(3).replace(',', ''))
+            pct = float(m.group(2).replace(',', ''))
+            price = float(m.group(3))
         except ValueError:
             continue
         vol_raw, vol_display = _parse_ocr_volume(m.group(4))
@@ -635,8 +636,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            price = float(m.group(2))
-            pct = float(m.group(3).replace(',', ''))
+            pct = float(m.group(2).replace(',', ''))
+            price = float(m.group(3))
         except ValueError:
             continue
         vol_raw, vol_display = _parse_ocr_volume(m.group(4))
@@ -653,8 +654,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            price = float(m.group(2))
-            pct = float(m.group(3).replace(',', ''))
+            pct = float(m.group(2).replace(',', ''))
+            price = float(m.group(3))
         except ValueError:
             continue
         results.append({
@@ -2870,6 +2871,40 @@ class ScannerThread(threading.Thread):
         if self._telegram_listener:
             self._telegram_listener.stop()
 
+    def _quick_ocr_price_update(self):
+        """Fast OCR-only price refresh between full scan cycles.
+
+        Reads Webull screen via OCR (~1s) and updates only price/pct
+        for stocks already in self.previous. No enrichment, no alerts.
+        """
+        if not self.previous:
+            return
+        raw = _run_ocr_scan(self.price_min, self.price_max)
+        if not raw:
+            return
+        updated = False
+        for sym, d in raw.items():
+            if sym not in self.previous:
+                continue
+            new_price = d['price']
+            old_price = self.previous[sym].get('price', 0)
+            if abs(old_price - new_price) < 0.001:
+                continue
+            self.previous[sym]['price'] = new_price
+            # Use IBKR prev_close if available for accurate pct
+            prev_close = self.previous[sym].get('prev_close', 0)
+            if prev_close > 0:
+                self.previous[sym]['pct'] = round(
+                    (new_price - prev_close) / prev_close * 100, 1)
+            else:
+                self.previous[sym]['pct'] = d['pct']
+            updated = True
+        if updated:
+            self._refresh_enrichment_fibs(self.previous)
+            merged = self._merge_stocks(self.previous)
+            if self.on_stocks and merged:
+                self.on_stocks(merged)
+
     def run(self):
         # Ensure asyncio event loop exists in this thread (ib_insync needs one)
         try:
@@ -2895,7 +2930,12 @@ class ScannerThread(threading.Thread):
                     break
                 self._process_lookup_queue()
                 _check_news_updates(self.previous, suppress_send=self._warmup)
-                time_mod.sleep(1)
+                # Quick OCR price refresh (~1s per read)
+                t0 = time_mod.time()
+                self._quick_ocr_price_update()
+                elapsed = time_mod.time() - t0
+                if elapsed < 1:
+                    time_mod.sleep(1 - elapsed)
 
     def _process_lookup_queue(self):
         """Process pending Telegram stock lookup requests."""
@@ -3443,7 +3483,7 @@ class ScannerThread(threading.Thread):
                     continue
                 price = d.get('price', 0)
                 pct = d.get('pct', 0)
-                prev_d = previous.get(sym, {}) if previous else {}
+                prev_d = self.previous.get(sym, {}) if self.previous else {}
 
                 # HOD break
                 hod_msg = check_hod_break(sym, d, prev_d)
@@ -3813,17 +3853,19 @@ class App:
         # News indicator
         news_text = "N" if (enrich and enrich.get('news')) else ""
 
-        # Fib text
+        # Fib text — nearest 3 below + 5 above, smart rounding
         fib_text = ""
         if enrich and (enrich.get('fib_above') or enrich.get('fib_below')):
+            def _fp(p):
+                return f"${p:.2f}" if p >= 1 else f"${p:.3f}" if p >= 0.1 else f"${p:.4f}"
             parts = []
-            above = enrich.get('fib_above', [])
-            below = enrich.get('fib_below', [])
-            if above:
-                parts.append("⬆" + " ".join(f"${p:.3f}" for p in above))
+            below = enrich.get('fib_below', [])[-3:]   # 3 nearest below
+            above = enrich.get('fib_above', [])[:5]     # 5 nearest above
             if below:
-                parts.append("⬇" + " ".join(f"${p:.3f}" for p in below))
-            fib_text = "  📐 " + "  |  ".join(parts)
+                parts.append("⬇" + " ".join(_fp(p) for p in below))
+            if above:
+                parts.append("⬆" + " ".join(_fp(p) for p in above))
+            fib_text = "  📐 " + "  |  ".join(parts) if parts else ""
 
         return {
             'bg': bg, 'sym_text': sym_text, 'sym_fg': sym_fg,
