@@ -4682,7 +4682,6 @@ class App:
                 'thresh': self.thresh.get(),
                 'price_min': self.price_min.get(),
                 'price_max': self.price_max.get(),
-                'window_size': self.size_var.get(),
             }, f)
 
     def _load(self):
@@ -4695,10 +4694,6 @@ class App:
             self.thresh.set(s.get('thresh', MONITOR_DEFAULT_ALERT_PCT))
             self.price_min.set(s.get('price_min', MONITOR_PRICE_MIN))
             self.price_max.set(s.get('price_max', MONITOR_PRICE_MAX))
-            saved_size = s.get('window_size', '')
-            if saved_size and saved_size in self._size_presets:
-                self.size_var.set(saved_size)
-                self.root.geometry(self._size_presets[saved_size])
         except Exception:
             pass
 
