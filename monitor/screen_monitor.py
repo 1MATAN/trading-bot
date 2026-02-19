@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 import subprocess
+import webbrowser
 import io
 import requests
 from PIL import Image, ImageFilter, ImageOps, ImageTk
@@ -3839,7 +3840,7 @@ class App:
     def _build_stock_row(self, sym: str, rd: dict) -> dict:
         """Create widget row for a stock and return widget refs."""
         _click = lambda e, s=sym: self._select_stock(s)
-        _dbl_click = lambda e, s=sym: self._open_chart_window(s)
+        _dbl_click = lambda e, s=sym: self._open_tradingview(s)
 
         row1 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row1.pack(fill='x', pady=0)
@@ -4120,6 +4121,11 @@ class App:
             panel, textvariable=self._order_status_var,
             font=("Courier", 10), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(fill='x', pady=1)
+
+    def _open_tradingview(self, sym: str):
+        """Open TradingView chart in browser for the given symbol."""
+        url = f"https://www.tradingview.com/chart/?symbol={sym}"
+        webbrowser.open(url)
 
     def _open_chart_window(self, sym: str):
         """Open a Toplevel window with 2x2 web-fetched chart grid.
