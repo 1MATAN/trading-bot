@@ -3319,15 +3319,19 @@ class ScannerThread(threading.Thread):
             else:
                 status += "  ✓"
 
-        # ── Batch alerts: milestone + volume + 52w ──
+        # ── Collect ALL alerts for this cycle into one batch ──
         batch_alerts: list[str] = []
+        batch_syms: list[str] = []  # unique symbols for keyboard buttons
 
+        # Milestone + Volume + 52W
         for sym, d in current.items():
             ms_msg = check_milestone(sym, d['pct'], d['price'])
             if ms_msg:
                 spike, ratio = _check_1min_volume_spike(sym)
                 if spike:
                     batch_alerts.append(ms_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
                     status += f"  📈{sym}"
                 else:
                     log.info(f"Milestone {sym} skipped: 1min vol ratio {ratio}x < {MILESTONE_VOL_RATIO}x")
@@ -3336,23 +3340,19 @@ class ScannerThread(threading.Thread):
                 vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
                 if vol_msg:
                     batch_alerts.append(vol_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
                     status += f"  🔥{sym}"
 
             if sym in _enrichment:
                 w52_msg = check_52w_breakout(sym, d['price'], _enrichment[sym])
                 if w52_msg:
                     batch_alerts.append(w52_msg)
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
                     status += f"  👑{sym}"
 
-        if batch_alerts:
-            if len(batch_alerts) == 1:
-                send_telegram(batch_alerts[0])
-            else:
-                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
-                header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
-                send_telegram(header + "\n\n".join(batch_alerts))
-
-        # ── Real-time alerts (5 types, score-filtered + multi-signal) ──
+        # Real-time alerts (5 types, score-filtered + multi-signal)
         if not is_baseline and current:
             # Update daily volume peaks for all stocks in this cycle
             for sym, d in current.items():
@@ -3371,12 +3371,9 @@ class ScannerThread(threading.Thread):
                 pct = d.get('pct', 0)
                 score, reasons = _calc_alert_score(sym, d)
 
-                # Collect signals for this stock this cycle
                 signals: list[str] = []
 
-                btn = _make_lookup_button(sym)
-
-                # Build badges: volume rank + repeat alerts
+                # Build badges
                 badges = []
                 if sym in vol_top3:
                     rank = [s for s, _ in sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)[:3]].index(sym) + 1
@@ -3392,7 +3389,6 @@ class ScannerThread(threading.Thread):
                 if prev_alerts >= 2:
                     badges.append(f"🔄 ×{prev_alerts} התראות היום")
 
-                # Build score line with reasons + badges
                 reason_str = f" ({', '.join(reasons)})" if reasons else ""
                 score_line = f"\n🏆 ניקוד: {score}/100{reason_str}"
                 if badges:
@@ -3405,7 +3401,9 @@ class ScannerThread(threading.Thread):
                         signals.append("HOD")
                         if score >= ALERT_MIN_SCORE:
                             _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                            send_telegram(hod_msg + score_line, reply_markup=btn)
+                            batch_alerts.append(hod_msg + score_line)
+                            if sym not in batch_syms:
+                                batch_syms.append(sym)
                         else:
                             log.info(f"Alert filtered {sym} HOD: score {score} < {ALERT_MIN_SCORE}")
                 # 2. Fib 2nd touch
@@ -3414,7 +3412,9 @@ class ScannerThread(threading.Thread):
                     signals.append("FIB×2")
                     if score >= ALERT_MIN_SCORE:
                         _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        send_telegram(fib2_msg + score_line, reply_markup=btn)
+                        batch_alerts.append(fib2_msg + score_line)
+                        if sym not in batch_syms:
+                            batch_syms.append(sym)
                     else:
                         log.info(f"Alert filtered {sym} FIB×2: score {score} < {ALERT_MIN_SCORE}")
                 # 3. LOD 2nd touch
@@ -3423,7 +3423,9 @@ class ScannerThread(threading.Thread):
                     signals.append("LOD×2")
                     if score >= ALERT_MIN_SCORE:
                         _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        send_telegram(lod_msg + score_line, reply_markup=btn)
+                        batch_alerts.append(lod_msg + score_line)
+                        if sym not in batch_syms:
+                            batch_syms.append(sym)
                     else:
                         log.info(f"Alert filtered {sym} LOD×2: score {score} < {ALERT_MIN_SCORE}")
                 # 4. VWAP cross
@@ -3432,7 +3434,9 @@ class ScannerThread(threading.Thread):
                     signals.append("VWAP")
                     if score >= ALERT_MIN_SCORE:
                         _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        send_telegram(vwap_msg + score_line, reply_markup=btn)
+                        batch_alerts.append(vwap_msg + score_line)
+                        if sym not in batch_syms:
+                            batch_syms.append(sym)
                     else:
                         log.info(f"Alert filtered {sym} VWAP: score {score} < {ALERT_MIN_SCORE}")
                 # 5. 1-min spike
@@ -3441,27 +3445,48 @@ class ScannerThread(threading.Thread):
                     signals.append("SPIKE")
                     if score >= ALERT_MIN_SCORE:
                         _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        send_telegram(spike_msg + score_line, reply_markup=btn)
+                        batch_alerts.append(spike_msg + score_line)
+                        if sym not in batch_syms:
+                            batch_syms.append(sym)
                     else:
                         log.info(f"Alert filtered {sym} SPIKE: score {score} < {ALERT_MIN_SCORE}")
 
-                # ── Multi-signal alert ──
+                # Multi-signal (added to batch, not sent separately)
                 if len(signals) >= MULTI_SIGNAL_MIN and sym not in _multi_signal_alerted:
                     _multi_signal_alerted.add(sym)
                     enrich = _enrichment.get(sym, {})
                     flt = enrich.get('float', '-')
                     short = enrich.get('short', '-')
                     badge_line = ("\n" + " | ".join(badges)) if badges else ""
-                    send_telegram(
+                    batch_alerts.append(
                         f"🔥🔥🔥 <b>MULTI-SIGNAL — {sym}</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"⚡ {len(signals)} סיגנלים: {' + '.join(signals)}\n"
                         f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                         f"📊 Float: {flt} | Short: {short} | RVOL: {d.get('rvol', 0)}x\n"
                         f"🏆 ניקוד: {score}/100 ({', '.join(reasons)})"
-                        f"{badge_line}",
-                        reply_markup=btn,
+                        f"{badge_line}"
                     )
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
+
+        # ── Send all alerts as one message ──
+        if batch_alerts:
+            # Build keyboard with buttons for all symbols
+            keyboard_rows = []
+            for s in batch_syms:
+                keyboard_rows.append([
+                    {'text': f'📊 {s}', 'callback_data': f'lookup:{s}'},
+                    {'text': f'📈 TradingView', 'url': f'https://www.tradingview.com/chart/?symbol={s}'},
+                ])
+            btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
+
+            if len(batch_alerts) == 1:
+                send_telegram(batch_alerts[0], reply_markup=btn)
+            else:
+                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
+                header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
+                send_telegram(header + "\n\n".join(batch_alerts), reply_markup=btn)
 
         # ── Fetch account data before FIB DT (needs buying power) ──
         self._fetch_account_data()
