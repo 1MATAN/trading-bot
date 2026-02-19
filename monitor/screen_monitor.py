@@ -492,6 +492,98 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
         return []
 
 
+# ══════════════════════════════════════════════════════════
+#  Periodic News Alerts (every 5.5 min)
+# ══════════════════════════════════════════════════════════
+
+NEWS_CHECK_INTERVAL = 330  # 5.5 minutes in seconds
+NEWS_MIN_PCT = 20.0        # only check stocks ≥ +20%
+
+# {symbol: set of headline strings already sent}
+_news_sent: dict[str, set[str]] = {}
+_news_last_check: float = 0.0
+
+
+def _check_news_updates(current_stocks: dict):
+    """Check for new IBKR news headlines on stocks ≥ +20%.
+
+    Only runs during pre_market, market, and after_hours.
+    Sends Telegram alert for each new headline found.
+    """
+    global _news_last_check
+
+    now = time_mod.time()
+    if now - _news_last_check < NEWS_CHECK_INTERVAL:
+        return
+    _news_last_check = now
+
+    session = _get_market_session()
+    if session == 'closed':
+        return
+
+    # Filter stocks ≥ 20%
+    candidates = {sym: d for sym, d in current_stocks.items()
+                  if d.get('pct', 0) >= NEWS_MIN_PCT}
+    if not candidates:
+        return
+
+    log.info(f"News check: {len(candidates)} stocks ≥ +{NEWS_MIN_PCT:.0f}%")
+
+    for sym, d in candidates.items():
+        if sym not in _news_sent:
+            _news_sent[sym] = set()
+
+        try:
+            headlines = _fetch_ibkr_news(sym, max_news=5)
+        except Exception as e:
+            log.debug(f"News check {sym}: {e}")
+            continue
+
+        new_headlines = []
+        for h in headlines:
+            title = h['title_en']
+            if title not in _news_sent[sym]:
+                _news_sent[sym].add(title)
+                new_headlines.append(h)
+
+        if not new_headlines:
+            continue
+
+        # Translate new headlines
+        titles_en = [h['title_en'] for h in new_headlines]
+        try:
+            combined = "\n||||\n".join(titles_en)
+            translated = _translator.translate(combined)
+            titles_he = translated.split("\n||||\n")
+        except Exception:
+            titles_he = titles_en
+
+        price = d.get('price', 0)
+        pct = d.get('pct', 0)
+        enrich = _enrichment.get(sym, {})
+        flt = enrich.get('float', '-')
+
+        lines = [
+            f"📰 <b>חדשות — {sym}</b>  ${price:.2f}  {pct:+.1f}%  Float:{flt}",
+            f"━━━━━━━━━━━━━━━━━━",
+        ]
+        for i, h in enumerate(new_headlines):
+            title_he = titles_he[i].strip() if i < len(titles_he) else h['title_en']
+            src = h.get('source', '')
+            src_tag = f" [{src}]" if src else ""
+            lines.append(f"  • {title_he}  <i>({h['date']}{src_tag})</i>")
+
+        btn = _make_lookup_button(sym)
+        send_telegram("\n".join(lines), reply_markup=btn)
+        log.info(f"News alert: {sym} — {len(new_headlines)} new headlines")
+
+    # Clean up symbols that dropped below threshold
+    active_syms = set(candidates.keys())
+    for sym in list(_news_sent.keys()):
+        if sym not in current_stocks:
+            del _news_sent[sym]
+
+
 def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
     """Fetch fundamentals + news from Finviz."""
     result = {'fundamentals': {}, 'news': []}
@@ -1521,14 +1613,14 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                        current_price: float,
                        ratio_map: dict | None = None,
                        ma_frames: dict | None = None) -> Path | None:
-    """Generate a 5-min candlestick chart with Fibonacci levels + MA overlays.
+    """Generate a daily candlestick chart with Fibonacci levels, gaps + MA overlays.
 
-    Two compact MA tables overlaid on chart: SMA top-left, EMA bottom-left.
+    Y-axis spans 250% of current price for full picture.
 
     Returns path to saved PNG or None on failure.
     """
     try:
-        # Crop to last ~120 bars — chart will extend right so last candle is centered
+        # Crop to last ~120 bars
         df = df.tail(120).copy()
         if len(df) < 5:
             return None
@@ -1555,24 +1647,11 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
             ax.bar(i, body_height, bottom=body_bottom, width=width,
                    color=color, edgecolor=color, linewidth=0.5)
 
-        # Filter fib levels — show at least 3 above and 3 below current price
-        price_min = df['low'].min()
-        price_max = df['high'].max()
-        margin = (price_max - price_min) * 0.15
+        # Y range: 250% of current price (centered around price)
+        vis_max = current_price * 2.5
+        vis_min = max(0, current_price * 0.01)  # near zero but not negative
 
-        # Find 3 fib levels below and 6 above current price
-        levels_below = sorted([lv for lv in all_levels if lv <= current_price])
-        levels_above = sorted([lv for lv in all_levels if lv > current_price])
-        target_below = levels_below[-3:] if len(levels_below) >= 3 else levels_below
-        target_above = levels_above[:6] if len(levels_above) >= 6 else levels_above
-
-        # Expand Y range to include these fib levels
-        vis_min = price_min - margin
-        vis_max = price_max + margin
-        if target_below:
-            vis_min = min(vis_min, min(target_below) - margin * 0.5)
-        if target_above:
-            vis_max = max(vis_max, max(target_above) + margin * 0.5)
+        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
@@ -1613,6 +1692,45 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                         fontsize=7, va='center', ha='left', fontweight='bold')
                 last_y_right = lv
 
+        # ── Unfilled gap detection on chart (≥ $0.05) ──
+        # A gap is "filled" when subsequent price action returns to the pre-gap close.
+        # Gap up filled when any later bar's low ≤ prev_close (bottom of gap).
+        # Gap down filled when any later bar's high ≥ prev_close (top of gap).
+        open_gaps: list[dict] = []
+        for i in range(1, n_bars):
+            prev_close_val = df.iloc[i - 1]['close']
+            cur_open = df.iloc[i]['open']
+            gap_abs = cur_open - prev_close_val
+            if abs(gap_abs) >= 0.05:
+                # Check if any subsequent bar filled this gap
+                filled = False
+                for j in range(i, n_bars):
+                    if gap_abs > 0 and df.iloc[j]['low'] <= prev_close_val:
+                        filled = True
+                        break
+                    elif gap_abs < 0 and df.iloc[j]['high'] >= prev_close_val:
+                        filled = True
+                        break
+                if not filled:
+                    gap_pct = abs(gap_abs) / prev_close_val * 100 if prev_close_val > 0 else 0
+                    open_gaps.append({
+                        'idx': i, 'bottom': min(prev_close_val, cur_open),
+                        'top': max(prev_close_val, cur_open),
+                        'pct': gap_pct, 'up': gap_abs > 0,
+                    })
+
+        for g in open_gaps:
+            color = '#26a69a' if g['up'] else '#ef5350'
+            direction = '+' if g['up'] else '-'
+            # Shade from gap bar to right edge (gap still open)
+            ax.axhspan(g['bottom'], g['top'],
+                       xmin=g['idx'] / (n_bars + right_padding), xmax=1.0,
+                       color=color, alpha=0.12)
+            ax.annotate(f'OPEN GAP {direction}{g["pct"]:.0f}%',
+                        xy=(g['idx'], g['top'] if g['up'] else g['bottom']),
+                        fontsize=5, color=color, ha='center',
+                        va='bottom' if g['up'] else 'top', fontweight='bold')
+
         # Current price line
         ax.axhline(y=current_price, color='white', linewidth=1.2,
                     linestyle='--', alpha=0.9)
@@ -1644,7 +1762,7 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         ax.spines['bottom'].set_color('#333')
         ax.spines['left'].set_color('#333')
         ax.yaxis.label.set_color('#888')
-        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
+        ax.set_title(f'{sym} — Daily + Fibonacci (${current_price:.2f})',
                      color='white', fontsize=14, fontweight='bold', pad=12)
         ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
 
@@ -1748,6 +1866,36 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         vwap_label = "מעל" if above else "מתחת"
         lines.append(f"{vwap_icon} VWAP: ${vwap:.2f} — מחיר {vwap_label} ל-VWAP")
 
+    # Unfilled gap detection from daily data (threshold: $0.05)
+    df_daily = ma_frames.get('D')
+    if df_daily is not None and len(df_daily) >= 2 and price > 0:
+        n_d = len(df_daily)
+        unfilled_gaps = []
+        for i in range(1, n_d):
+            pc = df_daily.iloc[i - 1]['close']
+            co = df_daily.iloc[i]['open']
+            g_abs = co - pc
+            if abs(g_abs) < 0.05 or pc <= 0:
+                continue
+            # Check if any subsequent bar filled this gap
+            filled = False
+            for j in range(i, n_d):
+                if g_abs > 0 and df_daily.iloc[j]['low'] <= pc:
+                    filled = True
+                    break
+                elif g_abs < 0 and df_daily.iloc[j]['high'] >= pc:
+                    filled = True
+                    break
+            if not filled:
+                g_pct = g_abs / pc * 100
+                unfilled_gaps.append((g_abs, g_pct, co, pc))
+        if unfilled_gaps:
+            lines.append(f"🕳️ גאפים פתוחים ({len(unfilled_gaps)}):")
+            for g_abs, g_pct, co, pc in unfilled_gaps[-3:]:  # show last 3
+                bottom, top = (pc, co) if g_abs > 0 else (co, pc)
+                icon = "⬆️" if g_abs > 0 else "⬇️"
+                lines.append(f"  {icon} ${bottom:.2f}—${top:.2f} ({g_pct:+.1f}%)")
+
     # Resist line
     if resist_str:
         lines.append(f"📉 Resist: {resist_str}")
@@ -1777,9 +1925,9 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     if cached:
         all_levels = cached[2]
         ratio_map = cached[3]
-        df_5min = ma_frames.get('5m')
-        if df_5min is not None:
-            chart_path = generate_fib_chart(sym, df_5min, all_levels, price,
+        df_daily = ma_frames.get('D')
+        if df_daily is not None:
+            chart_path = generate_fib_chart(sym, df_daily, all_levels, price,
                                             ratio_map=ratio_map)
 
     return text, chart_path
@@ -1790,7 +1938,7 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     text, chart_path = _build_stock_report(sym, stock, enriched)
     send_telegram(text)
     if chart_path:
-        send_telegram_photo(chart_path, f"📐 {sym} — 5min + Fibonacci ${stock['price']:.2f}")
+        send_telegram_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -2447,6 +2595,7 @@ class ScannerThread(threading.Thread):
                     break
                 self._process_order_queue()
                 self._process_lookup_queue()
+                _check_news_updates(self.previous)
                 time_mod.sleep(1)
 
     def _process_order_queue(self):
@@ -2539,7 +2688,7 @@ class ScannerThread(threading.Thread):
             if chart_path:
                 send_telegram_photo_to(
                     chat_id, chart_path,
-                    f"📐 {sym} — 5min + Fibonacci ${price:.2f}",
+                    f"📐 {sym} — Daily + Fibonacci ${price:.2f}",
                     reply_to=message_id,
                 )
         except Exception as e:
