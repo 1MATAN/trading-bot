@@ -988,6 +988,98 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None):
 
 
 # ══════════════════════════════════════════════════════════
+#  Session Summaries (pre-market / market / after-hours)
+# ══════════════════════════════════════════════════════════
+
+_session_summary_sent: set[str] = set()  # e.g. "2026-02-19_pre_market"
+_session_stocks: dict[str, dict] = {}  # sym → {pct, price, volume_raw} per session
+
+_SESSION_WINDOWS = {
+    # session_name: (start_hour, start_min, end_hour, end_min, summary_label)
+    'pre_market':  (4, 0, 9, 30, '🌅 Pre-Market'),
+    'market':      (9, 30, 16, 0, '🏛️ Market'),
+    'after_hours': (16, 0, 20, 0, '🌙 After-Hours'),
+}
+
+
+def _track_session_stocks(current: dict):
+    """Track best stats per symbol for the current session."""
+    for sym, d in current.items():
+        pct = d.get('pct', 0)
+        price = d.get('price', 0)
+        vol = d.get('volume_raw', 0)
+        prev = _session_stocks.get(sym)
+        if prev is None or abs(pct) > abs(prev.get('pct', 0)):
+            _session_stocks[sym] = {'pct': pct, 'price': price, 'volume_raw': vol}
+        elif vol > prev.get('volume_raw', 0):
+            _session_stocks[sym]['volume_raw'] = vol
+
+
+def _check_session_summary():
+    """Send summary when a session ends. Checks if we just crossed a boundary."""
+    now_et = datetime.now(ZoneInfo('US/Eastern'))
+    if now_et.weekday() >= 5:
+        return
+    today_str = now_et.strftime('%Y-%m-%d')
+    t = now_et.time()
+
+    for sess_name, (sh, sm, eh, em, label) in _SESSION_WINDOWS.items():
+        key = f"{today_str}_{sess_name}"
+        if key in _session_summary_sent:
+            continue
+        end_t = time(eh, em)
+        # Send summary 1-5 min after session end
+        window_start = time(eh, em)
+        window_end = time(eh, min(em + 5, 59))
+        if not (window_start <= t <= window_end):
+            continue
+        if not _session_stocks:
+            continue
+
+        _session_summary_sent.add(key)
+
+        # Top 5 by percentage
+        by_pct = sorted(_session_stocks.items(),
+                        key=lambda x: abs(x[1]['pct']), reverse=True)[:5]
+        # Top 5 by volume
+        by_vol = sorted(_session_stocks.items(),
+                        key=lambda x: x[1].get('volume_raw', 0), reverse=True)[:5]
+
+        lines = [
+            f"📋 <b>סיכום {label}</b>",
+            f"━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if by_pct:
+            lines.append("")
+            lines.append("🏆 <b>אחוזים:</b>")
+            for i, (sym, info) in enumerate(by_pct, 1):
+                arrow = "🟢" if info['pct'] > 0 else "🔴"
+                vol = info.get('volume_raw', 0)
+                vol_str = _format_volume(vol) if vol else '-'
+                lines.append(
+                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}"
+                )
+
+        if by_vol:
+            lines.append("")
+            lines.append("📊 <b>ווליום:</b>")
+            for i, (sym, info) in enumerate(by_vol, 1):
+                vol = info.get('volume_raw', 0)
+                vol_str = _format_volume(vol) if vol else '-'
+                lines.append(
+                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}"
+                )
+
+        lines.append(f"\n📈 סה\"כ מניות בסקאנר: {len(_session_stocks)}")
+        send_telegram("\n".join(lines))
+        log.info(f"Session summary sent: {sess_name}")
+
+        # Reset for next session
+        _session_stocks.clear()
+
+
+# ══════════════════════════════════════════════════════════
 #  Volume Anomaly Detection
 # ══════════════════════════════════════════════════════════
 
@@ -1321,7 +1413,7 @@ def _calc_alert_score(sym: str, d: dict) -> tuple[int, list[str]]:
     # ── Near fib level (0-5 pts) ──
     cached = _fib_cache.get(sym)
     if cached and price > 0:
-        _, _, all_levels, _ = cached
+        _, _, all_levels, *_ = cached
         threshold = price * 0.008
         for lv in all_levels:
             if abs(price - lv) <= threshold:
@@ -1355,6 +1447,8 @@ def _reset_alerts_if_new_day():
         _multi_signal_alerted.clear()
         _daily_alert_count.clear()
         _daily_volume_peak.clear()
+        _session_summary_sent.clear()
+        _session_stocks.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -3500,9 +3594,11 @@ class ScannerThread(threading.Thread):
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)
 
-        # ── Daily stats tracking + end-of-day summary ──
+        # ── Daily stats + session tracking + summaries ──
         new_count = len(set(current) - set(self.previous)) if self.previous else 0
         _track_daily_stats(current, new_count=new_count)
+        _track_session_stocks(current)
+        _check_session_summary()
         _check_daily_summary(positions=self._cached_positions)
 
         # ── Final GUI update with all enrichment ──
@@ -4172,7 +4268,7 @@ class App:
                                    parent=self.root)
             return
 
-        _anchor_low, _anchor_high, all_levels, _ratio_map = cached
+        _anchor_low, _anchor_high, all_levels, _ratio_map, *_ = cached
         if not all_levels:
             messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.",
                                    parent=self.root)
