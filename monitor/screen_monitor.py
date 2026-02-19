@@ -259,6 +259,7 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
                 contract, endDateTime='',
                 durationStr='21600 S', barSizeSetting='1 min',
                 whatToShow='MIDPOINT', useRTH=False,
+                timeout=15,
             )
             if mid_bars:
                 price = mid_bars[-1].close
@@ -275,6 +276,7 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
                 contract, endDateTime='',
                 durationStr='14400 S', barSizeSetting='1 min',
                 whatToShow='MIDPOINT', useRTH=False,
+                timeout=15,
             )
             if mid_bars:
                 price = mid_bars[-1].close
@@ -372,6 +374,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 barSizeSetting="1 day",
                 whatToShow="TRADES",
                 useRTH=True,
+                timeout=15,
             )
             if not bars:
                 continue
@@ -777,6 +780,7 @@ def _check_1min_volume_spike(sym: str) -> tuple[bool, float]:
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr='300 S',
             barSizeSetting='1 min', whatToShow='TRADES', useRTH=False,
+            timeout=15,
         )
         if bars and len(bars) >= 2:
             prev_vol = bars[-2].volume
@@ -2449,6 +2453,7 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr='5 Y',
             barSizeSetting='1 day', whatToShow='TRADES', useRTH=False,
+            timeout=15,
         )
         if bars:
             df = ib_util.df(bars)
@@ -2488,6 +2493,7 @@ def _download_intraday(symbol: str, bar_size: str = '5 mins',
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr=duration,
             barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False,
+            timeout=15,
         )
         if bars:
             df = ib_util.df(bars)
@@ -3084,6 +3090,7 @@ class ScannerThread(threading.Thread):
             bars = ib.reqHistoricalData(
                 contract, endDateTime='', durationStr='2 D',
                 barSizeSetting='1 day', whatToShow='TRADES', useRTH=True,
+                timeout=15,
             )
             if not bars:
                 send_telegram_to(chat_id, f"❌ <b>{sym}</b> — לא נמצאו נתונים", reply_to=message_id)
