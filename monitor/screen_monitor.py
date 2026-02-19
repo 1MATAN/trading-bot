@@ -91,40 +91,84 @@ log = logging.getLogger("monitor")
 # ══════════════════════════════════════════════════════════
 
 _ibkr: IB | None = None
+_ibkr_last_attempt: float = 0.0      # time.time() of last failed connect
+_ibkr_fail_count: int = 0            # consecutive failures (for backoff)
+_IBKR_BACKOFF_BASE = 5               # initial backoff seconds
+_IBKR_BACKOFF_MAX = 120              # max backoff seconds
+_IBKR_MAX_RETRIES = 3                # retries per _get_ibkr call
 
 
 def _get_ibkr() -> IB | None:
-    """Get/create a dedicated IBKR connection for the monitor."""
-    global _ibkr
+    """Get/create a dedicated IBKR connection for the monitor.
+
+    Retries up to _IBKR_MAX_RETRIES times with exponential backoff.
+    Respects a cooldown between connect attempts to avoid hammering TWS.
+    """
+    global _ibkr, _ibkr_last_attempt, _ibkr_fail_count
     if _ibkr and _ibkr.isConnected():
         return _ibkr
+
+    # Respect backoff cooldown from previous failures
+    if _ibkr_fail_count > 0:
+        backoff = min(_IBKR_BACKOFF_BASE * (2 ** (_ibkr_fail_count - 1)), _IBKR_BACKOFF_MAX)
+        elapsed = time_mod.time() - _ibkr_last_attempt
+        if elapsed < backoff:
+            return None
+
+    # Ensure an asyncio event loop exists in this thread
     try:
-        # Ensure an asyncio event loop exists in this thread
-        # (ib_insync needs one; non-main threads don't get one by default)
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # Disconnect stale instance if any
+    if _ibkr:
         try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-        _ibkr = IB()
-        _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
-        log.info("IBKR connection established (monitor)")
-        accts = _ibkr.managedAccounts() or []
-        acct = accts[0] if accts else "?"
-        ok = send_telegram(
-            f"✅ <b>Monitor Online</b>\n"
-            f"  IBKR: מחובר ✓  |  Account: {acct}\n"
-            f"  Telegram: מחובר ✓\n"
+            _ibkr.disconnect()
+        except Exception:
+            pass
+        _ibkr = None
+
+    for attempt in range(1, _IBKR_MAX_RETRIES + 1):
+        try:
+            _ibkr = IB()
+            _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=10)
+            log.info("IBKR connection established (monitor)")
+            _ibkr_fail_count = 0
+            accts = _ibkr.managedAccounts() or []
+            acct = accts[0] if accts else "?"
+            reconnect_note = " (reconnected)" if _ibkr_last_attempt > 0 else ""
+            ok = send_telegram(
+                f"✅ <b>Monitor Online{reconnect_note}</b>\n"
+                f"  IBKR: מחובר ✓  |  Account: {acct}\n"
+                f"  Telegram: מחובר ✓\n"
+                f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            if ok:
+                log.info("Startup notification sent to Telegram")
+            else:
+                log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
+            return _ibkr
+        except Exception as e:
+            log.warning(f"IBKR connect attempt {attempt}/{_IBKR_MAX_RETRIES} failed: {e}")
+            _ibkr = None
+            if attempt < _IBKR_MAX_RETRIES:
+                time_mod.sleep(min(2 * attempt, 6))
+
+    # All retries exhausted
+    _ibkr_fail_count += 1
+    _ibkr_last_attempt = time_mod.time()
+    backoff = min(_IBKR_BACKOFF_BASE * (2 ** (_ibkr_fail_count - 1)), _IBKR_BACKOFF_MAX)
+    log.warning(f"IBKR connect failed after {_IBKR_MAX_RETRIES} retries, "
+                f"next attempt in {backoff:.0f}s (fail #{_ibkr_fail_count})")
+    if _ibkr_fail_count == 1:
+        send_telegram(
+            f"⚠️ <b>IBKR מנותק!</b>\n"
+            f"  {_IBKR_MAX_RETRIES} ניסיונות חיבור נכשלו\n"
+            f"  ניסיון הבא עוד {backoff:.0f} שניות\n"
             f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        if ok:
-            log.info("Startup notification sent to Telegram")
-        else:
-            log.warning("Telegram send failed — check BOT_TOKEN / CHAT_ID")
-        return _ibkr
-    except Exception as e:
-        log.warning(f"IBKR connect failed: {e}")
-        _ibkr = None
-        return None
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -148,6 +192,67 @@ def _get_market_session() -> str:
     elif time(16, 0) <= t < time(20, 0):
         return 'after_hours'
     return 'closed'
+
+
+def _fetch_extended_hours_price(ib: IB, contract, session: str,
+                                bars: list) -> tuple[float, float, float | None, float | None, float | None]:
+    """Fetch price, prev_close, and extended-hours high/low/vwap.
+
+    Returns (price, prev_close, ext_high, ext_low, ext_vwap).
+    ext_* are None when no extended-hours data is available.
+    """
+    last_bar = bars[-1]
+    price = last_bar.close
+    ext_high = None
+    ext_low = None
+    ext_vwap = None
+
+    if session == 'pre_market':
+        # Pre-market: last RTH bar is yesterday → it IS prev_close
+        prev_close = last_bar.close
+        try:
+            mid_bars = ib.reqHistoricalData(
+                contract, endDateTime='',
+                durationStr='21600 S', barSizeSetting='1 min',
+                whatToShow='MIDPOINT', useRTH=False,
+            )
+            if mid_bars:
+                price = mid_bars[-1].close
+                ext_high = max(b.high for b in mid_bars)
+                ext_low = min(b.low for b in mid_bars)
+                ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
+        except Exception:
+            pass
+    elif session == 'after_hours':
+        # After-hours: last RTH bar is today → prev_close is yesterday
+        prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+        try:
+            mid_bars = ib.reqHistoricalData(
+                contract, endDateTime='',
+                durationStr='14400 S', barSizeSetting='1 min',
+                whatToShow='MIDPOINT', useRTH=False,
+            )
+            if mid_bars:
+                price = mid_bars[-1].close
+                ext_high = max(b.high for b in mid_bars)
+                ext_low = min(b.low for b in mid_bars)
+                ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
+        except Exception:
+            pass
+    else:
+        # Market hours (or closed): normal calculation
+        prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+
+    return price, prev_close, ext_high, ext_low, ext_vwap
+
+
+def _format_volume(volume: float) -> str:
+    """Format volume as human-readable string (e.g. 2.3M, 890K)."""
+    if volume >= 1_000_000:
+        return f"{volume / 1_000_000:.1f}M"
+    elif volume >= 1_000:
+        return f"{volume / 1_000:.0f}K"
+    return str(int(volume))
 
 
 # ══════════════════════════════════════════════════════════
@@ -215,62 +320,11 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 continue
 
             last_bar = bars[-1]
-            price = last_bar.close
             volume = last_bar.volume
-
             session = _get_market_session()
 
-            # Extended-hours running high/low/vwap from MIDPOINT bars
-            ext_high = None
-            ext_low = None
-            ext_vwap = None
-
-            if session == 'pre_market':
-                # Pre-market: last RTH bar is yesterday → it IS prev_close
-                prev_close = last_bar.close
-                # Get current price + running high/low/vwap from MIDPOINT
-                try:
-                    mid_bars = ib.reqHistoricalData(
-                        stock_contract, endDateTime='',
-                        durationStr='21600 S', barSizeSetting='1 min',
-                        whatToShow='MIDPOINT', useRTH=False,
-                    )
-                    if mid_bars:
-                        price = mid_bars[-1].close
-                        ext_high = max(b.high for b in mid_bars)
-                        ext_low = min(b.low for b in mid_bars)
-                        # Typical price average as VWAP proxy (no volume in MIDPOINT)
-                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
-                except Exception:
-                    pass  # fall back to last RTH close
-
-            elif session == 'after_hours':
-                # After-hours: last RTH bar is today → prev_close is yesterday
-                if len(bars) >= 2:
-                    prev_close = bars[-2].close
-                else:
-                    prev_close = 0.0
-                # Get current AH price + running high/low from MIDPOINT
-                try:
-                    mid_bars = ib.reqHistoricalData(
-                        stock_contract, endDateTime='',
-                        durationStr='14400 S', barSizeSetting='1 min',
-                        whatToShow='MIDPOINT', useRTH=False,
-                    )
-                    if mid_bars:
-                        price = mid_bars[-1].close
-                        ext_high = max(b.high for b in mid_bars)
-                        ext_low = min(b.low for b in mid_bars)
-                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
-                except Exception:
-                    pass  # fall back to RTH close
-
-            else:
-                # Market hours (or closed): normal calculation
-                if len(bars) >= 2:
-                    prev_close = bars[-2].close
-                else:
-                    prev_close = 0.0
+            price, prev_close, ext_high, ext_low, ext_vwap = \
+                _fetch_extended_hours_price(ib, stock_contract, session, bars)
 
             pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
@@ -286,15 +340,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 avg_vol = 0
 
             rvol = round(volume / avg_vol, 1) if avg_vol > 0 else 0.0
-
-            # Format volume (e.g. 2.3M, 890K)
-            if volume >= 1_000_000:
-                vol_str = f"{volume / 1_000_000:.1f}M"
-            elif volume >= 1_000:
-                vol_str = f"{volume / 1_000:.0f}K"
-            else:
-                vol_str = str(int(volume))
-
+            vol_str = _format_volume(volume)
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
             # Override with extended-hours values when available
@@ -648,6 +694,97 @@ def _check_market_reminders():
             _reminders_sent.add(key)
             send_telegram(f"⏰ <b>תזכורת:</b> {m} דקות לפתיחת המסחר!")
             log.info(f"Market reminder sent: {m} min to open")
+
+
+# ══════════════════════════════════════════════════════════
+#  Daily Summary (sent after market close)
+# ══════════════════════════════════════════════════════════
+
+_daily_summary_sent: str = ""  # "YYYY-MM-DD" of last summary sent
+_daily_top_movers: dict[str, dict] = {}  # sym → {peak_pct, peak_price}
+_daily_new_stocks: int = 0
+
+
+def _track_daily_stats(current: dict, new_count: int = 0):
+    """Accumulate daily statistics for the end-of-day summary."""
+    global _daily_new_stocks
+    _daily_new_stocks += new_count
+    for sym, d in current.items():
+        pct = d.get('pct', 0)
+        price = d.get('price', 0)
+        prev = _daily_top_movers.get(sym)
+        if prev is None or abs(pct) > abs(prev['peak_pct']):
+            _daily_top_movers[sym] = {'peak_pct': pct, 'peak_price': price}
+
+
+def _check_daily_summary(positions: dict[str, tuple] | None = None):
+    """Send end-of-day summary at ~16:05 ET. Only once per day."""
+    global _daily_summary_sent, _daily_new_stocks
+    now_et = datetime.now(ZoneInfo('US/Eastern'))
+    today_str = now_et.strftime('%Y-%m-%d')
+
+    if today_str == _daily_summary_sent:
+        return
+    if now_et.weekday() >= 5:
+        return
+    # Send between 16:03 and 16:10 ET
+    t = now_et.time()
+    if not (time(16, 3) <= t <= time(16, 10)):
+        return
+
+    _daily_summary_sent = today_str
+
+    # ── Top movers (top 5 by absolute pct) ──
+    sorted_movers = sorted(
+        _daily_top_movers.items(),
+        key=lambda x: abs(x[1]['peak_pct']),
+        reverse=True,
+    )[:5]
+
+    total_alerts = sum(_daily_alert_count.values())
+
+    lines = [
+        f"📊 <b>סיכום יומי — {today_str}</b>",
+        f"━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if sorted_movers:
+        lines.append("")
+        lines.append("🏆 <b>מובילים היום:</b>")
+        for i, (sym, info) in enumerate(sorted_movers, 1):
+            arrow = "🟢" if info['peak_pct'] > 0 else "🔴"
+            enrich = _enrichment.get(sym, {})
+            flt = enrich.get('float', '-')
+            lines.append(
+                f"  {i}. {arrow} <b>{sym}</b> {info['peak_pct']:+.1f}% "
+                f"(${info['peak_price']:.2f}) Float:{flt}"
+            )
+
+    lines.append("")
+    lines.append(f"📈 מניות חדשות בסקאנר: {_daily_new_stocks}")
+    lines.append(f"🔔 סה\"כ התראות: {total_alerts}")
+
+    # ── P&L if positions exist ──
+    if positions:
+        total_pnl = sum(pos[3] for pos in positions.values() if len(pos) >= 4)
+        lines.append("")
+        pnl_icon = "💚" if total_pnl >= 0 else "❤️"
+        lines.append(f"{pnl_icon} P&L פתוח: ${total_pnl:+,.2f}")
+        for sym, pos in sorted(positions.items()):
+            qty, avg = pos[0], pos[1]
+            pnl = pos[3] if len(pos) >= 4 else 0
+            icon = "🟢" if pnl >= 0 else "🔴"
+            lines.append(f"  {icon} {sym}: {qty}sh @ ${avg:.2f} → ${pnl:+,.2f}")
+
+    lines.append("")
+    lines.append("📡 המוניטור ממשיך לעבוד — after hours")
+
+    send_telegram("\n".join(lines))
+    log.info("Daily summary sent")
+
+    # Reset daily stats for next day
+    _daily_top_movers.clear()
+    _daily_new_stocks = 0
 
 
 # ══════════════════════════════════════════════════════════
@@ -1182,15 +1319,21 @@ def check_1min_spike(sym: str, price: float, pct: float) -> str | None:
 
 # {symbol: {float, short, eps, income, earnings, cash, fib_below, fib_above, news}}
 _enrichment: dict[str, dict] = {}
+_enrichment_ts: dict[str, float] = {}   # symbol → time.time() when enriched
+ENRICHMENT_TTL_SECS = 30 * 60           # 30 minutes
 
 
-def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
-    """Fetch Finviz fundamentals + Fib levels for a stock. Cached.
+def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -> dict:
+    """Fetch Finviz fundamentals + Fib levels for a stock. Cached with TTL.
 
     Returns enrichment dict and sends Telegram alert with full report.
+    ``force=True`` bypasses cache (used by explicit lookups).
     """
-    if sym in _enrichment:
-        return _enrichment[sym]
+    if not force and sym in _enrichment:
+        age = time_mod.time() - _enrichment_ts.get(sym, 0)
+        if age < ENRICHMENT_TTL_SECS:
+            return _enrichment[sym]
+        log.info(f"Enrichment expired for {sym} ({age/60:.0f}m old), refreshing")
 
     data = {
         'float': '-', 'short': '-', 'eps': '-',
@@ -1284,6 +1427,7 @@ def _enrich_stock(sym: str, price: float, on_status=None) -> dict:
             log.error(f"Fib {sym}: {e}")
 
     _enrichment[sym] = data
+    _enrichment_ts[sym] = time_mod.time()
     log.info(f"Enriched {sym}: float={data['float']} short={data['short']} fib={len(data['fib_below'])}↓{len(data['fib_above'])}↑")
     return data
 
@@ -2264,6 +2408,7 @@ class ScannerThread(threading.Thread):
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
         self._cached_net_liq: float = 0.0
+        self._cached_positions: dict[str, tuple] = {}  # sym → (qty, avg, mkt, pnl)
         # Track FIB DT open positions for order fill monitoring
         self._fib_dt_positions: dict[str, dict] = {}  # symbol -> entry_info
         # ── Telegram stock lookup ──
@@ -2357,63 +2502,16 @@ class ScannerThread(threading.Thread):
                 return
 
             last_bar = bars[-1]
-            price = last_bar.close
             volume = last_bar.volume
-            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
-
             session = _get_market_session()
-            ext_high = None
-            ext_low = None
-            ext_vwap = None
 
-            if session == 'pre_market':
-                prev_close = last_bar.close
-                try:
-                    mid_bars = ib.reqHistoricalData(
-                        contract, endDateTime='',
-                        durationStr='21600 S', barSizeSetting='1 min',
-                        whatToShow='MIDPOINT', useRTH=False,
-                    )
-                    if mid_bars:
-                        price = mid_bars[-1].close
-                        ext_high = max(b.high for b in mid_bars)
-                        ext_low = min(b.low for b in mid_bars)
-                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
-                except Exception:
-                    pass
-            elif session == 'after_hours':
-                prev_close = bars[-2].close if len(bars) >= 2 else 0.0
-                try:
-                    mid_bars = ib.reqHistoricalData(
-                        contract, endDateTime='',
-                        durationStr='14400 S', barSizeSetting='1 min',
-                        whatToShow='MIDPOINT', useRTH=False,
-                    )
-                    if mid_bars:
-                        price = mid_bars[-1].close
-                        ext_high = max(b.high for b in mid_bars)
-                        ext_low = min(b.low for b in mid_bars)
-                        ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
-                except Exception:
-                    pass
-            else:
-                prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+            price, prev_close, ext_high, ext_low, ext_vwap = \
+                _fetch_extended_hours_price(ib, contract, session, bars)
 
             pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
-
-            if volume >= 1_000_000:
-                vol_str = f"{volume / 1_000_000:.1f}M"
-            elif volume >= 1_000:
-                vol_str = f"{volume / 1_000:.0f}K"
-            else:
-                vol_str = str(int(volume))
-
-            # Override with extended-hours values when available
-            rth_high = round(last_bar.high, 4)
-            rth_low = round(last_bar.low, 4)
-            if session == 'pre_market' and ext_high is not None:
-                vwap = round(ext_vwap, 4)
-            elif session == 'after_hours' and ext_high is not None:
+            vol_str = _format_volume(volume)
+            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
+            if ext_vwap is not None:
                 vwap = round(ext_vwap, 4)
 
             stock_data = {
@@ -2429,9 +2527,8 @@ class ScannerThread(threading.Thread):
             return
 
         # ── Enrich (Finviz + Fib) ──
-        # Clear enrichment cache to get fresh data on explicit lookup
-        _enrichment.pop(sym, None)
-        enriched = _enrich_stock(sym, price)
+        # Force refresh on explicit lookup
+        enriched = _enrich_stock(sym, price, force=True)
 
         # ── Build and send report ──
         try:
@@ -2562,7 +2659,7 @@ class ScannerThread(threading.Thread):
     def _fetch_account_data(self):
         """Fetch account values and positions from IBKR."""
         ib = _get_ibkr()
-        if not ib or not self.on_account:
+        if not ib:
             return
         try:
             acct_vals = ib.accountValues()
@@ -2591,7 +2688,9 @@ class ScannerThread(threading.Thread):
                     round(item.unrealizedPNL, 2),
                 )
 
-            self.on_account(net_liq, buying_power, positions)
+            self._cached_positions = positions
+            if self.on_account:
+                self.on_account(net_liq, buying_power, positions)
         except Exception as e:
             log.debug(f"Account fetch: {e}")
 
@@ -3119,6 +3218,11 @@ class ScannerThread(threading.Thread):
 
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)
+
+        # ── Daily stats tracking + end-of-day summary ──
+        new_count = len(set(current) - set(self.previous)) if self.previous else 0
+        _track_daily_stats(current, new_count=new_count)
+        _check_daily_summary(positions=self._cached_positions)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
