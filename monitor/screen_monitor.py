@@ -24,6 +24,7 @@ import logging
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import time as time_mod
 import tkinter as tk
@@ -43,7 +44,7 @@ from dotenv import load_dotenv
 import subprocess
 import io
 import requests
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps, ImageTk
 import pytesseract
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
@@ -4898,10 +4899,10 @@ class App:
         self._order_status_label.pack(fill='x', pady=1)
 
     def _open_chart_window(self, sym: str):
-        """Open a Toplevel window with 2x2 chart grid for a stock.
+        """Open a Toplevel window with 2x2 web-fetched chart grid.
 
-        Charts: 5-min+Fib | Weekly | Monthly | Yearly
-        Data fetched from IBKR in a background thread.
+        Charts: StockCharts Daily | Finviz Daily | Finviz Weekly | Cached Fib
+        Images fetched in parallel via ThreadPoolExecutor (~1.5s total).
         """
         win = tk.Toplevel(self.root)
         win.title(f"Charts — {sym}")
@@ -4914,77 +4915,76 @@ class App:
 
         chart_frame = tk.Frame(win, bg='#0e1117')
         chart_frame.pack(fill='both', expand=True)
-        # 2x2 grid
         for r in range(2):
             chart_frame.rowconfigure(r, weight=1)
         for c in range(2):
             chart_frame.columnconfigure(c, weight=1)
 
+        # Keep references to PhotoImages to prevent GC
+        win._chart_images = []
+
+        def _fetch_url_image(url: str, title: str) -> tuple[Image.Image | None, str]:
+            """Fetch an image from a URL, return (PIL.Image, title)."""
+            try:
+                resp = requests.get(url, timeout=10, headers={
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+                })
+                resp.raise_for_status()
+                return Image.open(io.BytesIO(resp.content)), title
+            except Exception as e:
+                log.error(f"Chart fetch {sym} {title}: {e}")
+                return None, title
+
+        def _load_fib_from_disk(sym: str) -> tuple[Image.Image | None, str]:
+            """Load cached Fib chart from /tmp."""
+            title = "Fibonacci Levels"
+            path = Path(f'/tmp/fib_{sym}.png')
+            if path.exists():
+                try:
+                    return Image.open(path), title
+                except Exception as e:
+                    log.error(f"Fib chart load {sym}: {e}")
+            return None, title
+
         def _fetch_and_draw():
-            ib = _get_ibkr()
-            if not ib:
-                win.after(0, lambda: status_var.set("IBKR not connected"))
-                return
-
-            contract = _get_contract(sym)
-            if not contract:
-                win.after(0, lambda: status_var.set(f"Could not qualify contract for {sym}"))
-                return
-
-            # Chart specs: (title, duration, barSize, grid_row, grid_col, use_fib)
-            chart_specs = [
-                ("5-min + Fibonacci", "1 D",  "5 mins",  0, 0, True),
-                ("Weekly (6M)",       "6 M",  "1 day",   0, 1, False),
-                ("Monthly (1Y)",      "1 Y",  "1 day",   1, 0, False),
-                ("Yearly (5Y)",       "5 Y",  "1 week",  1, 1, False),
+            # Chart specs: (row, col, title, callable)
+            urls = [
+                (0, 0, "Daily 6M (StockCharts)",
+                 f"https://stockcharts.com/c-sc/sc?s={sym}&p=D&yr=0&mn=6&dy=0&id=p75498498580"),
+                (0, 1, "Daily (Finviz)",
+                 f"https://finviz.com/chart.ashx?t={sym}&ty=c&ta=1&p=d&s=l"),
+                (1, 0, "Weekly (Finviz)",
+                 f"https://finviz.com/chart.ashx?t={sym}&ty=c&ta=1&p=w&s=l"),
             ]
 
-            figures: list[tuple[Figure | None, int, int, str]] = []
-            for title, duration, bar_size, row, col, use_fib in chart_specs:
-                win.after(0, lambda t=title: status_var.set(f"Fetching {t}..."))
-                try:
-                    bars = ib.reqHistoricalData(
-                        contract, endDateTime='', durationStr=duration,
-                        barSizeSetting=bar_size, whatToShow='TRADES',
-                        useRTH=False, formatDate=1, timeout=15,
-                    )
-                    if not bars:
-                        figures.append((None, row, col, title))
-                        continue
-                    df = ib_util.df(bars)
-                    if 'date' not in df.columns and df.index.name == 'date':
-                        df = df.reset_index()
-                except Exception as e:
-                    log.error(f"Chart data {sym} {title}: {e}")
-                    figures.append((None, row, col, title))
-                    continue
+            results: dict[str, tuple[Image.Image | None, int, int]] = {}
 
-                if use_fib:
-                    # Get fib levels for this stock
-                    current_price = df['close'].iloc[-1] if len(df) > 0 else 0
-                    cached_fib = _fib_cache.get(sym)
-                    if cached_fib:
-                        all_levels = cached_fib[2]
-                        ratio_map = cached_fib[3]
-                    else:
-                        enrich = _enrichment.get(sym, {})
-                        all_levels = enrich.get('fib_below', []) + enrich.get('fib_above', [])
-                        ratio_map = {}
-                    fig = _generate_fib_chart_figure(sym, df, all_levels, current_price, ratio_map)
-                else:
-                    fig = _generate_simple_chart(sym, df, f"{sym} — {title}")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {}
+                for row, col, title, url in urls:
+                    fut = pool.submit(_fetch_url_image, url, title)
+                    futures[fut] = (row, col, title)
+                # Also load fib chart from disk
+                fib_fut = pool.submit(_load_fib_from_disk, sym)
+                futures[fib_fut] = (1, 1, "Fibonacci Levels")
 
-                figures.append((fig, row, col, title))
+                for fut in as_completed(futures):
+                    row, col, title = futures[fut]
+                    img, _ = fut.result()
+                    results[title] = (img, row, col)
 
-            # Draw all figures on GUI thread
+            # Draw on GUI thread
             def _draw():
-                for fig, row, col, title in figures:
+                cell_w, cell_h = 540, 350
+                for title, (img, row, col) in results.items():
                     cell = tk.Frame(chart_frame, bg='#0e1117')
                     cell.grid(row=row, column=col, sticky='nsew', padx=2, pady=2)
-                    if fig:
-                        canvas = FigureCanvasTkAgg(fig, master=cell)
-                        canvas.draw()
-                        canvas.get_tk_widget().pack(fill='both', expand=True)
+                    if img:
+                        img.thumbnail((cell_w, cell_h), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        win._chart_images.append(photo)
+                        lbl = tk.Label(cell, image=photo, bg='#0e1117')
+                        lbl.pack(expand=True)
                     else:
                         tk.Label(cell, text=f"No data: {title}",
                                  font=("Courier", 11), bg='#0e1117', fg='#666').pack(
