@@ -35,6 +35,8 @@ from tkinter import messagebox
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -455,85 +457,71 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 #  Webull Desktop OCR Scanner
 # ══════════════════════════════════════════════════════════
 
-_webull_wid: int | None = None
-_webull_wid_ts: float = 0.0
-_WEBULL_WID_TTL = 300  # 5 minutes
+# Multi-scanner sources: up to 3 user-picked windows for OCR scanning
+_scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 3
+_MAX_SCANNER_SOURCES = 3
 
 
-def _find_webull_window() -> int | None:
-    """Find the Webull Desktop window ID using xdotool.
-
-    Picks the smallest-area visible window (the scanner pane).
-    Caches WID for 5 minutes, verifies it still exists before reuse.
-    """
-    global _webull_wid, _webull_wid_ts
-
-    # Check cached WID
-    if _webull_wid and (time_mod.time() - _webull_wid_ts < _WEBULL_WID_TTL):
-        # Verify it still exists
-        try:
-            result = subprocess.run(
-                ['xdotool', 'getwindowname', str(_webull_wid)],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and 'Webull' in result.stdout:
-                return _webull_wid
-        except Exception:
-            pass
-        _webull_wid = None
-
-    # Search for Webull windows
+def _verify_wid(wid: int) -> bool:
+    """Check that a window ID still exists."""
     try:
         result = subprocess.run(
-            ['xdotool', 'search', '--name', 'Webull Desktop'],
+            ['xdotool', 'getwindowname', str(wid)],
             capture_output=True, text=True, timeout=5,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-    except Exception as e:
-        log.debug(f"xdotool search failed: {e}")
-        return None
-
-    wids = [int(w) for w in result.stdout.strip().split('\n') if w.strip()]
-    if not wids:
-        return None
-
-    # Pick smallest-area window (the scanner pane)
-    best_wid = None
-    best_area = float('inf')
-    for wid in wids:
-        try:
-            geo = subprocess.run(
-                ['xdotool', 'getwindowgeometry', '--shell', str(wid)],
-                capture_output=True, text=True, timeout=5,
-            )
-            if geo.returncode != 0:
-                continue
-            w = h = 0
-            for line in geo.stdout.strip().split('\n'):
-                if line.startswith('WIDTH='):
-                    w = int(line.split('=')[1])
-                elif line.startswith('HEIGHT='):
-                    h = int(line.split('=')[1])
-            area = w * h
-            if area < 10_000:
-                continue  # skip hidden/dummy windows (< ~100x100)
-            if area < best_area:
-                best_area = area
-                best_wid = wid
-        except Exception:
-            continue
-
-    if best_wid:
-        _webull_wid = best_wid
-        _webull_wid_ts = time_mod.time()
-        log.info(f"Webull window found: WID={best_wid} area={best_area}")
-
-    return best_wid
+        return result.returncode == 0 and result.stdout.strip() != ''
+    except Exception:
+        return False
 
 
-def _capture_and_ocr_webull(wid: int) -> str:
-    """Capture Webull window via import(1) and OCR with pytesseract.
+def _get_window_name(wid: int) -> str:
+    """Get short display name for a window ID."""
+    try:
+        result = subprocess.run(
+            ['xdotool', 'getwindowname', str(wid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:20]
+    except Exception:
+        pass
+    return ""
+
+
+def add_scanner_source(wid: int, name: str = ""):
+    """Add a scanner source window. Max 3."""
+    global _scanner_sources
+    if len(_scanner_sources) >= _MAX_SCANNER_SOURCES:
+        log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
+        return False
+    # Don't add duplicates
+    if any(s['wid'] == wid for s in _scanner_sources):
+        log.info(f"Scanner source WID {wid} already added")
+        return False
+    if not name:
+        name = _get_window_name(wid)
+    _scanner_sources.append({'wid': wid, 'name': name})
+    log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
+    return True
+
+
+def remove_scanner_source(idx: int):
+    """Remove scanner source by slot index (0-based)."""
+    global _scanner_sources
+    if 0 <= idx < len(_scanner_sources):
+        removed = _scanner_sources.pop(idx)
+        log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
+    else:
+        log.warning(f"Invalid scanner source index: {idx}")
+
+
+def get_scanner_sources() -> list[dict]:
+    """Get current scanner sources list."""
+    return list(_scanner_sources)
+
+
+def _capture_and_ocr(wid: int) -> str:
+    """Capture a window via import(1) and OCR with pytesseract.
 
     Pipeline: screenshot → 3x resize → grayscale → invert → sharpen → OCR.
     """
@@ -560,8 +548,8 @@ def _capture_and_ocr_webull(wid: int) -> str:
     return text
 
 
-def _parse_webull_volume(vol_str: str) -> tuple[int, str]:
-    """Parse Webull volume string to (raw_int, display_str).
+def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
+    """Parse OCR volume/float string to (raw_int, display_str).
 
     Examples: "351.00K" → (351000, "351.0K"), "1.33M" → (1330000, "1.3M")
     """
@@ -586,7 +574,8 @@ def _parse_webull_volume(vol_str: str) -> tuple[int, str]:
     return (raw, _format_volume(raw))
 
 
-_WEBULL_LINE_RE = re.compile(
+# Generic OCR patterns — 3 formats in priority order
+_OCR_RE_5COL = re.compile(
     r'^([A-Z]{1,5})\s+'           # symbol
     r'([\d.]+)\s+'                # price
     r'([+-]?[\d.,]+)%\S*\s+'     # pct change (ignore OCR junk after %)
@@ -594,63 +583,137 @@ _WEBULL_LINE_RE = re.compile(
     r'([\d.,]+[KMBkmb]?)$',      # float
     re.MULTILINE,
 )
+_OCR_RE_4COL = re.compile(
+    r'^([A-Z]{1,5})\s+'
+    r'([\d.]+)\s+'
+    r'([+-]?[\d.,]+)%\S*\s+'
+    r'([\d.,]+[KMBkmb]?)$',
+    re.MULTILINE,
+)
+_OCR_RE_3COL = re.compile(
+    r'^([A-Z]{1,5})\s+'
+    r'([\d.]+)\s+'
+    r'([+-]?[\d.,]+)%\S*$',
+    re.MULTILINE,
+)
 
 
-def _parse_ocr_lines(text: str) -> list[dict]:
+def _parse_ocr_generic(text: str) -> list[dict]:
     """Parse OCR text into structured stock data.
 
-    Expected format per line: SYMBOL  PRICE  +PCT%  VOLUME  FLOAT
+    Tries 3 regex patterns in priority order:
+    1. 5 columns: SYMBOL PRICE PCT% VOLUME FLOAT (Webull style)
+    2. 4 columns: SYMBOL PRICE PCT% VOLUME
+    3. 3 columns: SYMBOL PRICE PCT%
     """
     results = []
-    for m in _WEBULL_LINE_RE.finditer(text):
+    seen = set()
+
+    # Try 5-column first (most data)
+    for m in _OCR_RE_5COL.finditer(text):
         sym = m.group(1)
-        try:
-            price = float(m.group(2))
-        except ValueError:
+        if sym in seen:
             continue
         try:
+            price = float(m.group(2))
             pct = float(m.group(3).replace(',', ''))
         except ValueError:
             continue
-
-        vol_raw, vol_display = _parse_webull_volume(m.group(4))
-        flt_raw, flt_display = _parse_webull_volume(m.group(5))
-
+        vol_raw, vol_display = _parse_ocr_volume(m.group(4))
+        flt_raw, flt_display = _parse_ocr_volume(m.group(5))
         results.append({
-            'sym': sym,
-            'price': price,
-            'pct': pct,
-            'volume_raw': vol_raw,
-            'volume': vol_display,
-            'float_raw': flt_raw,
-            'float_display': flt_display,
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': vol_raw, 'volume': vol_display,
+            'float_raw': flt_raw, 'float_display': flt_display,
         })
+        seen.add(sym)
+
+    # Try 4-column for remaining
+    for m in _OCR_RE_4COL.finditer(text):
+        sym = m.group(1)
+        if sym in seen:
+            continue
+        try:
+            price = float(m.group(2))
+            pct = float(m.group(3).replace(',', ''))
+        except ValueError:
+            continue
+        vol_raw, vol_display = _parse_ocr_volume(m.group(4))
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': vol_raw, 'volume': vol_display,
+            'float_raw': 0, 'float_display': '',
+        })
+        seen.add(sym)
+
+    # Try 3-column for remaining
+    for m in _OCR_RE_3COL.finditer(text):
+        sym = m.group(1)
+        if sym in seen:
+            continue
+        try:
+            price = float(m.group(2))
+            pct = float(m.group(3).replace(',', ''))
+        except ValueError:
+            continue
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': 0, 'volume': '',
+            'float_raw': 0, 'float_display': '',
+        })
+        seen.add(sym)
+
     return results
 
 
-def _run_webull_scan(price_min: float = MONITOR_PRICE_MIN,
-                     price_max: float = MONITOR_PRICE_MAX) -> dict:
-    """Scan via Webull Desktop OCR. Returns same dict format as _run_ibkr_scan.
+def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
+                   price_max: float = MONITOR_PRICE_MAX) -> dict:
+    """Scan via OCR on all configured scanner sources.
 
-    Falls back to empty dict if Webull window not found or OCR fails.
+    Loops over _scanner_sources, OCR each window, merges results
+    (prefer source with more fields). Returns same dict format as _run_ibkr_scan.
+    Falls back to empty dict if no sources configured or all fail.
     """
-    wid = _find_webull_window()
-    if not wid:
-        log.info("Webull window not found, will fallback to IBKR scan")
+    global _scanner_sources
+
+    # Prune dead windows
+    _scanner_sources = [s for s in _scanner_sources if _verify_wid(s['wid'])]
+
+    if not _scanner_sources:
+        log.info("No scanner sources configured, will fallback to IBKR scan")
         return {}
 
-    text = _capture_and_ocr_webull(wid)
-    if not text.strip():
-        log.warning("Webull OCR returned empty text")
+    all_parsed: list[dict] = []
+    for src in _scanner_sources:
+        text = _capture_and_ocr(src['wid'])
+        if not text.strip():
+            log.warning(f"OCR empty for source WID={src['wid']} ({src['name']})")
+            continue
+        parsed = _parse_ocr_generic(text)
+        if parsed:
+            log.info(f"OCR source WID={src['wid']} ({src['name']}): {len(parsed)} lines")
+        all_parsed.extend(parsed)
+
+    if not all_parsed:
+        log.warning("OCR scan: no valid lines from any source")
         return {}
 
-    parsed = _parse_ocr_lines(text)
-    if not parsed:
-        log.warning(f"Webull OCR: no valid lines parsed from {len(text)} chars")
-        return {}
+    # Merge by symbol — prefer entry with more fields (float > volume > basic)
+    best: dict[str, dict] = {}
+    for p in all_parsed:
+        sym = p['sym']
+        if sym not in best:
+            best[sym] = p
+        else:
+            # Prefer entry with float data, then volume data
+            old = best[sym]
+            old_score = (1 if old['float_raw'] else 0) + (1 if old['volume_raw'] else 0)
+            new_score = (1 if p['float_raw'] else 0) + (1 if p['volume_raw'] else 0)
+            if new_score > old_score:
+                best[sym] = p
 
     stocks: dict[str, dict] = {}
-    for p in parsed:
+    for p in best.values():
         price = p['price']
         if price < price_min or price > price_max:
             continue
@@ -674,7 +737,8 @@ def _run_webull_scan(price_min: float = MONITOR_PRICE_MIN,
         }
 
     session = _get_market_session()
-    log.info(f"Webull OCR [{session}]: {len(parsed)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
+    src_count = len(_scanner_sources)
+    log.info(f"OCR scan [{session}]: {src_count} sources → {len(best)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
     return stocks
 
 
@@ -2510,8 +2574,6 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
         visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
 
-        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
-
         # Draw fib levels — S1 labels right, S2 labels left, skip overlaps
         _default_color = '#888888'
         price_span = vis_max - vis_min
@@ -2611,6 +2673,158 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         plt.close('all')
         return None
 
+
+
+def _generate_simple_chart(sym: str, df: pd.DataFrame, title: str) -> Figure | None:
+    """Generate a simple candlestick chart (no Fibonacci) as a matplotlib Figure.
+
+    Returns a Figure object for embedding in tkinter, or None on failure.
+    """
+    try:
+        if len(df) < 3:
+            return None
+
+        n_bars = len(df)
+        fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0e1117')
+        ax.set_facecolor('#0e1117')
+
+        width = 0.6
+        for i, (_, row) in enumerate(df.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = '#26a69a' if c >= o else '#ef5350'
+            ax.plot([i, i], [l, h], color=color, linewidth=0.6)
+            body_bottom = min(o, c)
+            body_height = abs(c - o) or 0.001
+            ax.bar(i, body_height, bottom=body_bottom, width=width,
+                   color=color, edgecolor=color, linewidth=0.4)
+
+        # Current price line
+        last_close = df['close'].iloc[-1]
+        ax.axhline(y=last_close, color='white', linewidth=0.8, linestyle='--', alpha=0.7)
+        ax.text(n_bars - 1, last_close, f' ${last_close:.2f}',
+                color='white', fontsize=7, va='bottom', ha='left', fontweight='bold')
+
+        # X-axis labels
+        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
+        tick_step = max(1, n_bars // 6)
+        tick_positions = list(range(0, n_bars, tick_step))
+        tick_labels = []
+        date_list = list(dates)
+        for pos in tick_positions:
+            d = date_list[pos]
+            if hasattr(d, 'strftime'):
+                tick_labels.append(d.strftime('%m/%d'))
+            else:
+                tick_labels.append(str(d)[:5])
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, color='#888', fontsize=6, rotation=30, ha='right')
+
+        ax.tick_params(colors='#888', labelsize=7)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color('#333')
+        ax.spines['left'].set_color('#333')
+        ax.set_title(title, color='white', fontsize=10, fontweight='bold', pad=6)
+        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
+        fig.tight_layout()
+        return fig
+
+    except Exception as e:
+        log.error(f"_generate_simple_chart {sym}: {e}")
+        plt.close('all')
+        return None
+
+
+def _generate_fib_chart_figure(sym: str, df: pd.DataFrame, all_levels: list[float],
+                                current_price: float,
+                                ratio_map: dict | None = None) -> Figure | None:
+    """Generate a 5-min candlestick chart with Fibonacci levels as a Figure.
+
+    Similar to generate_fib_chart but returns Figure for tkinter embedding.
+    """
+    try:
+        df = df.tail(120).copy()
+        if len(df) < 5:
+            return None
+
+        n_bars = len(df)
+        right_padding = int(n_bars * 0.3)
+
+        fig, ax = plt.subplots(figsize=(7, 4), facecolor='#0e1117')
+        ax.set_facecolor('#0e1117')
+
+        width = 0.6
+        for i, (_, row) in enumerate(df.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = '#26a69a' if c >= o else '#ef5350'
+            ax.plot([i, i], [l, h], color=color, linewidth=0.6)
+            body_bottom = min(o, c)
+            body_height = abs(c - o) or 0.001
+            ax.bar(i, body_height, bottom=body_bottom, width=width,
+                   color=color, edgecolor=color, linewidth=0.4)
+
+        # Y range
+        vis_max = current_price * 2.5
+        vis_min = max(0, current_price * 0.01)
+        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
+
+        _default_color = '#888888'
+        price_span = vis_max - vis_min
+        min_label_gap = price_span * 0.018
+        last_y = -999.0
+
+        for lv in visible_levels:
+            info = ratio_map.get(round(lv, 4)) if ratio_map else None
+            if isinstance(info, tuple):
+                ratio, series = info
+            elif info is not None:
+                ratio, series = info, "S1"
+            else:
+                ratio, series = None, "S1"
+            color = FIB_LEVEL_COLORS.get(ratio, _default_color) if ratio is not None else _default_color
+            ax.axhline(y=lv, color=color, linewidth=0.6, alpha=0.7, linestyle='-')
+            if ratio is not None and abs(lv - last_y) >= min_label_gap:
+                ax.text(n_bars + 1, lv, f' {ratio} ${lv:.3f}', color=color,
+                        fontsize=6, va='center', ha='left', fontweight='bold')
+                last_y = lv
+
+        # Current price
+        ax.axhline(y=current_price, color='white', linewidth=0.8, linestyle='--', alpha=0.8)
+        ax.text(0, current_price, f' ${current_price:.2f}',
+                color='white', fontsize=7, va='bottom', ha='left', fontweight='bold')
+
+        # X-axis
+        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
+        tick_step = max(1, n_bars // 8)
+        tick_positions = list(range(0, n_bars, tick_step))
+        tick_labels = []
+        date_list = list(dates)
+        for pos in tick_positions:
+            d = date_list[pos]
+            if hasattr(d, 'strftime'):
+                tick_labels.append(d.strftime('%H:%M'))
+            else:
+                tick_labels.append(str(d)[:5])
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, color='#888', fontsize=6, rotation=30, ha='right')
+
+        ax.set_ylim(vis_min, vis_max)
+        ax.set_xlim(-1, n_bars + right_padding)
+        ax.tick_params(colors='#888', labelsize=7)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color('#333')
+        ax.spines['left'].set_color('#333')
+        ax.set_title(f'{sym} — 5min + Fibonacci (${current_price:.2f})',
+                     color='white', fontsize=10, fontweight='bold', pad=6)
+        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
+        fig.tight_layout()
+        return fig
+
+    except Exception as e:
+        log.error(f"_generate_fib_chart_figure {sym}: {e}")
+        plt.close('all')
+        return None
 
 
 def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
@@ -3350,13 +3564,14 @@ class TelegramListenerThread(threading.Thread):
 
 class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
-                 on_status=None, on_stocks=None):
+                 on_status=None, on_stocks=None, on_alert=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
         self.price_max = price_max
         self.on_status = on_status
         self.on_stocks = on_stocks  # callback(dict) to update GUI table
+        self.on_alert = on_alert    # callback(str) for alert messages
         self.running = False
         self.previous: dict = {}
         self.count = 0
@@ -3837,15 +4052,15 @@ class ScannerThread(threading.Thread):
                 self.on_status(f"Session: {cur_label} — rescanning...")
         self._last_session = current_session
 
-        # ── Webull OCR scan with IBKR fallback ──
-        current = _run_webull_scan(self.price_min, self.price_max)
-        scan_source = "Webull"
+        # ── OCR scan with IBKR fallback ──
+        current = _run_ocr_scan(self.price_min, self.price_max)
+        scan_source = "OCR"
         if not current:
             current = _run_ibkr_scan(self.price_min, self.price_max)
             scan_source = "IBKR"
 
-        # IBKR enrichment for momentum stocks from Webull scan
-        if scan_source == "Webull" and current:
+        # IBKR enrichment for momentum stocks from OCR scan
+        if scan_source == "OCR" and current:
             momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 16.0]
             if momentum_syms:
                 if self.on_status:
@@ -3963,6 +4178,8 @@ class ScannerThread(threading.Thread):
                 lines = [a['msg'] for a in mom_alerts]
                 for a in mom_alerts:
                     file_logger.log_alert(ts, a)
+                    if self.on_alert:
+                        self.on_alert(a.get('msg', f"Momentum {a.get('symbol', '?')}"))
                 send_telegram_alert(header + "\n".join(lines))
                 status += f"  🔔{len(mom_alerts)}"
             else:
@@ -4042,6 +4259,13 @@ class ScannerThread(threading.Thread):
 
         # ── Send all alerts as one message ──
         if batch_alerts and not self._warmup:
+            # Push batch alerts to GUI panel
+            if self.on_alert:
+                for ba in batch_alerts:
+                    # Strip HTML tags for GUI display
+                    clean = re.sub(r'<[^>]+>', '', ba)[:100]
+                    self.on_alert(clean)
+
             # Build keyboard with buttons for all symbols
             keyboard_rows = []
             for s in batch_syms:
@@ -4113,6 +4337,8 @@ class App:
     def __init__(self):
         self.scanner = None
         self._stock_data: dict = {}  # current scan results for table display
+        self._filter_20pct: bool = True  # show only ≥20% by default
+        self._recent_alerts: list[str] = []  # last N alert messages for GUI panel
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
@@ -4131,7 +4357,7 @@ class App:
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
-        self.root.geometry("1050x680")
+        self.root.geometry("1150x780")
         self.root.attributes('-topmost', True)
         self.root.configure(bg=self.BG, highlightbackground=self.ACCENT,
                             highlightcolor=self.ACCENT, highlightthickness=2)
@@ -4154,7 +4380,7 @@ class App:
         # Column headers
         hdr_frame = tk.Frame(self.root, bg=self.BG)
         hdr_frame.pack(fill='x', padx=10)
-        for text, w in [("SYM", 7), ("PRICE", 7), ("CHG%", 7), ("VOL", 7), ("RVOL", 6), ("FLOAT", 7), ("SHORT", 6)]:
+        for text, w in [("SYM", 7), ("PRICE", 7), ("CHG%", 7), ("VOL", 7), ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
             tk.Label(hdr_frame, text=text, font=("Courier", 11, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
 
@@ -4230,19 +4456,63 @@ class App:
         self.price_max = tk.DoubleVar(value=MONITOR_PRICE_MAX)
         tk.Spinbox(fs, from_=1, to=500, increment=1, textvariable=self.price_max,
                    width=4, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=1)
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 8))
 
-        # Start/Stop
-        self.btn = tk.Button(self.root, text="START", font=("Helvetica", 16, "bold"),
+        # Scanner source slots (up to 3)
+        scanner_row = tk.Frame(self.root, bg=self.BG)
+        scanner_row.pack(fill='x', padx=10, pady=1)
+        tk.Label(scanner_row, text="Scanners:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left')
+        self._scanner_slot_labels: list[tk.Label] = []
+        self._scanner_slot_vars: list[tk.StringVar] = []
+        for i in range(_MAX_SCANNER_SOURCES):
+            var = tk.StringVar(value=f"S{i+1}: ——")
+            lbl = tk.Label(scanner_row, textvariable=var,
+                           font=("Courier", 9), bg=self.BG, fg="#666", width=16, anchor='w')
+            lbl.pack(side='left', padx=(4, 0))
+            self._scanner_slot_vars.append(var)
+            self._scanner_slot_labels.append(lbl)
+            tk.Button(
+                scanner_row, text="Pick", font=("Helvetica", 8), bg=self.ROW_BG, fg=self.FG,
+                command=lambda idx=i: self._pick_scanner(idx), relief='flat', padx=3, pady=0,
+            ).pack(side='left', padx=(1, 0))
+            tk.Button(
+                scanner_row, text="X", font=("Helvetica", 8), bg=self.ROW_BG, fg=self.RED,
+                command=lambda idx=i: self._clear_scanner(idx), relief='flat', padx=2, pady=0,
+            ).pack(side='left', padx=(0, 4))
+
+        # Filter toggle + Start/Stop row
+        ctrl_row = tk.Frame(self.root, bg=self.BG)
+        ctrl_row.pack(fill='x', padx=10, pady=(4, 0))
+        self._filter_btn = tk.Button(
+            ctrl_row, text="20%+", font=("Helvetica", 10, "bold"),
+            bg="#335533", fg=self.GREEN, relief='flat', padx=6, pady=2,
+            command=self._toggle_filter,
+        )
+        self._filter_btn.pack(side='left', padx=(0, 6))
+        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 16, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
                              relief='flat', activebackground="#00a844")
-        self.btn.pack(fill='x', padx=10, ipady=2, pady=(4, 0))
+        self.btn.pack(side='left', fill='x', expand=True, ipady=2)
 
         # Status
         self.status = tk.StringVar(value="Ready")
         tk.Label(self.root, textvariable=self.status, font=("Courier", 10),
                  bg=self.BG, fg="#888", wraplength=1000, justify='left'
-                 ).pack(padx=10, pady=3, anchor='w')
+                 ).pack(padx=10, pady=1, anchor='w')
+
+        # Alerts panel (last 5 alerts)
+        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=1)
+        self._alerts_frame = tk.Frame(self.root, bg=self.BG)
+        self._alerts_frame.pack(fill='x', padx=10, pady=1)
+        tk.Label(self._alerts_frame, text="Alerts:", font=("Helvetica", 9, "bold"),
+                 bg=self.BG, fg="#888").pack(anchor='w')
+        self._alert_labels: list[tk.Label] = []
+        for _ in range(5):
+            lbl = tk.Label(self._alerts_frame, text="", font=("Courier", 9),
+                           bg=self.BG, fg="#aaa", anchor='w', wraplength=900, justify='left')
+            lbl.pack(fill='x')
+            self._alert_labels.append(lbl)
 
         self._load()
         self.root.after(500, self._check_connection)
@@ -4302,8 +4572,21 @@ class App:
             rvol_text = "—"
             rvol_color = "#555"
 
+        # VWAP
+        vwap = d.get('vwap', 0)
+        price = d['price']
+        if vwap > 0:
+            vwap_text = f"${vwap:.2f}"
+            vwap_fg = self.GREEN if price > vwap else self.RED
+        else:
+            vwap_text = "—"
+            vwap_fg = "#555"
+
         flt = enrich.get('float', '') if enrich else ''
         short = enrich.get('short', '') if enrich else ''
+
+        # News indicator
+        news_text = "N" if (enrich and enrich.get('news')) else ""
 
         # Fib text
         fib_text = ""
@@ -4319,49 +4602,67 @@ class App:
 
         return {
             'bg': bg, 'sym_text': sym_text, 'sym_fg': sym_fg,
-            'price_text': f"${d['price']:.2f}",
+            'price_text': f"${price:.2f}",
             'pct_text': f"{pct:+.1f}%", 'pct_fg': pct_color,
             'vol_text': vol_text, 'vol_fg': vol_color,
             'rvol_text': rvol_text, 'rvol_fg': rvol_color,
+            'vwap_text': vwap_text, 'vwap_fg': vwap_fg,
             'float_text': flt, 'short_text': short,
+            'news_text': news_text,
             'fib_text': fib_text,
         }
 
     def _build_stock_row(self, sym: str, rd: dict) -> dict:
         """Create widget row for a stock and return widget refs."""
         _click = lambda e, s=sym: self._select_stock(s)
+        _dbl_click = lambda e, s=sym: self._open_chart_window(s)
 
         row1 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row1.pack(fill='x', pady=0)
         row1.bind('<Button-1>', _click)
+        row1.bind('<Double-Button-1>', _dbl_click)
 
         sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 12, "bold"),
                            bg=rd['bg'], fg=rd['sym_fg'], width=7, anchor='w')
-        sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
+        sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
 
         price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 12),
                              bg=rd['bg'], fg=self.FG, width=7, anchor='w')
-        price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
+        price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click); price_lbl.bind('<Double-Button-1>', _dbl_click)
 
         pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 12, "bold"),
                            bg=rd['bg'], fg=rd['pct_fg'], width=7, anchor='w')
-        pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click)
+        pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click); pct_lbl.bind('<Double-Button-1>', _dbl_click)
 
         vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 11),
-                           bg=rd['bg'], fg=rd['vol_fg'], width=10, anchor='w')
-        vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click)
+                           bg=rd['bg'], fg=rd['vol_fg'], width=7, anchor='w')
+        vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click); vol_lbl.bind('<Double-Button-1>', _dbl_click)
 
         rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 11, "bold"),
                             bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
-        rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click)
+        rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click); rvol_lbl.bind('<Double-Button-1>', _dbl_click)
+
+        vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=("Courier", 11),
+                            bg=rd['bg'], fg=rd.get('vwap_fg', '#555'), width=7, anchor='w')
+        vwap_lbl.pack(side='left'); vwap_lbl.bind('<Button-1>', _click); vwap_lbl.bind('<Double-Button-1>', _dbl_click)
 
         float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 11),
                              bg=rd['bg'], fg="#cca0ff", width=7, anchor='w')
-        float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click)
+        float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click); float_lbl.bind('<Double-Button-1>', _dbl_click)
 
         short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 11),
                              bg=rd['bg'], fg="#ffaa00", width=6, anchor='w')
-        short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click)
+        short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click); short_lbl.bind('<Double-Button-1>', _dbl_click)
+
+        news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=("Courier", 11),
+                            bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
+        news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Double-Button-1>', _dbl_click)
+
+        # Chart button
+        chart_btn = tk.Button(row1, text="Ch", font=("Helvetica", 8), bg='#333',
+                              fg=self.ACCENT, relief='flat', padx=2, pady=0,
+                              command=lambda s=sym: self._open_chart_window(s))
+        chart_btn.pack(side='left', padx=(2, 0))
 
         # Fib row
         row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
@@ -4376,8 +4677,8 @@ class App:
             'row1': row1, 'row2': row2,
             'sym_lbl': sym_lbl, 'price_lbl': price_lbl, 'pct_lbl': pct_lbl,
             'vol_lbl': vol_lbl, 'rvol_lbl': rvol_lbl,
-            'float_lbl': float_lbl, 'short_lbl': short_lbl,
-            'fib_lbl': fib_lbl,
+            'vwap_lbl': vwap_lbl, 'float_lbl': float_lbl, 'short_lbl': short_lbl,
+            'news_lbl': news_lbl, 'fib_lbl': fib_lbl, 'chart_btn': chart_btn,
         }
 
     def _update_stock_row(self, widgets: dict, rd: dict):
@@ -4389,8 +4690,10 @@ class App:
         widgets['pct_lbl'].config(text=rd['pct_text'], fg=rd['pct_fg'], bg=bg)
         widgets['vol_lbl'].config(text=rd['vol_text'], fg=rd['vol_fg'], bg=bg)
         widgets['rvol_lbl'].config(text=rd['rvol_text'], fg=rd['rvol_fg'], bg=bg)
+        widgets['vwap_lbl'].config(text=rd.get('vwap_text', '—'), fg=rd.get('vwap_fg', '#555'), bg=bg)
         widgets['float_lbl'].config(text=rd['float_text'], bg=bg)
         widgets['short_lbl'].config(text=rd['short_text'], bg=bg)
+        widgets['news_lbl'].config(text=rd.get('news_text', ''), bg=bg)
         # Fib row
         if rd['fib_text']:
             widgets['fib_lbl'].config(text=rd['fib_text'], bg=bg)
@@ -4414,8 +4717,12 @@ class App:
                      bg=self.BG, fg="#666", font=("Helvetica", 20)).pack(pady=10)
             return
 
-        sorted_stocks = sorted(self._stock_data.items(),
-                               key=lambda x: x[1]['pct'], reverse=True)
+        all_sorted = sorted(self._stock_data.items(),
+                            key=lambda x: x[1]['pct'], reverse=True)
+        if self._filter_20pct:
+            sorted_stocks = [(s, d) for s, d in all_sorted if d.get('pct', 0) >= 20.0]
+        else:
+            sorted_stocks = all_sorted
         new_order = [sym for sym, _ in sorted_stocks]
 
         if new_order == self._rendered_order:
@@ -4589,6 +4896,104 @@ class App:
             panel, textvariable=self._order_status_var,
             font=("Courier", 10), bg=self.BG, fg="#888", anchor='w')
         self._order_status_label.pack(fill='x', pady=1)
+
+    def _open_chart_window(self, sym: str):
+        """Open a Toplevel window with 2x2 chart grid for a stock.
+
+        Charts: 5-min+Fib | Weekly | Monthly | Yearly
+        Data fetched from IBKR in a background thread.
+        """
+        win = tk.Toplevel(self.root)
+        win.title(f"Charts — {sym}")
+        win.geometry("1100x750")
+        win.configure(bg='#0e1117')
+
+        status_var = tk.StringVar(value=f"Loading charts for {sym}...")
+        tk.Label(win, textvariable=status_var, font=("Courier", 11),
+                 bg='#0e1117', fg='#888').pack(pady=5)
+
+        chart_frame = tk.Frame(win, bg='#0e1117')
+        chart_frame.pack(fill='both', expand=True)
+        # 2x2 grid
+        for r in range(2):
+            chart_frame.rowconfigure(r, weight=1)
+        for c in range(2):
+            chart_frame.columnconfigure(c, weight=1)
+
+        def _fetch_and_draw():
+            ib = _get_ibkr()
+            if not ib:
+                win.after(0, lambda: status_var.set("IBKR not connected"))
+                return
+
+            contract = _get_contract(sym)
+            if not contract:
+                win.after(0, lambda: status_var.set(f"Could not qualify contract for {sym}"))
+                return
+
+            # Chart specs: (title, duration, barSize, grid_row, grid_col, use_fib)
+            chart_specs = [
+                ("5-min + Fibonacci", "1 D",  "5 mins",  0, 0, True),
+                ("Weekly (6M)",       "6 M",  "1 day",   0, 1, False),
+                ("Monthly (1Y)",      "1 Y",  "1 day",   1, 0, False),
+                ("Yearly (5Y)",       "5 Y",  "1 week",  1, 1, False),
+            ]
+
+            figures: list[tuple[Figure | None, int, int, str]] = []
+            for title, duration, bar_size, row, col, use_fib in chart_specs:
+                win.after(0, lambda t=title: status_var.set(f"Fetching {t}..."))
+                try:
+                    bars = ib.reqHistoricalData(
+                        contract, endDateTime='', durationStr=duration,
+                        barSizeSetting=bar_size, whatToShow='TRADES',
+                        useRTH=False, formatDate=1, timeout=15,
+                    )
+                    if not bars:
+                        figures.append((None, row, col, title))
+                        continue
+                    df = ib_util.df(bars)
+                    if 'date' not in df.columns and df.index.name == 'date':
+                        df = df.reset_index()
+                except Exception as e:
+                    log.error(f"Chart data {sym} {title}: {e}")
+                    figures.append((None, row, col, title))
+                    continue
+
+                if use_fib:
+                    # Get fib levels for this stock
+                    current_price = df['close'].iloc[-1] if len(df) > 0 else 0
+                    cached_fib = _fib_cache.get(sym)
+                    if cached_fib:
+                        all_levels = cached_fib[2]
+                        ratio_map = cached_fib[3]
+                    else:
+                        enrich = _enrichment.get(sym, {})
+                        all_levels = enrich.get('fib_below', []) + enrich.get('fib_above', [])
+                        ratio_map = {}
+                    fig = _generate_fib_chart_figure(sym, df, all_levels, current_price, ratio_map)
+                else:
+                    fig = _generate_simple_chart(sym, df, f"{sym} — {title}")
+
+                figures.append((fig, row, col, title))
+
+            # Draw all figures on GUI thread
+            def _draw():
+                for fig, row, col, title in figures:
+                    cell = tk.Frame(chart_frame, bg='#0e1117')
+                    cell.grid(row=row, column=col, sticky='nsew', padx=2, pady=2)
+                    if fig:
+                        canvas = FigureCanvasTkAgg(fig, master=cell)
+                        canvas.draw()
+                        canvas.get_tk_widget().pack(fill='both', expand=True)
+                    else:
+                        tk.Label(cell, text=f"No data: {title}",
+                                 font=("Courier", 11), bg='#0e1117', fg='#666').pack(
+                                     expand=True)
+                status_var.set(f"Charts loaded for {sym}")
+
+            win.after(0, _draw)
+
+        threading.Thread(target=_fetch_and_draw, daemon=True).start()
 
     def _select_stock(self, sym: str):
         """Handle stock row click — populate trading panel fields."""
@@ -4807,6 +5212,73 @@ class App:
             f"Sending: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
         self._order_status_label.config(fg="#ffcc00")
 
+    def _toggle_filter(self):
+        """Toggle 20%+ filter on stock table."""
+        self._filter_20pct = not self._filter_20pct
+        if self._filter_20pct:
+            self._filter_btn.config(bg="#335533", fg=self.GREEN, text="20%+")
+        else:
+            self._filter_btn.config(bg="#553333", fg="#aaa", text="ALL")
+        self._render_stock_table()
+
+    def _push_alert(self, msg: str):
+        """Add alert message to recent alerts panel (GUI thread safe)."""
+        ts = datetime.now().strftime('%H:%M:%S')
+        line = f"[{ts}] {msg}"
+        self._recent_alerts.insert(0, line)
+        self._recent_alerts = self._recent_alerts[:5]
+        def _update():
+            for i, lbl in enumerate(self._alert_labels):
+                if i < len(self._recent_alerts):
+                    lbl.config(text=self._recent_alerts[i])
+                else:
+                    lbl.config(text="")
+        self.root.after(0, _update)
+
+    def _pick_scanner(self, idx: int):
+        """Let user click on a window to add as scanner source in slot idx."""
+        self.status.set(f"Click on the scanner window for slot S{idx+1}...")
+        self.root.update()
+        def _do_pick():
+            try:
+                result = subprocess.run(
+                    ['xdotool', 'selectwindow'],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    wid = int(result.stdout.strip())
+                    name = _get_window_name(wid)
+                    # If slot already occupied, remove old one first
+                    if idx < len(_scanner_sources):
+                        remove_scanner_source(idx)
+                    # Pad sources list if needed
+                    while len(_scanner_sources) < idx:
+                        _scanner_sources.append({'wid': 0, 'name': ''})
+                    if idx < len(_scanner_sources):
+                        _scanner_sources[idx] = {'wid': wid, 'name': name}
+                    else:
+                        add_scanner_source(wid, name)
+                    short_name = name[:12] if name else str(wid)
+                    self.root.after(0, lambda: self._scanner_slot_vars[idx].set(f"S{idx+1}: {short_name}"))
+                    self.root.after(0, lambda: self._scanner_slot_labels[idx].config(fg=self.GREEN))
+                    self.root.after(0, lambda: self.status.set(f"Scanner S{idx+1}: WID={wid} ({name})"))
+                    self._save()
+                else:
+                    self.root.after(0, lambda: self.status.set("Window pick cancelled"))
+            except Exception as e:
+                self.root.after(0, lambda: self.status.set(f"Pick failed: {e}"))
+        threading.Thread(target=_do_pick, daemon=True).start()
+
+    def _clear_scanner(self, idx: int):
+        """Remove scanner source from slot idx."""
+        if idx < len(_scanner_sources):
+            remove_scanner_source(idx)
+        self._scanner_slot_vars[idx].set(f"S{idx+1}: ——")
+        self._scanner_slot_labels[idx].config(fg="#666")
+        self.status.set(f"Scanner S{idx+1} cleared")
+        self._save()
+        self._refresh_scanner_slots()
+
     def _toggle(self):
         if self.scanner and self.scanner.running:
             self.scanner.stop()
@@ -4823,6 +5295,7 @@ class App:
                 price_max=self.price_max.get(),
                 on_status=self._st,
                 on_stocks=self._update_stock_table,
+                on_alert=self._push_alert,
             )
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
@@ -4831,13 +5304,27 @@ class App:
     def _st(self, msg):
         self.root.after(0, lambda: self.status.set(msg))
 
+    def _refresh_scanner_slots(self):
+        """Refresh scanner slot labels from _scanner_sources."""
+        for i in range(_MAX_SCANNER_SOURCES):
+            if i < len(_scanner_sources) and _scanner_sources[i].get('wid'):
+                src = _scanner_sources[i]
+                short_name = src['name'][:12] if src['name'] else str(src['wid'])
+                self._scanner_slot_vars[i].set(f"S{i+1}: {short_name}")
+                self._scanner_slot_labels[i].config(fg=self.GREEN)
+            else:
+                self._scanner_slot_vars[i].set(f"S{i+1}: ——")
+                self._scanner_slot_labels[i].config(fg="#666")
+
     def _save(self):
+        scanner_data = [{'wid': s['wid'], 'name': s['name']} for s in _scanner_sources]
         with open(STATE_PATH, 'w') as f:
             json.dump({
                 'freq': self.freq.get(),
                 'thresh': self.thresh.get(),
                 'price_min': self.price_min.get(),
                 'price_max': self.price_max.get(),
+                'scanner_sources': scanner_data,
             }, f)
 
     def _load(self):
@@ -4850,6 +5337,18 @@ class App:
             self.thresh.set(s.get('thresh', MONITOR_DEFAULT_ALERT_PCT))
             self.price_min.set(s.get('price_min', MONITOR_PRICE_MIN))
             self.price_max.set(s.get('price_max', MONITOR_PRICE_MAX))
+            # Restore scanner sources
+            global _scanner_sources
+            saved_sources = s.get('scanner_sources', [])
+            # Legacy: migrate from old webull_wid format
+            if not saved_sources and s.get('webull_wid'):
+                saved_sources = [{'wid': int(s['webull_wid']), 'name': 'Webull'}]
+            _scanner_sources = []
+            for src in saved_sources:
+                wid = int(src.get('wid', 0))
+                if wid and _verify_wid(wid):
+                    _scanner_sources.append({'wid': wid, 'name': src.get('name', '')})
+            self._refresh_scanner_slots()
         except Exception:
             pass
 
