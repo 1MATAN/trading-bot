@@ -1378,6 +1378,15 @@ def _check_stocks_in_play(current: dict):
 _daily_summary_sent: str = ""  # "YYYY-MM-DD" of last summary sent
 _daily_top_movers: dict[str, dict] = {}  # sym → {peak_pct, peak_price}
 _daily_new_stocks: int = 0
+_daily_events: list[dict] = []           # {time, type, symbol, detail}
+_daily_alert_counts: dict[str, int] = {}  # alert_type → count
+_daily_reports_sent: int = 0             # full stock reports sent to group
+
+
+def _log_daily_event(etype: str, symbol: str, detail: str):
+    """Record an event for the end-of-day full report."""
+    ts = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
+    _daily_events.append({'time': ts, 'type': etype, 'symbol': symbol, 'detail': detail})
 
 
 def _track_daily_stats(current: dict, new_count: int = 0):
@@ -1392,9 +1401,11 @@ def _track_daily_stats(current: dict, new_count: int = 0):
             _daily_top_movers[sym] = {'peak_pct': pct, 'peak_price': price}
 
 
-def _check_daily_summary(positions: dict[str, tuple] | None = None):
-    """Send end-of-day summary at ~16:05 ET. Only once per day."""
-    global _daily_summary_sent, _daily_new_stocks
+def _check_daily_summary(positions: dict[str, tuple] | None = None,
+                         net_liq: float = 0, buying_power: float = 0,
+                         fib_dt_sym: str | None = None, cycle_count: int = 0):
+    """Send comprehensive end-of-day report at ~16:05 ET. Only once per day."""
+    global _daily_summary_sent, _daily_new_stocks, _daily_reports_sent
     now_et = datetime.now(ZoneInfo('US/Eastern'))
     today_str = now_et.strftime('%Y-%m-%d')
 
@@ -1409,21 +1420,65 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None):
 
     _daily_summary_sent = today_str
 
-    # ── Top movers (top 5 by absolute pct) ──
+    lines = [
+        f"📊 <b>דוח יומי מלא — {today_str}</b>",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    # ── FIB DT Section ──
+    fib_tracks = [e for e in _daily_events if e['type'] == 'fib_dt_track']
+    fib_signals = [e for e in _daily_events if e['type'] == 'fib_dt_signal']
+    fib_entries = [e for e in _daily_events if e['type'] == 'fib_dt_entry']
+    fib_closes = [e for e in _daily_events if e['type'] == 'fib_dt_close']
+
+    lines.append("")
+    lines.append("📐 <b>אסטרטגיית FIB DT:</b>")
+    if fib_dt_sym:
+        lines.append(f"  • מניה נסרקת: {fib_dt_sym}")
+    if fib_tracks:
+        tracked_syms = list(dict.fromkeys(e['symbol'] for e in fib_tracks))
+        lines.append(f"  • מניות שנסרקו: {', '.join(tracked_syms)}")
+    lines.append(f"  • איתותי כניסה: {len(fib_signals)}")
+    for e in fib_signals:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+    lines.append(f"  • כניסות שבוצעו: {len(fib_entries)}")
+    for e in fib_entries:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+    lines.append(f"  • יציאות/סגירות: {len(fib_closes)}")
+    for e in fib_closes:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+
+    # ── Open Positions ──
+    if positions:
+        total_pnl = sum(pos[3] for pos in positions.values() if len(pos) >= 4)
+        lines.append("")
+        lines.append("💼 <b>פוזיציות פתוחות:</b>")
+        for sym, pos in sorted(positions.items()):
+            qty, avg = pos[0], pos[1]
+            mkt = pos[2] if len(pos) >= 3 else 0
+            pnl = pos[3] if len(pos) >= 4 else 0
+            icon = "🟢" if pnl >= 0 else "🔴"
+            pct_chg = ((mkt - avg) / avg * 100) if avg > 0 else 0
+            lines.append(f"  {icon} {sym}: {qty}sh @ ${avg:.2f} → ${mkt:.2f} ({pct_chg:+.1f}%)")
+        pnl_icon = "💚" if total_pnl >= 0 else "❤️"
+        lines.append(f"  {pnl_icon} סה\"כ P&L: ${total_pnl:+,.2f}")
+
+    # ── Account ──
+    if net_liq > 0:
+        lines.append("")
+        lines.append("💰 <b>חשבון:</b>")
+        lines.append(f"  NetLiq: ${net_liq:,.0f} | Buying Power: ${buying_power:,.0f}")
+
+    # ── Top 5 movers ──
     sorted_movers = sorted(
         _daily_top_movers.items(),
         key=lambda x: abs(x[1]['peak_pct']),
         reverse=True,
     )[:5]
 
-    lines = [
-        f"📊 <b>סיכום יומי — {today_str}</b>",
-        f"━━━━━━━━━━━━━━━━━━",
-    ]
-
     if sorted_movers:
         lines.append("")
-        lines.append("🏆 <b>מובילים היום:</b>")
+        lines.append("🏆 <b>טופ 5 מובילים:</b>")
         for i, (sym, info) in enumerate(sorted_movers, 1):
             arrow = "🟢" if info['peak_pct'] > 0 else "🔴"
             enrich = _enrichment.get(sym, {})
@@ -1433,30 +1488,34 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None):
                 f"(${info['peak_price']:.2f}) Float:{flt}"
             )
 
+    # ── Alert counts ──
+    total_alerts = sum(_daily_alert_counts.values())
     lines.append("")
-    lines.append(f"📈 מניות חדשות בסקאנר: {_daily_new_stocks}")
+    lines.append(f"🔔 <b>התראות שנשלחו:</b> {total_alerts}")
+    if _daily_alert_counts:
+        parts = [f"{k}: {v}" for k, v in sorted(_daily_alert_counts.items())]
+        lines.append(f"  {' | '.join(parts)}")
 
-    # ── P&L if positions exist ──
-    if positions:
-        total_pnl = sum(pos[3] for pos in positions.values() if len(pos) >= 4)
-        lines.append("")
-        pnl_icon = "💚" if total_pnl >= 0 else "❤️"
-        lines.append(f"{pnl_icon} P&L פתוח: ${total_pnl:+,.2f}")
-        for sym, pos in sorted(positions.items()):
-            qty, avg = pos[0], pos[1]
-            pnl = pos[3] if len(pos) >= 4 else 0
-            icon = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"  {icon} {sym}: {qty}sh @ ${avg:.2f} → ${pnl:+,.2f}")
+    # ── Stats ──
+    lines.append("")
+    lines.append("📈 <b>סטטיסטיקות:</b>")
+    lines.append(f"  • סך מניות בסקאנר: {len(_daily_top_movers)}")
+    lines.append(f"  • מניות חדשות: {_daily_new_stocks}")
+    lines.append(f"  • דוחות מלאים (לקבוצה): {_daily_reports_sent}")
+    lines.append(f"  • סייקלים: {cycle_count}")
 
     lines.append("")
-    lines.append("📡 המוניטור ממשיך לעבוד — after hours")
+    lines.append("📡 המוניטור ממשיך — After Hours")
 
     send_telegram("\n".join(lines))
-    log.info("Daily summary sent")
+    log.info("Daily full report sent")
 
     # Reset daily stats for next day
     _daily_top_movers.clear()
     _daily_new_stocks = 0
+    _daily_events.clear()
+    _daily_alert_counts.clear()
+    _daily_reports_sent = 0
 
 
 # ══════════════════════════════════════════════════════════
@@ -3122,6 +3181,8 @@ class ScannerThread(threading.Thread):
                     f"+{best_data['pct']:.1f}%, "
                     f"float={_enrichment.get(best_sym, {}).get('float', '?')})"
                 )
+                _log_daily_event('fib_dt_track', best_sym,
+                                 f"turnover={best_turnover:.2f}x, +{best_data['pct']:.1f}%")
                 self._fib_dt_current_sym = best_sym
 
             # ── 3. Run strategy cycle ──
@@ -3137,6 +3198,9 @@ class ScannerThread(threading.Thread):
                     f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
                     f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}"
                 )
+                _log_daily_event('fib_dt_signal', req.symbol,
+                                 f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
+                                 f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}")
                 success = self._fib_dt_entry.execute_entry(req)
                 if success:
                     log.info(f"FIB DT: Entry executed for {req.symbol} [{now_et}]")
@@ -3145,6 +3209,8 @@ class ScannerThread(threading.Thread):
                     if info:
                         self._fib_dt_positions[req.symbol] = dict(info)
                         log.info(f"FIB DT: Tracking position {req.symbol} for fill monitoring")
+                        _log_daily_event('fib_dt_entry', req.symbol,
+                                         f"BUY {info.get('qty', '?')}sh @ ${info.get('entry_price', 0):.2f}")
                 else:
                     log.warning(f"FIB DT: Entry failed for {req.symbol} [{now_et}]")
 
@@ -3199,6 +3265,8 @@ class ScannerThread(threading.Thread):
             if actual_qty == 0:
                 now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
                 log.info(f"FIB DT MONITOR: {sym} position closed (qty=0)")
+                _log_daily_event('fib_dt_close', sym,
+                                 f"entry was ${info.get('entry_price', 0):.2f}")
                 self._fib_dt_strategy.mark_position_closed(sym)
                 info['phase'] = 'CLOSED'
                 closed_symbols.append(sym)
@@ -3425,6 +3493,10 @@ class ScannerThread(threading.Thread):
 
             if above_vwap and flt_ok and has_news and not self._warmup:
                 _send_stock_report(sym, d, enrich)
+                global _daily_reports_sent
+                _daily_reports_sent += 1
+                _log_daily_event('stock_report', sym,
+                                 f"+{pct:.1f}% float={enrich.get('float', '-')}")
                 file_logger.log_alert(ts, {
                     'type': 'new', 'symbol': sym,
                     'price': d['price'], 'pct': d['pct'],
@@ -3489,6 +3561,7 @@ class ScannerThread(threading.Thread):
                 hod_msg = check_hod_break(sym, d, prev_d)
                 if hod_msg:
                     batch_alerts.append(hod_msg)
+                    _daily_alert_counts['HOD Break'] = _daily_alert_counts.get('HOD Break', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
@@ -3496,6 +3569,7 @@ class ScannerThread(threading.Thread):
                 fib_msg = check_fib_second_touch(sym, price, pct)
                 if fib_msg:
                     batch_alerts.append(fib_msg)
+                    _daily_alert_counts['FIB Touch'] = _daily_alert_counts.get('FIB Touch', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
@@ -3504,6 +3578,7 @@ class ScannerThread(threading.Thread):
                 lod_msg = check_lod_touch(sym, price, day_low, pct)
                 if lod_msg:
                     batch_alerts.append(lod_msg)
+                    _daily_alert_counts['LOD Touch'] = _daily_alert_counts.get('LOD Touch', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
@@ -3512,6 +3587,7 @@ class ScannerThread(threading.Thread):
                 vwap_msg = check_vwap_cross(sym, price, vwap, pct)
                 if vwap_msg:
                     batch_alerts.append(vwap_msg)
+                    _daily_alert_counts['VWAP Cross'] = _daily_alert_counts.get('VWAP Cross', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
@@ -3519,6 +3595,7 @@ class ScannerThread(threading.Thread):
                 spike_msg = check_spike(sym, price, pct)
                 if spike_msg:
                     batch_alerts.append(spike_msg)
+                    _daily_alert_counts['Spike'] = _daily_alert_counts.get('Spike', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
@@ -3566,7 +3643,13 @@ class ScannerThread(threading.Thread):
             _track_session_stocks(current)
             _check_stocks_in_play(current)
             _check_session_summary()
-            _check_daily_summary(positions=self._cached_positions)
+            _check_daily_summary(
+                positions=self._cached_positions,
+                net_liq=self._cached_net_liq,
+                buying_power=self._cached_buying_power,
+                fib_dt_sym=self._fib_dt_current_sym,
+                cycle_count=self.count,
+            )
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
