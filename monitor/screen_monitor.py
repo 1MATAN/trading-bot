@@ -610,11 +610,12 @@ _news_sent: dict[str, set[str]] = {}
 _news_last_check: float = 0.0
 
 
-def _check_news_updates(current_stocks: dict):
+def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
     """Check for new IBKR news headlines on stocks ≥ +20%.
 
     Only runs during pre_market, market, and after_hours.
     Sends Telegram alert for each new headline found.
+    If suppress_send=True, populate state without sending messages (warmup).
     """
     global _news_last_check
 
@@ -674,9 +675,10 @@ def _check_news_updates(current_stocks: dict):
             src_tag = f" [{src}]" if src else ""
             lines.append(f"  • {title_he}  <i>({h['date']}{src_tag})</i>")
 
-        btn = _make_lookup_button(sym)
-        send_telegram("\n".join(lines), reply_markup=btn)
-        log.info(f"News alert: {sym} — {len(new_headlines)} new headlines")
+        if not suppress_send:
+            btn = _make_lookup_button(sym)
+            send_telegram("\n".join(lines), reply_markup=btn)
+        log.info(f"News alert: {sym} — {len(new_headlines)} new headlines{' (warmup)' if suppress_send else ''}")
 
     # Clean up symbols that dropped below threshold
     active_syms = set(candidates.keys())
@@ -2994,6 +2996,7 @@ class ScannerThread(threading.Thread):
         self.running = False
         self.previous: dict = {}
         self.count = 0
+        self._warmup = True   # suppress alerts on first cycle
         # ── FIB DT Auto-Strategy ──
         self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
         self._fib_dt_entry = FibDTLiveEntrySync(
@@ -3048,7 +3051,7 @@ class ScannerThread(threading.Thread):
                     break
                 self._process_order_queue()
                 self._process_lookup_queue()
-                _check_news_updates(self.previous)
+                _check_news_updates(self.previous, suppress_send=self._warmup)
                 time_mod.sleep(1)
 
     def _process_order_queue(self):
@@ -3647,7 +3650,7 @@ class ScannerThread(threading.Thread):
             above_vwap = vwap > 0 and price > vwap
             has_news = bool(enrich.get('news'))
 
-            if above_vwap and flt_ok and has_news:
+            if above_vwap and flt_ok and has_news and not self._warmup:
                 _send_stock_report(sym, d, enrich)
                 file_logger.log_alert(ts, {
                     'type': 'new', 'symbol': sym,
@@ -3893,7 +3896,7 @@ class ScannerThread(threading.Thread):
                         batch_syms.append(sym)
 
         # ── Send all alerts as one message ──
-        if batch_alerts:
+        if batch_alerts and not self._warmup:
             # Build keyboard with buttons for all symbols
             keyboard_rows = []
             for s in batch_syms:
@@ -3923,12 +3926,13 @@ class ScannerThread(threading.Thread):
         self._refresh_enrichment_fibs(current)
 
         # ── Daily stats + session tracking + summaries ──
-        new_count = len(set(current) - set(self.previous)) if self.previous else 0
-        _track_daily_stats(current, new_count=new_count)
-        _track_session_stocks(current)
-        _check_stocks_in_play(current)
-        _check_session_summary()
-        _check_daily_summary(positions=self._cached_positions)
+        if not self._warmup:
+            new_count = len(set(current) - set(self.previous)) if self.previous else 0
+            _track_daily_stats(current, new_count=new_count)
+            _track_session_stocks(current)
+            _check_stocks_in_play(current)
+            _check_session_summary()
+            _check_daily_summary(positions=self._cached_positions)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
@@ -3936,6 +3940,9 @@ class ScannerThread(threading.Thread):
             self.on_stocks(merged)
 
         self.previous = current
+        if self._warmup:
+            self._warmup = False
+            log.info("Warmup complete — alerts enabled")
         if self.on_status:
             self.on_status(status)
         log.info(status)
