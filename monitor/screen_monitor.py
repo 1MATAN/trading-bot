@@ -449,6 +449,53 @@ stock_history = StockHistory()
 
 _translator = GoogleTranslator(source='en', target='iw')
 
+
+def _batch_translate(titles_en: list[str]) -> list[str]:
+    """Translate a list of English strings to Hebrew in a single API call."""
+    if not titles_en:
+        return []
+    try:
+        combined = "\n||||\n".join(titles_en)
+        translated = _translator.translate(combined)
+        return translated.split("\n||||\n")
+    except Exception:
+        return list(titles_en)
+
+
+def _find_unfilled_gaps(df: pd.DataFrame, min_gap: float = 0.05) -> list[dict]:
+    """Find price gaps that haven't been filled by subsequent price action.
+
+    Returns list of dicts with keys: idx, bottom, top, pct, up.
+    """
+    n = len(df)
+    if n < 2:
+        return []
+    gaps = []
+    for i in range(1, n):
+        pc = df.iloc[i - 1]['close']
+        co = df.iloc[i]['open']
+        g = co - pc
+        if abs(g) < min_gap or pc <= 0:
+            continue
+        filled = False
+        for j in range(i, n):
+            if g > 0 and df.iloc[j]['low'] <= pc:
+                filled = True
+                break
+            elif g < 0 and df.iloc[j]['high'] >= pc:
+                filled = True
+                break
+        if not filled:
+            gaps.append({
+                'idx': i,
+                'bottom': min(pc, co),
+                'top': max(pc, co),
+                'pct': abs(g) / pc * 100,
+                'up': g > 0,
+            })
+    return gaps
+
+
 # Regex to strip IBKR headline metadata like {A:800015:L:en:K:-0.97:C:0.97}
 import re
 _IBKR_HEADLINE_RE = re.compile(r'\{[^}]*\}\*?\s*')
@@ -551,12 +598,7 @@ def _check_news_updates(current_stocks: dict):
 
         # Translate new headlines
         titles_en = [h['title_en'] for h in new_headlines]
-        try:
-            combined = "\n||||\n".join(titles_en)
-            translated = _translator.translate(combined)
-            titles_he = translated.split("\n||||\n")
-        except Exception:
-            titles_he = titles_en
+        titles_he = _batch_translate(titles_en)
 
         price = d.get('price', 0)
         pct = d.get('pct', 0)
@@ -633,12 +675,7 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
 
         # Batch translate all headlines in one call
         if titles_en:
-            try:
-                combined = "\n||||\n".join(titles_en)
-                translated = _translator.translate(combined)
-                titles_he = translated.split("\n||||\n")
-            except Exception:
-                titles_he = titles_en
+            titles_he = _batch_translate(titles_en)
             for i, title_he in enumerate(titles_he):
                 result['news'].append({
                     'title_he': title_he.strip(),
@@ -799,6 +836,64 @@ def _check_market_reminders():
             _reminders_sent.add(key)
             send_telegram(f"⏰ <b>תזכורת:</b> {m} דקות לפתיחת המסחר!")
             log.info(f"Market reminder sent: {m} min to open")
+
+
+# ══════════════════════════════════════════════════════════
+#  US Market Holiday Calendar
+# ══════════════════════════════════════════════════════════
+
+# NYSE/NASDAQ holidays 2026 (+ early closes marked with *)
+_US_HOLIDAYS_2026 = {
+    '2026-01-01': 'New Year\'s Day',
+    '2026-01-19': 'MLK Day',
+    '2026-02-16': 'Presidents\' Day',
+    '2026-04-03': 'Good Friday',
+    '2026-05-25': 'Memorial Day',
+    '2026-06-19': 'Juneteenth',
+    '2026-07-03': 'Independence Day (observed)',
+    '2026-09-07': 'Labor Day',
+    '2026-11-26': 'Thanksgiving',
+    '2026-12-25': 'Christmas',
+}
+
+_holiday_alert_sent: str = ""  # "YYYY-WW" of last weekly alert
+
+
+def _check_holiday_alerts():
+    """Send weekly alert on Sunday/Monday about upcoming market holidays."""
+    global _holiday_alert_sent
+
+    now_et = datetime.now(ZoneInfo('US/Eastern'))
+    week_key = now_et.strftime('%Y-%W')
+
+    if _holiday_alert_sent == week_key:
+        return
+    # Send on Sunday (6) or Monday (0) between 8:00-9:00
+    if now_et.weekday() not in (6, 0):
+        return
+    if not (8 <= now_et.hour < 9):
+        return
+
+    _holiday_alert_sent = week_key
+
+    # Check next 14 days for holidays
+    upcoming = []
+    for day_offset in range(1, 15):
+        check_date = (now_et + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+        if check_date in _US_HOLIDAYS_2026:
+            upcoming.append((check_date, _US_HOLIDAYS_2026[check_date]))
+
+    if not upcoming:
+        return
+
+    lines = ["📅 <b>חגים בשבועיים הקרובים:</b>"]
+    for date_str, name in upcoming:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        day_name = dt.strftime('%A')
+        lines.append(f"  🔴 {date_str} ({day_name}) — {name}")
+    lines.append("\n⚠️ אין מסחר בימים אלה!")
+    send_telegram("\n".join(lines))
+    log.info(f"Holiday alert sent: {len(upcoming)} upcoming holidays")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1256,6 +1351,7 @@ def _reset_alerts_if_new_day():
         _vwap_side.clear()
         _price_1min.clear()
         _spike_alerted.clear()
+        _52w_alerted.clear()
         _multi_signal_alerted.clear()
         _daily_alert_count.clear()
         _daily_volume_peak.clear()
@@ -1418,6 +1514,36 @@ def check_1min_spike(sym: str, price: float, pct: float) -> str | None:
     return None
 
 
+# ── 52-Week High Breakout ──
+
+_52w_alerted: set[str] = set()  # symbols already alerted today
+
+
+def check_52w_breakout(sym: str, price: float, enrich: dict) -> str | None:
+    """Alert when current price breaks above 52-week high."""
+    if sym in _52w_alerted or price <= 0:
+        return None
+    raw = enrich.get('52w_high', '-')
+    if raw == '-' or not raw:
+        return None
+    try:
+        high_52w = float(str(raw).replace(',', ''))
+    except (ValueError, TypeError):
+        return None
+    if price >= high_52w:
+        _52w_alerted.add(sym)
+        pct_above = (price - high_52w) / high_52w * 100
+        fib_text = _format_fib_text(sym, price)
+        return (
+            f"👑 <b>52W HIGH — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 ${price:.2f}  שבר שיא שנתי!\n"
+            f"🎯 שיא קודם: ${high_52w:.2f}  (+{pct_above:.1f}% מעל)"
+            f"{fib_text}"
+        )
+    return None
+
+
 # ══════════════════════════════════════════════════════════
 #  Stock Enrichment Cache (Finviz + Fib)
 # ══════════════════════════════════════════════════════════
@@ -1503,12 +1629,7 @@ def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -
                 new_sources.append(n['source'])
 
             if new_titles_en:
-                try:
-                    combined = "\n||||\n".join(new_titles_en)
-                    translated = _translator.translate(combined)
-                    titles_he = translated.split("\n||||\n")
-                except Exception:
-                    titles_he = new_titles_en
+                titles_he = _batch_translate(new_titles_en)
                 for i, title_he in enumerate(titles_he):
                     src = new_sources[i] if i < len(new_sources) else ''
                     data['news'].append({
@@ -1706,31 +1827,7 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                 last_y_right = lv
 
         # ── Unfilled gap detection on chart (≥ $0.05) ──
-        # A gap is "filled" when subsequent price action returns to the pre-gap close.
-        # Gap up filled when any later bar's low ≤ prev_close (bottom of gap).
-        # Gap down filled when any later bar's high ≥ prev_close (top of gap).
-        open_gaps: list[dict] = []
-        for i in range(1, n_bars):
-            prev_close_val = df.iloc[i - 1]['close']
-            cur_open = df.iloc[i]['open']
-            gap_abs = cur_open - prev_close_val
-            if abs(gap_abs) >= 0.05:
-                # Check if any subsequent bar filled this gap
-                filled = False
-                for j in range(i, n_bars):
-                    if gap_abs > 0 and df.iloc[j]['low'] <= prev_close_val:
-                        filled = True
-                        break
-                    elif gap_abs < 0 and df.iloc[j]['high'] >= prev_close_val:
-                        filled = True
-                        break
-                if not filled:
-                    gap_pct = abs(gap_abs) / prev_close_val * 100 if prev_close_val > 0 else 0
-                    open_gaps.append({
-                        'idx': i, 'bottom': min(prev_close_val, cur_open),
-                        'top': max(prev_close_val, cur_open),
-                        'pct': gap_pct, 'up': gap_abs > 0,
-                    })
+        open_gaps = _find_unfilled_gaps(df)
 
         for g in open_gaps:
             color = '#26a69a' if g['up'] else '#ef5350'
@@ -1882,32 +1979,13 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     # Unfilled gap detection from daily data (threshold: $0.05)
     df_daily = ma_frames.get('D')
     if df_daily is not None and len(df_daily) >= 2 and price > 0:
-        n_d = len(df_daily)
-        unfilled_gaps = []
-        for i in range(1, n_d):
-            pc = df_daily.iloc[i - 1]['close']
-            co = df_daily.iloc[i]['open']
-            g_abs = co - pc
-            if abs(g_abs) < 0.05 or pc <= 0:
-                continue
-            # Check if any subsequent bar filled this gap
-            filled = False
-            for j in range(i, n_d):
-                if g_abs > 0 and df_daily.iloc[j]['low'] <= pc:
-                    filled = True
-                    break
-                elif g_abs < 0 and df_daily.iloc[j]['high'] >= pc:
-                    filled = True
-                    break
-            if not filled:
-                g_pct = g_abs / pc * 100
-                unfilled_gaps.append((g_abs, g_pct, co, pc))
+        unfilled_gaps = _find_unfilled_gaps(df_daily)
         if unfilled_gaps:
             lines.append(f"🕳️ גאפים פתוחים ({len(unfilled_gaps)}):")
-            for g_abs, g_pct, co, pc in unfilled_gaps[-3:]:  # show last 3
-                bottom, top = (pc, co) if g_abs > 0 else (co, pc)
-                icon = "⬆️" if g_abs > 0 else "⬇️"
-                lines.append(f"  {icon} ${bottom:.2f}—${top:.2f} ({g_pct:+.1f}%)")
+            for g in unfilled_gaps[-3:]:  # show last 3
+                icon = "⬆️" if g['up'] else "⬇️"
+                pct = g['pct'] if g['up'] else -g['pct']
+                lines.append(f"  {icon} ${g['bottom']:.2f}—${g['top']:.2f} ({pct:+.1f}%)")
 
     # Resist line
     if resist_str:
@@ -3125,6 +3203,7 @@ class ScannerThread(threading.Thread):
 
     def _cycle(self):
         _check_market_reminders()
+        _check_holiday_alerts()
         _reset_alerts_if_new_day()
         current = _run_ibkr_scan(self.price_min, self.price_max)
         if not current and not self.previous:
@@ -3239,24 +3318,38 @@ class ScannerThread(threading.Thread):
             else:
                 status += "  ✓"
 
-        # ── Milestone alerts (+5% steps, including corrections) ──
+        # ── Batch alerts: milestone + volume + 52w ──
+        batch_alerts: list[str] = []
+
         for sym, d in current.items():
             ms_msg = check_milestone(sym, d['pct'], d['price'])
             if ms_msg:
                 spike, ratio = _check_1min_volume_spike(sym)
                 if spike:
-                    send_telegram(ms_msg)
+                    batch_alerts.append(ms_msg)
                     status += f"  📈{sym}"
                 else:
                     log.info(f"Milestone {sym} skipped: 1min vol ratio {ratio}x < {MILESTONE_VOL_RATIO}x")
 
-        # ── Volume anomaly checks ──
-        for sym, d in current.items():
             if sym in _enrichment and d.get('volume_raw', 0) > 0:
                 vol_msg = check_volume_anomaly(sym, d['volume_raw'], _enrichment[sym])
                 if vol_msg:
-                    send_telegram(vol_msg)
+                    batch_alerts.append(vol_msg)
                     status += f"  🔥{sym}"
+
+            if sym in _enrichment:
+                w52_msg = check_52w_breakout(sym, d['price'], _enrichment[sym])
+                if w52_msg:
+                    batch_alerts.append(w52_msg)
+                    status += f"  👑{sym}"
+
+        if batch_alerts:
+            if len(batch_alerts) == 1:
+                send_telegram(batch_alerts[0])
+            else:
+                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
+                header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
+                send_telegram(header + "\n\n".join(batch_alerts))
 
         # ── Real-time alerts (5 types, score-filtered + multi-signal) ──
         if not is_baseline and current:
