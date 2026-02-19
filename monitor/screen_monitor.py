@@ -83,6 +83,10 @@ LOG_TXT = DATA_DIR / "monitor_log.txt"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/tmp/monitor.log"),
+    ],
 )
 log = logging.getLogger("monitor")
 
@@ -4532,11 +4536,11 @@ class App:
             return
 
         if action == 'BUY':
-            bp = self._cached_buying_power
-            if bp <= 0:
+            nl = self._cached_net_liq
+            if nl <= 0:
                 messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
                 return
-            qty = int(bp * pct / price)
+            qty = int(nl * pct / price)
             if qty <= 0:
                 messagebox.showwarning("Qty Too Low",
                                        f"Not enough buying power for {pct*100:.0f}%.",
