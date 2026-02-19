@@ -24,9 +24,10 @@ import logging
 import os
 import queue
 import threading
+import re
 import time as time_mod
 import tkinter as tk
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from tkinter import messagebox
@@ -96,6 +97,23 @@ _ibkr_fail_count: int = 0            # consecutive failures (for backoff)
 _IBKR_BACKOFF_BASE = 5               # initial backoff seconds
 _IBKR_BACKOFF_MAX = 120              # max backoff seconds
 _IBKR_MAX_RETRIES = 3                # retries per _get_ibkr call
+
+# ── Contract cache (avoid repeated qualifyContracts round-trips) ──
+_contract_cache: dict[str, Stock] = {}
+
+
+def _get_contract(sym: str) -> Stock | None:
+    """Get a qualified Stock contract, using cache when available."""
+    if sym in _contract_cache:
+        return _contract_cache[sym]
+    ib = _get_ibkr()
+    if not ib:
+        return None
+    contract = Stock(sym, 'SMART', 'USD')
+    ib.qualifyContracts(contract)
+    if contract.conId:
+        _contract_cache[sym] = contract
+    return contract
 
 
 def _get_ibkr() -> IB | None:
@@ -305,6 +323,9 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             if sym not in seen_syms:
                 seen_syms.add(sym)
                 valid_items.append((sym, contract))
+                # Cache scanner contract (already qualified by IBKR)
+                if contract.conId and sym not in _contract_cache:
+                    _contract_cache[sym] = contract
                 added += 1
         log.debug(f"Scan [{scan_code}]: {len(results)} raw → {added} new unique")
 
@@ -400,15 +421,14 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 class StockHistory:
     """Track price/pct history for each stock across scans."""
 
+    _MAX_ENTRIES = 3600  # ~2 hours at 2s intervals
+
     def __init__(self):
-        # {symbol: [(timestamp, price, pct), ...]}
-        self.data = defaultdict(list)
+        # {symbol: deque of (timestamp, price, pct)}
+        self.data: dict[str, deque] = defaultdict(lambda: deque(maxlen=StockHistory._MAX_ENTRIES))
 
     def record(self, symbol: str, price: float, pct: float):
         self.data[symbol].append((datetime.now(), price, pct))
-        # Keep last 2 hours max
-        cutoff = datetime.now() - timedelta(hours=2)
-        self.data[symbol] = [(t, p, pc) for t, p, pc in self.data[symbol] if t > cutoff]
 
     def get_momentum(self, symbol: str) -> dict:
         """Calculate pct change over different time windows."""
@@ -507,7 +527,6 @@ def _find_unfilled_gaps(df: pd.DataFrame, min_gap: float = 0.05) -> list[dict]:
 
 
 # Regex to strip IBKR headline metadata like {A:800015:L:en:K:-0.97:C:0.97}
-import re
 _IBKR_HEADLINE_RE = re.compile(r'\{[^}]*\}\*?\s*')
 
 
@@ -520,8 +539,9 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
     if not ib:
         return []
     try:
-        contract = Stock(symbol, 'SMART', 'USD')
-        ib.qualifyContracts(contract)
+        contract = _get_contract(symbol)
+        if not contract or not contract.conId:
+            return []
         providers = 'DJ-N+DJ-RT+FLY+BRFG+BRFUPDN'
         headlines = ib.reqHistoricalNews(contract.conId, providers, '', '', max_news)
         if not headlines:
@@ -719,8 +739,9 @@ def _check_1min_volume_spike(sym: str) -> tuple[bool, float]:
     if not ib:
         return True, 0.0  # no connection — don't block alert
     try:
-        contract = Stock(sym, 'SMART', 'USD')
-        ib.qualifyContracts(contract)
+        contract = _get_contract(sym)
+        if not contract:
+            return True, 0.0
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr='300 S',
             barSizeSetting='1 min', whatToShow='TRADES', useRTH=False,
@@ -1581,6 +1602,10 @@ def _reset_alerts_if_new_day():
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
+        _contract_cache.clear()
+        _enrichment.clear()
+        _enrichment_ts.clear()
+        _intraday_cache.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -2326,8 +2351,9 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
         log.error(f"No IBKR connection for {symbol} daily download")
         return None
     try:
-        contract = Stock(symbol, 'SMART', 'USD')
-        ib.qualifyContracts(contract)
+        contract = _get_contract(symbol)
+        if not contract:
+            return None
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr='5 Y',
             barSizeSetting='1 day', whatToShow='TRADES', useRTH=False,
@@ -2343,19 +2369,30 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
     return None
 
 
+_intraday_cache: dict[str, tuple[float, pd.DataFrame]] = {}  # key → (timestamp, df)
+_INTRADAY_CACHE_TTL = 120  # 2 minutes
+
+
 def _download_intraday(symbol: str, bar_size: str = '5 mins',
                        duration: str = '3 D') -> pd.DataFrame | None:
-    """Download intraday bars from IBKR.
+    """Download intraday bars from IBKR (cached for 2 min per symbol+bar_size).
 
     Returns DataFrame with OHLCV columns, or None on failure.
     """
+    cache_key = f"{symbol}_{bar_size}"
+    if cache_key in _intraday_cache:
+        cached_ts, cached_df = _intraday_cache[cache_key]
+        if time_mod.time() - cached_ts < _INTRADAY_CACHE_TTL:
+            return cached_df
+
     ib = _get_ibkr()
     if not ib:
         log.error(f"No IBKR connection for {symbol} intraday download")
         return None
     try:
-        contract = Stock(symbol, 'SMART', 'USD')
-        ib.qualifyContracts(contract)
+        contract = _get_contract(symbol)
+        if not contract:
+            return None
         bars = ib.reqHistoricalData(
             contract, endDateTime='', durationStr=duration,
             barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False,
@@ -2364,6 +2401,7 @@ def _download_intraday(symbol: str, bar_size: str = '5 mins',
             df = ib_util.df(bars)
             if len(df) >= 5:
                 log.info(f"IBKR: {symbol} {len(df)} intraday bars ({bar_size})")
+                _intraday_cache[cache_key] = (time_mod.time(), df)
                 return df
     except Exception as e:
         log.warning(f"IBKR intraday {symbol}: {e}")
@@ -2430,83 +2468,6 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     above = [l for l in all_levels if l > current_price][:10]
     return below, above
 
-
-def format_fib_levels(symbol: str, current_price: float,
-                      below: list[float], above: list[float]) -> str:
-    """Format fib levels for Telegram message."""
-    lines = [f"📐 <b>{symbol} — פיבונאצ'י</b>  (${current_price:.2f})"]
-
-    if above:
-        above_str = "  ".join(f"${p:.4f}" for p in above)
-        lines.append(f"  ⬆️ מעל: {above_str}")
-
-    if below:
-        below_str = "  ".join(f"${p:.4f}" for p in below)
-        lines.append(f"  ⬇️ מתחת: {below_str}")
-
-    if not above and not below:
-        lines.append("  ❌ אין נתונים")
-
-    return "\n".join(lines)
-
-
-# ── Fib Touch Detection ─────────────────────────────────
-
-FIB_TOUCH_PCT = 0.8  # within 0.8% of a fib level = "touch"
-
-# {symbol: set of level prices already alerted}
-_fib_alerted: dict[str, set[float]] = {}
-
-
-def check_fib_touch(symbol: str, price: float) -> str | None:
-    """Check if price is touching a Fibonacci level.
-
-    Returns alert message or None. Only alerts once per level.
-    """
-    if price <= 0:
-        return None
-
-    # Ensure fib levels are calculated
-    if symbol not in _fib_cache:
-        calc_fib_levels(symbol, price)
-    if symbol not in _fib_cache:
-        return None
-
-    _, _, all_levels, *_ = _fib_cache[symbol]
-    if symbol not in _fib_alerted:
-        _fib_alerted[symbol] = set()
-
-    threshold = price * FIB_TOUCH_PCT / 100
-
-    for lv in all_levels:
-        if abs(price - lv) <= threshold:
-            # Round to avoid float noise in the set
-            lv_key = round(lv, 4)
-            if lv_key in _fib_alerted[symbol]:
-                continue
-
-            _fib_alerted[symbol].add(lv_key)
-
-            # Determine support or resistance
-            if price >= lv:
-                tag = "תמיכה ⬇️"
-            else:
-                tag = "התנגדות ⬆️"
-
-            return (
-                f"📐 <b>{symbol}</b> נוגע ברמת פיבו!\n"
-                f"  {tag}  ${lv:.4f}\n"
-                f"  מחיר: ${price:.2f}  (מרחק: {abs(price - lv):.4f})"
-            )
-
-    # Clear old alerts if price moved away from all alerted levels
-    to_clear = set()
-    for alerted_lv in _fib_alerted[symbol]:
-        if abs(price - alerted_lv) > threshold * 3:
-            to_clear.add(alerted_lv)
-    _fib_alerted[symbol] -= to_clear
-
-    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -2957,6 +2918,8 @@ class ScannerThread(threading.Thread):
                 log.error(f"Scanner cycle error: {e}")
                 if self.on_status:
                     self.on_status(f"Error: {e}")
+                # Backoff on error to prevent spin loop
+                time_mod.sleep(5)
             for _ in range(self.freq):
                 if not self.running:
                     break
@@ -3004,9 +2967,8 @@ class ScannerThread(threading.Thread):
 
         # ── Get current price from IBKR ──
         try:
-            contract = Stock(sym, 'SMART', 'USD')
-            ib.qualifyContracts(contract)
-            if not contract.conId:
+            contract = _get_contract(sym)
+            if not contract or not contract.conId:
                 send_telegram_to(chat_id, f"❌ <b>{sym}</b> — סימבול לא נמצא", reply_to=message_id)
                 return
             bars = ib.reqHistoricalData(
@@ -3087,8 +3049,9 @@ class ScannerThread(threading.Thread):
             return
 
         try:
-            contract = Stock(sym, 'SMART', 'USD')
-            ib.qualifyContracts(contract)
+            contract = _get_contract(sym)
+            if not contract:
+                raise RuntimeError(f"Could not qualify contract for {sym}")
             order = LimitOrder(action, qty, price)
             order.outsideRth = True
             order.tif = 'DAY'
@@ -3119,8 +3082,9 @@ class ScannerThread(threading.Thread):
         other_half = req['other_half']
 
         try:
-            contract = Stock(sym, 'SMART', 'USD')
-            ib.qualifyContracts(contract)
+            contract = _get_contract(sym)
+            if not contract:
+                raise RuntimeError(f"Could not qualify contract for {sym}")
 
             # 1. Market buy full qty
             buy_order = MarketOrder('BUY', qty)
@@ -4611,6 +4575,10 @@ class App:
         self.root.mainloop()
         if self.scanner:
             self.scanner.stop()
+        # Graceful IBKR disconnect
+        if _ibkr and _ibkr.isConnected():
+            log.info("Disconnecting IBKR...")
+            _ibkr.disconnect()
 
 
 if __name__ == "__main__":
