@@ -51,7 +51,7 @@ from strategies.fib_dt_live_strategy import (
 from strategies.fib_dt_live_entry import FibDTLiveEntrySync
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
-    MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_MAX_RESULTS,
+    MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_CODES, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT,
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
@@ -266,40 +266,49 @@ _avg_vol_cache_day: str = ""  # "YYYY-MM-DD" — reset cache daily
 
 def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                    price_max: float = MONITOR_PRICE_MAX) -> dict:
-    """Run IBKR scanner and enrich each symbol with historical data.
+    """Run multiple IBKR scanners and merge results.
 
-    Returns dict in the same format as the old ``parse_scanner_data()``:
-        {symbol: {'price': float, 'pct': float, 'volume': str, 'float': str}}
+    Runs TOP_PERC_GAIN + HOT_BY_VOLUME + MOST_ACTIVE for broad coverage
+    across pre-market, market, and after-hours sessions.
+
+    Returns dict: {symbol: {'price': float, 'pct': float, 'volume': str, ...}}
     """
     ib = _get_ibkr()
     if not ib:
         return {}
 
-    sub = ScannerSubscription(
-        instrument="STK",
-        locationCode="STK.US.MAJOR",
-        scanCode=MONITOR_SCAN_CODE,
-        numberOfRows=MONITOR_SCAN_MAX_RESULTS,
-        abovePrice=price_min,
-        belowPrice=price_max,
-    )
+    # ── Phase 1: Run all scan types and collect unique contracts ──
+    valid_items: list[tuple[str, object]] = []  # (sym, contract)
+    seen_syms: set[str] = set()
 
-    try:
-        results = ib.reqScannerData(sub)
-    except Exception as e:
-        log.error(f"reqScannerData failed: {e}")
-        return {}
+    for scan_code in MONITOR_SCAN_CODES:
+        sub = ScannerSubscription(
+            instrument="STK",
+            locationCode="STK.US.MAJOR",
+            scanCode=scan_code,
+            numberOfRows=MONITOR_SCAN_MAX_RESULTS,
+            abovePrice=price_min,
+            belowPrice=price_max,
+        )
+        try:
+            results = ib.reqScannerData(sub)
+        except Exception as e:
+            log.error(f"reqScannerData ({scan_code}) failed: {e}")
+            continue
+
+        added = 0
+        for item in results:
+            contract = item.contractDetails.contract
+            sym = contract.symbol
+            if not sym or not sym.isalpha() or len(sym) > 5:
+                continue
+            if sym not in seen_syms:
+                seen_syms.add(sym)
+                valid_items.append((sym, contract))
+                added += 1
+        log.debug(f"Scan [{scan_code}]: {len(results)} raw → {added} new unique")
 
     stocks: dict[str, dict] = {}
-
-    # ── Phase 1: Collect valid contracts ──
-    valid_items: list[tuple[str, object]] = []  # (sym, contract)
-    for item in results:
-        contract = item.contractDetails.contract
-        sym = contract.symbol
-        if not sym or not sym.isalpha() or len(sym) > 5:
-            continue
-        valid_items.append((sym, contract))
 
     # ── Phase 2: Enrich with historical data ──
     for sym, stock_contract in valid_items:
@@ -380,7 +389,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             continue
 
     session = _get_market_session()
-    log.info(f"Scanner [{session}]: {len(results)} raw → {len(stocks)} enriched symbols")
+    log.info(f"Scanner [{session}]: {len(valid_items)} unique from {len(MONITOR_SCAN_CODES)} scans → {len(stocks)} enriched symbols")
     return stocks
 
 
@@ -748,7 +757,14 @@ def _format_fib_text(sym: str, price: float) -> str:
     def _fmt(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
         r = f"({info[0]})" if info else ""
-        return f"${lv:.4f} {r}"
+        # Smart rounding: ≥$1 → 2dp, ≥$0.1 → 3dp, else 4dp
+        if lv >= 1:
+            p = f"${lv:.2f}"
+        elif lv >= 0.1:
+            p = f"${lv:.3f}"
+        else:
+            p = f"${lv:.4f}"
+        return f"{p} {r}"
 
     def _rows(levels: list[float]) -> list[str]:
         """Group levels into rows of 3."""
@@ -759,7 +775,11 @@ def _format_fib_text(sym: str, price: float) -> str:
         return result
 
     lines = ["\n📐 <b>פיבונאצ'י:</b>"]
-    lines.append(f"🕯 נר עוגן: L ${anchor_low:.4f} — H ${anchor_high:.4f}  ({anchor_date})")
+    def _p(v: float) -> str:
+        if v >= 1: return f"${v:.2f}"
+        if v >= 0.1: return f"${v:.3f}"
+        return f"${v:.4f}"
+    lines.append(f"🕯 נר עוגן: L {_p(anchor_low)} — H {_p(anchor_high)}  ({anchor_date})")
     if above:
         lines.append("⬆️ " + " | ".join(_fmt(lv) for lv in above[:3]))
         lines.extend(_rows(above[3:]))
@@ -1597,7 +1617,7 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
     if sym not in _fib_cache:
         return None
 
-    _, _, all_levels, ratio_map = _fib_cache[sym]
+    _, _, all_levels, ratio_map, *_ = _fib_cache[sym]
     if sym not in _fib_touch_tracker:
         _fib_touch_tracker[sym] = {}
 
@@ -2291,9 +2311,9 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
 #  Fibonacci Levels (WTS Method)
 # ══════════════════════════════════════════════════════════
 
-# Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted, ratio_map)}
+# Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted, ratio_map, anchor_date)}
 # ratio_map: {price: (ratio, "S1"|"S2")}
-_fib_cache: dict[str, tuple[float, float, list[float], dict]] = {}
+_fib_cache: dict[str, tuple] = {}
 
 # Cache daily DataFrames for chart generation (filled by _download_daily)
 _daily_cache: dict[str, pd.DataFrame] = {}
@@ -2452,7 +2472,7 @@ def check_fib_touch(symbol: str, price: float) -> str | None:
     if symbol not in _fib_cache:
         return None
 
-    _, _, all_levels, _ = _fib_cache[symbol]
+    _, _, all_levels, *_ = _fib_cache[symbol]
     if symbol not in _fib_alerted:
         _fib_alerted[symbol] = set()
 
@@ -3485,12 +3505,14 @@ class ScannerThread(threading.Thread):
         is_baseline = not self.previous
 
         # ── Determine which stocks need enrichment ──
-        if is_baseline:
-            # First scan: enrich ALL for GUI, but NO Telegram flood
-            new_syms = list(current.keys())
-        else:
-            # Subsequent: only truly new stocks
-            new_syms = list(set(current) - set(self.previous))
+        # Only enrich momentum candidates: ≥20% change (saves ~5 min vs all 50)
+        MIN_ENRICH_PCT = 20.0
+        new_syms = [sym for sym in current
+                    if current[sym].get('pct', 0) >= MIN_ENRICH_PCT
+                    and sym not in _enrichment]
+        skipped = len(current) - len(new_syms) - sum(1 for s in current if s in _enrichment)
+        if skipped > 0:
+            log.info(f"Enrichment filter: {len(new_syms)} stocks ≥{MIN_ENRICH_PCT}% (skipped {skipped} below threshold)")
 
         # ── Enrich stocks (Finviz + Fib) ──
         enriched_count = 0
@@ -3502,26 +3524,26 @@ class ScannerThread(threading.Thread):
                 self.on_status(f"#{self.count}  Enriching {sym}... ({enriched_count+1}/{len(new_syms)})")
             _enrich_stock(sym, d['price'], on_status=self.on_status)
 
-            if not is_baseline:
-                # Filter: only send Telegram if above VWAP + ≥20% + float <70M
-                vwap = d.get('vwap', 0)
-                pct = d.get('pct', 0)
-                price = d.get('price', 0)
-                flt_shares = _parse_float_to_shares(_enrichment[sym].get('float', '-'))
-                flt_ok = 0 < flt_shares < 70_000_000
-                above_vwap = vwap > 0 and price > vwap
-                above_pct = pct >= 20
+            # Filter: send Telegram report if above VWAP + float <70M + has news
+            enrich = _enrichment.get(sym, {})
+            vwap = d.get('vwap', 0)
+            pct = d.get('pct', 0)
+            price = d.get('price', 0)
+            flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
+            flt_ok = 0 < flt_shares < 70_000_000
+            above_vwap = vwap > 0 and price > vwap
+            has_news = bool(enrich.get('news'))
 
-                if above_vwap and above_pct and flt_ok:
-                    _send_stock_report(sym, d, _enrichment[sym])
-                    file_logger.log_alert(ts, {
-                        'type': 'new', 'symbol': sym,
-                        'price': d['price'], 'pct': d['pct'],
-                        'volume': d.get('volume', ''),
-                        'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
-                    })
-                else:
-                    log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={_enrichment[sym].get('float', '-')}")
+            if above_vwap and flt_ok and has_news:
+                _send_stock_report(sym, d, enrich)
+                file_logger.log_alert(ts, {
+                    'type': 'new', 'symbol': sym,
+                    'price': d['price'], 'pct': d['pct'],
+                    'volume': d.get('volume', ''),
+                    'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
+                })
+            else:
+                log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={enrich.get('float', '-')} news={'yes' if has_news else 'no'}")
 
             enriched_count += 1
             # Live-update GUI after each enrichment
@@ -3537,20 +3559,28 @@ class ScannerThread(threading.Thread):
 
         # ── Baseline: send single summary to Telegram ──
         if is_baseline and current:
-            top5 = sorted(current.items(), key=lambda x: x[1]['pct'], reverse=True)[:5]
+            # Show only momentum stocks (≥20%) with enrichment data
+            momentum = [(s, d) for s, d in current.items()
+                        if d.get('pct', 0) >= MIN_ENRICH_PCT and s in _enrichment]
+            momentum.sort(key=lambda x: x[1]['pct'], reverse=True)
             session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
                              'after_hours': 'After-Hours', 'closed': 'Closed'}
             sess = session_label.get(_get_market_session(), 'Unknown')
-            summary_lines = [f"📡 <b>Scanner started</b> [{sess}] — {len(current)} stocks"]
-            for sym, d in top5:
+            total = len(current)
+            mom_count = len(momentum)
+            summary_lines = [f"📡 <b>Scanner started</b> [{sess}] — {mom_count} momentum / {total} total"]
+            for sym, d in momentum[:5]:
                 e = _enrichment.get(sym, {})
                 flt = e.get('float', '-')
                 short = e.get('short', '-')
+                news_flag = "📰" if e.get('news') else ""
                 summary_lines.append(
-                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short}"
+                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short} {news_flag}"
                 )
-            if len(current) > 5:
-                summary_lines.append(f"  ... +{len(current)-5} more")
+            if mom_count > 5:
+                summary_lines.append(f"  ... +{mom_count-5} more")
+            elif mom_count == 0:
+                summary_lines.append("  אין מניות מעל 20% כרגע")
             send_telegram("\n".join(summary_lines))
 
         # ── Anomaly detection (only after baseline) ──
@@ -3578,8 +3608,10 @@ class ScannerThread(threading.Thread):
         batch_alerts: list[str] = []
         batch_syms: list[str] = []  # unique symbols for keyboard buttons
 
-        # Milestone + Volume + 52W
+        # Milestone + Volume + 52W (only enriched momentum stocks)
         for sym, d in current.items():
+            if sym not in _enrichment:
+                continue
             ms_msg = check_milestone(sym, d['pct'], d['price'])
             if ms_msg:
                 spike, ratio = _check_1min_volume_spike(sym)
@@ -3618,8 +3650,10 @@ class ScannerThread(threading.Thread):
 
         # Real-time alerts (5 types, score-filtered + multi-signal)
         if not is_baseline and current:
-            # Update daily volume peaks for all stocks in this cycle
+            # Update daily volume peaks for enriched stocks only
             for sym, d in current.items():
+                if sym not in _enrichment:
+                    continue
                 vol_raw = d.get('volume_raw', 0)
                 if vol_raw > _daily_volume_peak.get(sym, 0):
                     _daily_volume_peak[sym] = vol_raw
@@ -3631,6 +3665,8 @@ class ScannerThread(threading.Thread):
                 vol_top3 = {s for s, _ in sorted_vol[:3]}
 
             for sym, d in current.items():
+                if sym not in _enrichment:
+                    continue
                 price = d['price']
                 pct = d.get('pct', 0)
                 score, reasons = _calc_alert_score(sym, d)
@@ -3952,6 +3988,8 @@ class App:
 
         self._load()
         self.root.after(500, self._check_connection)
+        # Auto-start scanner on launch
+        self.root.after(1000, self._toggle)
 
     def _check_connection(self):
         """Check IBKR connection status (read-only, never creates connection).
