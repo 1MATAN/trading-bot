@@ -690,7 +690,7 @@ def _check_1min_volume_spike(sym: str) -> tuple[bool, float]:
 
 
 def _format_fib_text(sym: str, price: float) -> str:
-    """Build fib levels text — highest at top, lowest at bottom (like a chart)."""
+    """Build compact fib levels text — 3 per row with ratio labels."""
     # Recalculate if needed (auto-advance when price exceeds top level)
     if price > 0:
         calc_fib_levels(sym, price)
@@ -699,23 +699,36 @@ def _format_fib_text(sym: str, price: float) -> str:
         return ""
     all_levels = cached[2]
     ratio_map = cached[3]
-    above = [lv for lv in all_levels if lv > price][:6]
-    below = [lv for lv in all_levels if lv <= price][-3:]
+    anchor_low = cached[0]
+    anchor_high = cached[1]
+    anchor_date = cached[4] if len(cached) > 4 else ""
+    above = [lv for lv in all_levels if lv > price][:10]
+    below = [lv for lv in all_levels if lv <= price][-5:]
     if not above and not below:
         return ""
+
+    def _fmt(lv: float) -> str:
+        info = ratio_map.get(round(lv, 4))
+        r = f"({info[0]})" if info else ""
+        return f"${lv:.4f} {r}"
+
+    def _rows(levels: list[float]) -> list[str]:
+        """Group levels into rows of 3."""
+        result = []
+        for i in range(0, len(levels), 3):
+            chunk = levels[i:i + 3]
+            result.append("   " + " | ".join(_fmt(lv) for lv in chunk))
+        return result
+
     lines = ["\n📐 <b>פיבונאצ'י:</b>"]
-    # Above: highest first (top of chart)
-    for lv in reversed(above):
-        info = ratio_map.get(round(lv, 4))
-        ratio_label = f"  ({info[0]} {info[1]})" if info else ""
-        lines.append(f"  🟢 ${lv:.4f}{ratio_label}")
-    # Current price separator
-    lines.append(f"  ━━ ${price:.2f} ━━")
-    # Below: highest first (closest to price at top)
-    for lv in reversed(below):
-        info = ratio_map.get(round(lv, 4))
-        ratio_label = f"  ({info[0]} {info[1]})" if info else ""
-        lines.append(f"  🔴 ${lv:.4f}{ratio_label}")
+    lines.append(f"🕯 נר עוגן: L ${anchor_low:.4f} — H ${anchor_high:.4f}  ({anchor_date})")
+    if above:
+        lines.append("⬆️ " + " | ".join(_fmt(lv) for lv in above[:3]))
+        lines.extend(_rows(above[3:]))
+    lines.append(f"━━━ ${price:.2f} ━━━")
+    if below:
+        lines.append("⬇️ " + " | ".join(_fmt(lv) for lv in below[:3]))
+        lines.extend(_rows(below[3:]))
     return "\n".join(lines)
 
 
@@ -2012,7 +2025,7 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     """
     cached = _fib_cache.get(symbol)
     if cached:
-        anchor_low, anchor_high, all_levels, _ratio_map = cached
+        anchor_low, anchor_high, all_levels, _ratio_map, *_ = cached
         # Invalidate cache if price exceeded the top cached level (needs re-advance)
         if all_levels and current_price > all_levels[-1]:
             log.info(f"Fib cache invalidated for {symbol}: price ${current_price:.2f} > top level ${all_levels[-1]:.4f}")
@@ -2028,7 +2041,7 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
         if anchor is None:
             return [], []
 
-        anchor_low, anchor_high, _ = anchor
+        anchor_low, anchor_high, anchor_date = anchor
 
         dual = build_dual_series(anchor_low, anchor_high)
         all_levels = set()
@@ -2058,10 +2071,10 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
                 deduped.append(lv)
         all_levels = deduped
 
-        _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map)
+        _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map, anchor_date)
 
-    below = [l for l in all_levels if l <= current_price][-3:]
-    above = [l for l in all_levels if l > current_price][:6]
+    below = [l for l in all_levels if l <= current_price][-5:]
+    above = [l for l in all_levels if l > current_price][:10]
     return below, above
 
 
