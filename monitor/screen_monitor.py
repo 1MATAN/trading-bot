@@ -1050,6 +1050,12 @@ def _check_session_summary():
             f"━━━━━━━━━━━━━━━━━━",
         ]
 
+        # Collect unique symbols from both lists for detail section
+        seen_syms = []
+        for sym, _ in by_pct + by_vol:
+            if sym not in seen_syms:
+                seen_syms.append(sym)
+
         if by_pct:
             lines.append("")
             lines.append("🏆 <b>אחוזים:</b>")
@@ -1057,8 +1063,10 @@ def _check_session_summary():
                 arrow = "🟢" if info['pct'] > 0 else "🔴"
                 vol = info.get('volume_raw', 0)
                 vol_str = _format_volume(vol) if vol else '-'
+                enrich = _enrichment.get(sym, {})
+                flt = enrich.get('float', '-')
                 lines.append(
-                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}"
+                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}  Float:{flt}"
                 )
 
         if by_vol:
@@ -1067,9 +1075,26 @@ def _check_session_summary():
             for i, (sym, info) in enumerate(by_vol, 1):
                 vol = info.get('volume_raw', 0)
                 vol_str = _format_volume(vol) if vol else '-'
+                enrich = _enrichment.get(sym, {})
+                flt = enrich.get('float', '-')
                 lines.append(
-                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}"
+                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}  Float:{flt}"
                 )
+
+        # News section — show latest headline per stock
+        news_lines = []
+        for sym in seen_syms:
+            enrich = _enrichment.get(sym, {})
+            news = enrich.get('news', [])
+            if news:
+                latest = news[0]
+                title = latest.get('title_he', latest.get('title_en', ''))
+                if title:
+                    news_lines.append(f"  • <b>{sym}</b>: {title}")
+        if news_lines:
+            lines.append("")
+            lines.append("📰 <b>חדשות:</b>")
+            lines.extend(news_lines)
 
         lines.append(f"\n📈 סה\"כ מניות בסקאנר: {len(_session_stocks)}")
         send_telegram("\n".join(lines))
