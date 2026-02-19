@@ -2900,60 +2900,53 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
 # ══════════════════════════════════════════════════════════
 
 # Thresholds
-PCT_JUMP_THRESHOLD = 5.0    # % change jumps by 5+ between scans
-PRICE_JUMP_THRESHOLD = 3.0  # price moves 3%+ between scans
+MOMENTUM_1MIN_PCT = 7.0       # alert when price moves 7%+ in 1 minute
+MOMENTUM_COOLDOWN_SEC = 180   # 3 minute cooldown per symbol
+_momentum_last_alert: dict[str, float] = {}  # {sym: timestamp}
 
-def detect_anomalies(current: dict, previous: dict) -> list[dict]:
-    """Only flag truly unusual events."""
+
+def detect_momentum_alerts(current: dict) -> list[dict]:
+    """Detect stocks that moved ≥7% in price over the last 1 minute.
+
+    Uses stock_history data (timestamp, price, pct) to compare current
+    price vs price ~60 seconds ago. Simple, clear, no confusion between
+    points/percent/price.
+    """
     alerts = []
+    now = time_mod.time()
 
-    # New stock appeared in scanner
-    for sym in set(current) - set(previous):
-        d = current[sym]
-        alerts.append({
-            'type': 'new',
-            'symbol': sym,
-            'price': d['price'],
-            'pct': d['pct'],
-            'volume': d.get('volume', ''),
-            'float': d.get('float', ''),
-            'fetch_news': True,
-            'msg': f"🆕 {sym} appeared: ${d['price']:.2f}  {d['pct']:+.1f}%  Vol:{d.get('volume','-')}  Float:{d.get('float','-')}"
-        })
-
-    # Existing stocks — check for big moves
-    for sym in current:
-        if sym not in previous:
+    for sym, d in current.items():
+        # Cooldown check
+        last = _momentum_last_alert.get(sym, 0)
+        if now - last < MOMENTUM_COOLDOWN_SEC:
             continue
-        c, p = current[sym], previous[sym]
 
-        # % change jumped significantly
-        if p['pct'] != 0 and c['pct'] != 0:
-            diff = c['pct'] - p['pct']
-            if abs(diff) >= PCT_JUMP_THRESHOLD:
-                direction = "⬆️" if diff > 0 else "⬇️"
-                alerts.append({
-                    'type': 'pct_jump',
-                    'symbol': sym,
-                    'before': p['pct'],
-                    'after': c['pct'],
-                    'diff': diff,
-                    'msg': f"{direction} {sym} moved {diff:+.1f}%  ({p['pct']:+.1f}% → {c['pct']:+.1f}%)  Price: ${c['price']:.2f}"
-                })
+        mom = stock_history.get_momentum(sym)
+        m1 = mom.get('1m')
+        if not m1:
+            continue
 
-        # Price jumped
-        if p['price'] > 0 and c['price'] > 0:
-            chg = (c['price'] - p['price']) / p['price'] * 100
-            if abs(chg) >= PRICE_JUMP_THRESHOLD:
-                direction = "🚀" if chg > 0 else "💥"
-                alerts.append({
-                    'type': 'price_jump',
-                    'symbol': sym,
-                    'price_before': p['price'],
-                    'price_after': c['price'],
-                    'change_pct': chg,
-                    'msg': f"{direction} {sym} price ${p['price']:.2f} → ${c['price']:.2f}  ({chg:+.1f}%)"
-                })
+        price_chg = m1['price_delta_pct']  # actual % price change in 1 min
+        if abs(price_chg) >= MOMENTUM_1MIN_PCT:
+            direction = "🚀" if price_chg > 0 else "💥"
+            price = d['price']
+            pct = d.get('pct', 0)
+            vol = d.get('volume', '-')
+            flt = d.get('float', '-')
+            enrich = _enrichment.get(sym, {})
+            if not flt or flt == '-':
+                flt = enrich.get('float', '-')
+
+            alerts.append({
+                'type': 'momentum_1min',
+                'symbol': sym,
+                'change_pct': price_chg,
+                'msg': (
+                    f"{direction} <b>{sym}</b> — {price_chg:+.1f}% בדקה!\n"
+                    f"   💰 ${price:.2f} ({pct:+.1f}% יומי)  Vol: {vol}  Float: {flt}"
+                ),
+            })
+            _momentum_last_alert[sym] = now
 
     return alerts
 
@@ -3790,7 +3783,7 @@ class ScannerThread(threading.Thread):
 
         # IBKR enrichment for momentum stocks from Webull scan
         if scan_source == "Webull" and current:
-            momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 20.0]
+            momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 16.0]
             if momentum_syms:
                 if self.on_status:
                     self.on_status(f"Enriching {len(momentum_syms)} momentum stocks via IBKR...")
@@ -3819,8 +3812,8 @@ class ScannerThread(threading.Thread):
         is_baseline = not self.previous
 
         # ── Determine which stocks need enrichment ──
-        # Only enrich momentum candidates: ≥20% change (saves ~5 min vs all 50)
-        MIN_ENRICH_PCT = 20.0
+        # Only enrich momentum candidates: ≥16% change
+        MIN_ENRICH_PCT = 16.0
         new_syms = [sym for sym in current
                     if current[sym].get('pct', 0) >= MIN_ENRICH_PCT
                     and sym not in _enrichment]
@@ -3874,8 +3867,9 @@ class ScannerThread(threading.Thread):
         # ── Baseline: send single summary to Telegram ──
         if is_baseline and current:
             # Show only momentum stocks (≥20%) with enrichment data
+            MIN_TELEGRAM_PCT = 20.0
             momentum = [(s, d) for s, d in current.items()
-                        if d.get('pct', 0) >= MIN_ENRICH_PCT and s in _enrichment]
+                        if d.get('pct', 0) >= MIN_TELEGRAM_PCT and s in _enrichment]
             momentum.sort(key=lambda x: x[1]['pct'], reverse=True)
             session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
                              'after_hours': 'After-Hours', 'closed': 'Closed'}
@@ -3897,24 +3891,17 @@ class ScannerThread(threading.Thread):
                 summary_lines.append("  אין מניות מעל 20% כרגע")
             send_telegram("\n".join(summary_lines))
 
-        # ── Anomaly detection (only after baseline) ──
+        # ── Momentum alerts: ≥7% price move in 1 minute ──
         if not is_baseline and current:
-            alerts = detect_anomalies(current, self.previous)
-            # Filter: only price/pct jumps (new stocks handled above)
-            jump_alerts = [a for a in alerts if a['type'] != 'new']
-            if jump_alerts:
-                header = f"🔔 <b>Alert</b> — {datetime.now().strftime('%H:%M:%S')}\n"
-                lines = []
-                for a in jump_alerts:
-                    sym = a.get('symbol', '')
-                    line = a['msg']
-                    mom = stock_history.format_momentum(sym)
-                    if mom:
-                        line += f"\n   📊 {mom}"
-                    lines.append(line)
+            mom_alerts = detect_momentum_alerts(current)
+            if mom_alerts:
+                now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
+                header = f"🔔 <b>מומנטום</b> — {now_et} ET\n"
+                lines = [a['msg'] for a in mom_alerts]
+                for a in mom_alerts:
                     file_logger.log_alert(ts, a)
                 send_telegram(header + "\n".join(lines))
-                status += f"  🔔{len(jump_alerts)}"
+                status += f"  🔔{len(mom_alerts)}"
             else:
                 status += "  ✓"
 
@@ -3987,111 +3974,8 @@ class ScannerThread(threading.Thread):
                 sorted_vol = sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)
                 vol_top3 = {s for s, _ in sorted_vol[:3]}
 
-            for sym, d in current.items():
-                if sym not in _enrichment:
-                    continue
-                price = d['price']
-                pct = d.get('pct', 0)
-                score, reasons = _calc_alert_score(sym, d)
-
-                signals: list[str] = []
-
-                # Build badges
-                badges = []
-                if sym in vol_top3:
-                    rank = [s for s, _ in sorted(_daily_volume_peak.items(), key=lambda x: x[1], reverse=True)[:3]].index(sym) + 1
-                    vol_val = _daily_volume_peak[sym]
-                    if vol_val >= 1_000_000:
-                        vol_fmt = f"{vol_val / 1_000_000:.1f}M"
-                    elif vol_val >= 1_000:
-                        vol_fmt = f"{vol_val / 1_000:.0f}K"
-                    else:
-                        vol_fmt = str(vol_val)
-                    badges.append(f"📊 #{rank} ווליום היום ({vol_fmt})")
-                prev_alerts = _daily_alert_count.get(sym, 0)
-                if prev_alerts >= 2:
-                    badges.append(f"🔄 ×{prev_alerts} התראות היום")
-
-                reason_str = f" ({', '.join(reasons)})" if reasons else ""
-                score_line = f"\n🏆 ניקוד: {score}/100{reason_str}"
-                if badges:
-                    score_line += "\n" + " | ".join(badges)
-
-                # 1. HOD break
-                if self.previous and sym in self.previous:
-                    hod_msg = check_hod_break(sym, d, self.previous[sym])
-                    if hod_msg:
-                        signals.append("HOD")
-                        if score >= ALERT_MIN_SCORE:
-                            _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                            batch_alerts.append(hod_msg + score_line)
-                            if sym not in batch_syms:
-                                batch_syms.append(sym)
-                        else:
-                            log.info(f"Alert filtered {sym} HOD: score {score} < {ALERT_MIN_SCORE}")
-                # 2. Fib 2nd touch
-                fib2_msg = check_fib_second_touch(sym, price, pct)
-                if fib2_msg:
-                    signals.append("FIB×2")
-                    if score >= ALERT_MIN_SCORE:
-                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        batch_alerts.append(fib2_msg + score_line)
-                        if sym not in batch_syms:
-                            batch_syms.append(sym)
-                    else:
-                        log.info(f"Alert filtered {sym} FIB×2: score {score} < {ALERT_MIN_SCORE}")
-                # 3. LOD 2nd touch
-                lod_msg = check_lod_touch(sym, price, d.get('day_low', 0), pct)
-                if lod_msg:
-                    signals.append("LOD×2")
-                    if score >= ALERT_MIN_SCORE:
-                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        batch_alerts.append(lod_msg + score_line)
-                        if sym not in batch_syms:
-                            batch_syms.append(sym)
-                    else:
-                        log.info(f"Alert filtered {sym} LOD×2: score {score} < {ALERT_MIN_SCORE}")
-                # 4. VWAP cross
-                vwap_msg = check_vwap_cross(sym, price, d.get('vwap', 0), pct)
-                if vwap_msg:
-                    signals.append("VWAP")
-                    if score >= ALERT_MIN_SCORE:
-                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        batch_alerts.append(vwap_msg + score_line)
-                        if sym not in batch_syms:
-                            batch_syms.append(sym)
-                    else:
-                        log.info(f"Alert filtered {sym} VWAP: score {score} < {ALERT_MIN_SCORE}")
-                # 5. 1-min spike
-                spike_msg = check_1min_spike(sym, price, pct)
-                if spike_msg:
-                    signals.append("SPIKE")
-                    if score >= ALERT_MIN_SCORE:
-                        _daily_alert_count[sym] = _daily_alert_count.get(sym, 0) + 1
-                        batch_alerts.append(spike_msg + score_line)
-                        if sym not in batch_syms:
-                            batch_syms.append(sym)
-                    else:
-                        log.info(f"Alert filtered {sym} SPIKE: score {score} < {ALERT_MIN_SCORE}")
-
-                # Multi-signal (added to batch, not sent separately)
-                if len(signals) >= MULTI_SIGNAL_MIN and sym not in _multi_signal_alerted:
-                    _multi_signal_alerted.add(sym)
-                    enrich = _enrichment.get(sym, {})
-                    flt = enrich.get('float', '-')
-                    short = enrich.get('short', '-')
-                    badge_line = ("\n" + " | ".join(badges)) if badges else ""
-                    batch_alerts.append(
-                        f"🔥🔥🔥 <b>MULTI-SIGNAL — {sym}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"⚡ {len(signals)} סיגנלים: {' + '.join(signals)}\n"
-                        f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
-                        f"📊 Float: {flt} | Short: {short} | RVOL: {d.get('rvol', 0)}x\n"
-                        f"🏆 ניקוד: {score}/100 ({', '.join(reasons)})"
-                        f"{badge_line}"
-                    )
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
+            # NOTE: HOD, VWAP cross, Fib touch, LOD, 1-min spike alerts
+            # removed — replaced by momentum 1-min ≥7% alert above.
 
         # ── Send all alerts as one message ──
         if batch_alerts and not self._warmup:
@@ -4867,9 +4751,8 @@ class App:
             self.btn.config(text="START", bg=self.GREEN)
             self.status.set("Stopped.")
         else:
-            global PCT_JUMP_THRESHOLD, PRICE_JUMP_THRESHOLD
-            PCT_JUMP_THRESHOLD = self.thresh.get()
-            PRICE_JUMP_THRESHOLD = self.thresh.get()
+            global MOMENTUM_1MIN_PCT
+            MOMENTUM_1MIN_PCT = self.thresh.get()
             self._save()
             self.scanner = ScannerThread(
                 freq=self.freq.get(),
