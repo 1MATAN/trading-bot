@@ -50,6 +50,7 @@ from strategies.fib_dt_live_strategy import (
     FibDTLiveStrategySync, DTEntryRequest, DTTrailingExit, GapSignal,
 )
 from strategies.fib_dt_live_entry import FibDTLiveEntrySync
+from monitor.order_thread import OrderThread
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
     MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_CODES, MONITOR_SCAN_MAX_RESULTS,
@@ -2981,18 +2982,13 @@ class TelegramListenerThread(threading.Thread):
 
 class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
-                 on_status=None, on_stocks=None,
-                 order_queue: queue.Queue | None = None,
-                 on_account=None, on_order_result=None):
+                 on_status=None, on_stocks=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
         self.price_max = price_max
         self.on_status = on_status
         self.on_stocks = on_stocks  # callback(dict) to update GUI table
-        self.order_queue = order_queue
-        self.on_account = on_account          # callback(net_liq, buying_power, positions)
-        self.on_order_result = on_order_result  # callback(msg, success)
         self.running = False
         self.previous: dict = {}
         self.count = 0
@@ -3049,21 +3045,9 @@ class ScannerThread(threading.Thread):
             for _ in range(self.freq):
                 if not self.running:
                     break
-                self._process_order_queue()
                 self._process_lookup_queue()
                 _check_news_updates(self.previous, suppress_send=self._warmup)
                 time_mod.sleep(1)
-
-    def _process_order_queue(self):
-        """Check and execute pending orders from the GUI thread."""
-        if not self.order_queue:
-            return
-        while not self.order_queue.empty():
-            try:
-                req = self.order_queue.get_nowait()
-                self._execute_order(req)
-            except queue.Empty:
-                break
 
     def _process_lookup_queue(self):
         """Process pending Telegram stock lookup requests."""
@@ -3152,142 +3136,6 @@ class ScannerThread(threading.Thread):
 
         log.info(f"Stock lookup completed: {sym} → chat={chat_id}")
 
-    def _execute_order(self, req: dict):
-        """Place an order via IBKR.
-
-        Standard: req = {sym, action, qty, price}
-        Fib DT:   req = {sym, action, qty, price, strategy='fib_dt',
-                         stop_price, target_price, half, other_half}
-        """
-        sym = req['sym']
-        action = req['action']  # 'BUY' or 'SELL'
-        qty = req['qty']
-        price = req['price']
-
-        ib = _get_ibkr()
-        if not ib:
-            if self.on_order_result:
-                self.on_order_result("IBKR not connected", False)
-            return
-
-        if req.get('strategy') == 'fib_dt':
-            self._execute_fib_dt_order(ib, req)
-            return
-
-        try:
-            contract = _get_contract(sym)
-            if not contract:
-                raise RuntimeError(f"Could not qualify contract for {sym}")
-            order = LimitOrder(action, qty, price)
-            order.outsideRth = True
-            order.tif = 'DAY'
-            trade = ib.placeOrder(contract, order)
-            ib.sleep(3)  # wait for order status callback
-            status = trade.orderStatus.status
-            if status in ('Inactive', 'Cancelled'):
-                err_log = [e for e in trade.log if e.errorCode]
-                reason = err_log[-1].message if err_log else "Unknown"
-                msg = f"Order REJECTED: {action} {qty} {sym} — {reason}"
-                log.error(msg)
-                if self.on_order_result:
-                    self.on_order_result(msg, False)
-                send_telegram(
-                    f"❌ <b>Order Rejected</b>\n"
-                    f"  {action} {qty} {sym} @ ${price:.2f}\n"
-                    f"  Reason: {reason}"
-                )
-                return
-            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}"
-            log.info(f"Order placed: {msg}")
-            if self.on_order_result:
-                self.on_order_result(msg, True)
-            send_telegram(
-                f"📋 <b>Order Placed</b>\n"
-                f"  {action} {qty} {sym} @ ${price:.2f}\n"
-                f"  Status: {status}\n"
-                f"  outsideRth: ✓  |  TIF: DAY"
-            )
-        except Exception as e:
-            msg = f"Order failed: {action} {qty} {sym} — {e}"
-            log.error(msg)
-            if self.on_order_result:
-                self.on_order_result(msg, False)
-
-    def _execute_fib_dt_order(self, ib: IB, req: dict):
-        """Execute Fib Double-Touch split-exit bracket order."""
-        sym = req['sym']
-        qty = req['qty']
-        stop_price = req['stop_price']
-        target_price = req['target_price']
-        half = req['half']
-        other_half = req['other_half']
-
-        try:
-            contract = _get_contract(sym)
-            if not contract:
-                raise RuntimeError(f"Could not qualify contract for {sym}")
-
-            # 1. Market buy full qty
-            buy_order = MarketOrder('BUY', qty)
-            buy_order.outsideRth = True
-            buy_trade = ib.placeOrder(contract, buy_order)
-            ib.sleep(3)  # wait for order status callback
-            buy_status = buy_trade.orderStatus.status
-            if buy_status in ('Inactive', 'Cancelled'):
-                err_log = [e for e in buy_trade.log if e.errorCode]
-                reason = err_log[-1].message if err_log else "Unknown"
-                msg = f"FIB DT REJECTED: BUY {qty} {sym} — {reason}"
-                log.error(msg)
-                if self.on_order_result:
-                    self.on_order_result(msg, False)
-                send_telegram(f"❌ <b>FIB DT Order Rejected</b>\n  BUY {qty} {sym}\n  Reason: {reason}")
-                return
-            log.info(f"FIB DT: Market BUY {qty} {sym} — {buy_status}")
-
-            # 2. OCA bracket for first half
-            oca_group = f"FibDT_{sym}_{int(time_mod.time())}"
-
-            oca_stop = StopOrder('SELL', half, stop_price)
-            oca_stop.outsideRth = True
-            oca_stop.ocaGroup = oca_group
-            oca_stop.ocaType = 1  # cancel others on fill
-            oca_stop.tif = 'GTC'
-            ib.placeOrder(contract, oca_stop)
-
-            oca_target = LimitOrder('SELL', half, target_price)
-            oca_target.outsideRth = True
-            oca_target.ocaGroup = oca_group
-            oca_target.ocaType = 1
-            oca_target.tif = 'GTC'
-            ib.placeOrder(contract, oca_target)
-
-            # 3. Standalone stop for other half
-            solo_stop = StopOrder('SELL', other_half, stop_price)
-            solo_stop.outsideRth = True
-            solo_stop.tif = 'GTC'
-            ib.placeOrder(contract, solo_stop)
-
-            msg = (f"FIB DT: BUY {qty} {sym} | "
-                   f"OCA {half}sh stop ${stop_price:.2f}/target ${target_price:.2f} | "
-                   f"Solo stop {other_half}sh ${stop_price:.2f}")
-            log.info(msg)
-            if self.on_order_result:
-                self.on_order_result(msg, True)
-            now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-            send_telegram(
-                f"📐 <b>FIB DT Entry</b>\n"
-                f"  🕐 {now_et}\n"
-                f"  Market BUY {qty} {sym}\n"
-                f"  OCA ({half}sh): stop ${stop_price:.2f} / target ${target_price:.2f}\n"
-                f"  Standalone stop ({other_half}sh): ${stop_price:.2f}\n"
-                f"  outsideRth: ✓  |  TIF: GTC"
-            )
-        except Exception as e:
-            msg = f"FIB DT failed: {sym} — {e}"
-            log.error(msg)
-            if self.on_order_result:
-                self.on_order_result(msg, False)
-
     def _fetch_account_data(self):
         """Fetch account values and positions from IBKR."""
         ib = _get_ibkr()
@@ -3321,8 +3169,6 @@ class ScannerThread(threading.Thread):
                 )
 
             self._cached_positions = positions
-            if self.on_account:
-                self.on_account(net_liq, buying_power, positions)
         except Exception as e:
             log.debug(f"Account fetch: {e}")
 
@@ -3968,7 +3814,6 @@ class App:
     def __init__(self):
         self.scanner = None
         self._stock_data: dict = {}  # current scan results for table display
-        self._order_queue: queue.Queue = queue.Queue()
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
@@ -3977,6 +3822,13 @@ class App:
         self._rendered_order: list[str] = []       # last symbol render order
         self._portfolio_widgets: dict[str, dict] = {}  # sym → cached portfolio widgets
         self._portfolio_order: list[str] = []
+        # Separate order thread — starts immediately, independent of scanner
+        self._order_thread = OrderThread(
+            host=IBKR_HOST, port=IBKR_PORT,
+            on_account=self._on_account_data,
+            on_order_result=self._on_order_result,
+        )
+        self._order_thread.start()
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
@@ -4099,21 +3951,21 @@ class App:
         self.root.after(1000, self._toggle)
 
     def _check_connection(self):
-        """Check IBKR connection status (read-only, never creates connection).
-
-        The scanner thread owns the IB connection — creating it from the
-        main/tkinter thread would break ib_insync's event loop threading.
-        """
-        if _ibkr and _ibkr.isConnected():
-            self.conn_var.set("IBKR: Connected ✓")
+        """Check IBKR connection status for both scanner and order thread."""
+        scan_ok = _ibkr and _ibkr.isConnected()
+        order_ok = self._order_thread.connected
+        if scan_ok and order_ok:
+            self.conn_var.set("Scan ✓ | Orders ✓")
             self.conn_label.config(fg=self.GREEN)
-        elif _ibkr:
-            self.conn_var.set("IBKR: Disconnected ✗")
-            self.conn_label.config(fg=self.RED)
+        elif order_ok:
+            self.conn_var.set("Scan ✗ | Orders ✓")
+            self.conn_label.config(fg="#ffcc00")
+        elif scan_ok:
+            self.conn_var.set("Scan ✓ | Orders ✗")
+            self.conn_label.config(fg="#ffcc00")
         else:
-            self.conn_var.set("IBKR: Not connected")
-            self.conn_label.config(fg="#888")
-        # Re-check every 5 seconds
+            self.conn_var.set("Not connected")
+            self.conn_label.config(fg=self.RED)
         self.root.after(5_000, self._check_connection)
 
     def _update_stock_table(self, stocks: dict):
@@ -4504,7 +4356,7 @@ class App:
         self.root.after(0, _update)
 
     def _place_order(self, action: str, pct: float):
-        """Validate and queue a BUY or SELL order."""
+        """Validate and send a BUY or SELL order to the OrderThread."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
             messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
@@ -4518,8 +4370,8 @@ class App:
             messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
-        if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
+        if not self._order_thread.connected:
+            messagebox.showwarning("Not Connected", "Order thread not connected to IBKR.", parent=self.root)
             return
 
         if action == 'BUY':
@@ -4553,14 +4405,14 @@ class App:
         if not confirm:
             return
 
-        self._order_queue.put({
+        self._order_thread.submit({
             'sym': sym, 'action': action, 'qty': qty, 'price': price,
         })
-        self._order_status_var.set(f"Queued: {action} {qty} {sym} @ ${price:.2f}...")
+        self._order_status_var.set(f"Sending: {action} {qty} {sym} @ ${price:.2f}...")
         self._order_status_label.config(fg="#ffcc00")
 
     def _place_fib_dt_order(self):
-        """Validate and queue a Fib Double-Touch split-exit bracket order."""
+        """Validate and send a Fib Double-Touch split-exit bracket order to OrderThread."""
         sym = self._selected_symbol_name
         if not sym or sym == "---":
             messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
@@ -4574,8 +4426,8 @@ class App:
             messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
             return
 
-        if not self.scanner or not self.scanner.running:
-            messagebox.showwarning("Scanner Off", "Start the scanner first.", parent=self.root)
+        if not self._order_thread.connected:
+            messagebox.showwarning("Not Connected", "Order thread not connected to IBKR.", parent=self.root)
             return
 
         # Look up fib levels
@@ -4644,7 +4496,7 @@ class App:
         if not confirm:
             return
 
-        self._order_queue.put({
+        self._order_thread.submit({
             'sym': sym, 'action': 'BUY', 'qty': qty, 'price': entry_price,
             'strategy': 'fib_dt',
             'stop_price': stop_price,
@@ -4653,7 +4505,7 @@ class App:
             'other_half': other_half,
         })
         self._order_status_var.set(
-            f"Queued: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
+            f"Sending: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
         self._order_status_label.config(fg="#ffcc00")
 
     def _toggle(self):
@@ -4673,9 +4525,6 @@ class App:
                 price_max=self.price_max.get(),
                 on_status=self._st,
                 on_stocks=self._update_stock_table,
-                order_queue=self._order_queue,
-                on_account=self._on_account_data,
-                on_order_result=self._on_order_result,
             )
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
@@ -4710,7 +4559,9 @@ class App:
         self.root.mainloop()
         if self.scanner:
             self.scanner.stop()
-        # Graceful IBKR disconnect
+        # Stop order thread
+        self._order_thread.stop()
+        # Graceful IBKR disconnect (scanner connection)
         if _ibkr and _ibkr.isConnected():
             log.info("Disconnecting IBKR...")
             _ibkr.disconnect()
