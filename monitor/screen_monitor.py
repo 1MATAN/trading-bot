@@ -3941,6 +3941,8 @@ class ScannerThread(threading.Thread):
 
         self.previous = current
         if self._warmup:
+            # Populate news state without sending, so next cycle won't re-send
+            _check_news_updates(current, suppress_send=True)
             self._warmup = False
             log.info("Warmup complete — alerts enabled")
         if self.on_status:
