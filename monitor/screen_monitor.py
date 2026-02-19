@@ -212,6 +212,27 @@ def _get_market_session() -> str:
     return 'closed'
 
 
+def _expected_volume_fraction() -> float:
+    """Expected fraction of daily volume traded by current time of day.
+
+    Used to normalize RVOL so that 1.0x means normal pace regardless of time.
+    E.g., at 10:00 ET ~25% of daily volume is expected, so RVOL = today_vol / (avg * 0.25).
+    """
+    et = datetime.now(_ET)
+    h = et.hour + et.minute / 60.0
+    if h < 4:    return 0.01   # overnight
+    if h < 9.5:  return 0.03   # pre-market
+    if h < 10:   return 0.15   # first 30 min (heavy)
+    if h < 10.5: return 0.25
+    if h < 11:   return 0.35
+    if h < 12:   return 0.45
+    if h < 13:   return 0.55
+    if h < 14:   return 0.65
+    if h < 15:   return 0.80
+    if h < 16:   return 0.95   # near close
+    return 1.0                  # after-hours / closed
+
+
 def _fetch_extended_hours_price(ib: IB, contract, session: str,
                                 bars: list) -> tuple[float, float, float | None, float | None, float | None]:
     """Fetch price, prev_close, and extended-hours high/low/vwap.
@@ -359,7 +380,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
             pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
-            # RVOL: use cached avg or compute from full 12D
+            # RVOL: normalized by expected volume at current time of day
             if has_cached_avg:
                 avg_vol = _avg_vol_cache[sym]
             elif len(bars) >= 2:
@@ -370,7 +391,11 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             else:
                 avg_vol = 0
 
-            rvol = round(volume / avg_vol, 1) if avg_vol > 0 else 0.0
+            if avg_vol > 0:
+                expected = avg_vol * _expected_volume_fraction()
+                rvol = round(volume / expected, 1) if expected > 0 else 0.0
+            else:
+                rvol = 0.0
             vol_str = _format_volume(volume)
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
 
@@ -1297,6 +1322,8 @@ _price_1min: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, pr
 _spike_alerted: set[str] = set()                        # already alerted 8%+ spike
 _multi_signal_alerted: set[str] = set()                 # already sent multi-signal alert today
 _alerts_date: str = ""                                  # date for daily reset
+_halt_alerted: set[str] = set()                         # already alerted halt
+_halt_last_price: dict[str, tuple[float, float]] = {}   # sym → (price, timestamp)
 _daily_alert_count: dict[str, int] = {}                 # sym -> total alerts sent today
 _daily_volume_peak: dict[str, int] = {}                 # sym -> peak volume_raw seen today
 
@@ -1592,6 +1619,9 @@ def _reset_alerts_if_new_day():
         _lod_touch_tracker.clear()
         _lod_was_near.clear()
         _vwap_side.clear()
+        _vwap_last_alert.clear()
+        _halt_alerted.clear()
+        _halt_last_price.clear()
         _price_1min.clear()
         _spike_alerted.clear()
         _52w_alerted.clear()
@@ -1694,8 +1724,12 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
     return None
 
 
+_VWAP_COOLDOWN_SEC = 600  # 10 minutes between VWAP cross alerts per symbol
+_vwap_last_alert: dict[str, float] = {}  # sym → time.time() of last alert
+
+
 def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | None:
-    """Alert 4: Price crosses VWAP."""
+    """Alert 4: Price crosses VWAP (10-min cooldown per symbol)."""
     if price <= 0 or vwap <= 0:
         return None
 
@@ -1706,6 +1740,16 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
     if prev_side is None:
         return None  # first observation — just record
 
+    if prev_side == current_side:
+        return None  # no cross
+
+    # Cooldown check
+    last = _vwap_last_alert.get(sym, 0)
+    if time_mod.time() - last < _VWAP_COOLDOWN_SEC:
+        return None
+
+    _vwap_last_alert[sym] = time_mod.time()
+
     if prev_side == 'below' and current_side == 'above':
         return (
             f"⚡ <b>VWAP CROSS — {sym}</b>\n"
@@ -1714,7 +1758,7 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
             f"💰 ${price:.2f} > VWAP ${vwap:.2f}\n"
             f"📊 שינוי: {pct:+.1f}%"
         )
-    elif prev_side == 'above' and current_side == 'below':
+    else:
         return (
             f"⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -1722,7 +1766,6 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
             f"💰 ${price:.2f} < VWAP ${vwap:.2f}\n"
             f"📊 שינוי: {pct:+.1f}%"
         )
-    return None
 
 
 def check_1min_spike(sym: str, price: float, pct: float) -> str | None:
@@ -1802,6 +1845,48 @@ SQUEEZE_MIN_SHORT_PCT = 15.0   # short interest ≥ 15%
 SQUEEZE_MIN_TURNOVER_PCT = 20.0  # volume ≥ 20% of float
 
 _squeeze_alerted: set[str] = set()
+
+_HALT_STALE_SEC = 90  # if price unchanged for 90s during market hours → likely halted
+
+
+def check_halt(sym: str, price: float) -> str | None:
+    """Detect potential trading halt: price frozen for 90+ seconds during market hours.
+
+    LULD halts freeze the price. If we see the exact same price across
+    multiple scan cycles (90+ seconds), the stock is likely halted.
+    """
+    if _get_market_session() not in ('market', 'pre_market', 'after_hours'):
+        return None
+    if price <= 0 or sym in _halt_alerted:
+        return None
+
+    now = time_mod.time()
+    prev = _halt_last_price.get(sym)
+
+    if prev is None:
+        _halt_last_price[sym] = (price, now)
+        return None
+
+    prev_price, prev_ts = prev
+
+    if abs(price - prev_price) > 0.0001:
+        # Price moved — not halted, reset
+        _halt_last_price[sym] = (price, now)
+        return None
+
+    # Price unchanged — check how long
+    elapsed = now - prev_ts
+    if elapsed >= _HALT_STALE_SEC:
+        _halt_alerted.add(sym)
+        mins = int(elapsed / 60)
+        return (
+            f"🚨 <b>HALT — {sym}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⛔ מחיר קפוא {mins}+ דקות!\n"
+            f"💰 ${price:.2f} (ללא שינוי)\n"
+            f"⚠️ סביר שהמניה בהשהייה (LULD/T1)"
+        )
+    return None
 
 
 def check_short_squeeze(sym: str, price: float, pct: float,
@@ -2537,13 +2622,47 @@ def detect_anomalies(current: dict, previous: dict) -> list[dict]:
 #  Telegram
 # ══════════════════════════════════════════════════════════
 
+_TG_MAX_LEN = 4000  # Telegram limit is 4096, keep margin for safety
+
+
 def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
     """Send text message to personal chat and group (if configured).
 
+    Auto-splits messages that exceed Telegram's 4096-char limit.
     ``reply_markup`` can be an InlineKeyboardMarkup dict for buttons.
     """
     if not BOT_TOKEN or not CHAT_ID:
         return False
+
+    # Split long messages at double-newline boundaries
+    if len(text) > _TG_MAX_LEN:
+        chunks = _split_telegram_message(text)
+        ok = True
+        for i, chunk in enumerate(chunks):
+            # Only attach buttons to the last chunk
+            rm = reply_markup if i == len(chunks) - 1 else None
+            ok = _send_telegram_raw(chunk, rm) and ok
+        return ok
+
+    return _send_telegram_raw(text, reply_markup)
+
+
+def _split_telegram_message(text: str) -> list[str]:
+    """Split text into chunks ≤ _TG_MAX_LEN chars, breaking at paragraph boundaries."""
+    chunks = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        if current and len(current) + len(paragraph) + 2 > _TG_MAX_LEN:
+            chunks.append(current.rstrip())
+            current = ""
+        current += ("" if not current else "\n\n") + paragraph
+    if current:
+        chunks.append(current.rstrip())
+    return chunks if chunks else [text[:_TG_MAX_LEN]]
+
+
+def _send_telegram_raw(text: str, reply_markup: dict | None = None) -> bool:
+    """Send a single message (no splitting)."""
     ok = False
     for cid in [CHAT_ID, GROUP_CHAT_ID]:
         if not cid:
@@ -3611,6 +3730,15 @@ class ScannerThread(threading.Thread):
                     if sym not in batch_syms:
                         batch_syms.append(sym)
                     status += f"  🩳{sym}"
+
+        # Halt detection (check ALL stocks, not just enriched)
+        for sym, d in current.items():
+            halt_msg = check_halt(sym, d['price'])
+            if halt_msg:
+                batch_alerts.append(halt_msg)
+                if sym not in batch_syms:
+                    batch_syms.append(sym)
+                status += f"  🚨{sym}"
 
         # Real-time alerts (5 types, score-filtered + multi-signal)
         if not is_baseline and current:
