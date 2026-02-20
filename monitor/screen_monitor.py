@@ -1275,7 +1275,7 @@ def _format_fib_text(sym: str, price: float) -> str:
         if v >= 0.1: return f"${v:.3f}"
         return f"${v:.4f}"
 
-    lines = ["\n📐 <b>פיבונאצ'י</b> ({sym})"]
+    lines = [f"\n📐 <b>פיבונאצ'י</b> ({sym})"]
     lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
     lines.append("")
     # Above: descending (farthest at top, closest at bottom near price)
