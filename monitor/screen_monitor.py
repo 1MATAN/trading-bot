@@ -1166,6 +1166,12 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
             src_tag = f" [{src}]" if src else ""
             lines.append(f"  • {title_he}  <i>({h['date']}{src_tag})</i>")
 
+        # Append fib + VWAP
+        if price > 0:
+            fib_txt = _format_fib_text(sym, price, vwap=d.get('vwap', 0))
+            if fib_txt:
+                lines.append(fib_txt.strip())
+
         if not suppress_send:
             btn = _make_lookup_button(sym)
             send_telegram_alert("\n".join(lines), reply_markup=btn)
