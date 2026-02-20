@@ -652,9 +652,35 @@ def _parse_ocr_generic(text: str) -> list[dict]:
     results = []
     seen = set()
 
+    def _fix_ocr_sym(raw: str) -> str:
+        """Fix OCR symbol: l→I, then handle spurious 'I' in 5+ char symbols."""
+        sym = raw.replace('l', 'I').upper()
+        if len(sym) >= 5 and 'I' in sym:
+            # OCR likely inserted spurious 'l' (now 'I'). Try removing each 'I'.
+            for i, ch in enumerate(sym):
+                if ch == 'I':
+                    variant = sym[:i] + sym[i+1:]
+                    if len(variant) < 2:
+                        continue
+                    # Check cached corrections and known symbols
+                    if (_sym_corrections.get(sym) == variant
+                            or variant in _contract_cache
+                            or variant in _enrichment):
+                        _sym_corrections[sym] = variant
+                        return variant
+            # No cache hit — prefer 4-char by removing first 'I' (most common OCR error)
+            for i, ch in enumerate(sym):
+                if ch == 'I':
+                    variant = sym[:i] + sym[i+1:]
+                    if len(variant) >= 2:
+                        log.info(f"OCR auto-fix: {sym} → {variant} (5+ char, removed spurious I)")
+                        _sym_corrections[sym] = variant
+                        return variant
+        return sym
+
     # Try 5-column first (most data)
     for m in _OCR_RE_5COL.finditer(text):
-        sym = m.group(1).replace('l', 'I').upper()
+        sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
             continue
         try:
@@ -673,7 +699,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
 
     # Try 4-column for remaining
     for m in _OCR_RE_4COL.finditer(text):
-        sym = m.group(1).replace('l', 'I').upper()
+        sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
             continue
         try:
@@ -691,7 +717,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
 
     # Try 3-column for remaining
     for m in _OCR_RE_3COL.finditer(text):
-        sym = m.group(1).replace('l', 'I').upper()
+        sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
             continue
         try:
@@ -2324,21 +2350,33 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         eps_icon = "⚪"
 
     # ── Build consolidated message ──
+    # Order: Header → News → Fundamentals → Technical → Fib
     lines = [
         f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume', '-')}",
-        "",
-        f"🏢 {enriched.get('company', '-')}",
-        f"🌎 {enriched.get('country', '-')} | {enriched.get('sector', '-')} | {enriched.get('industry', '-')}",
-        f"🏛️ Inst: {enriched.get('inst_own', '-')} ({enriched.get('inst_trans', '-')}) | Insider: {enriched.get('insider_own', '-')} ({enriched.get('insider_trans', '-')})",
-        f"💰 MCap: {enriched.get('market_cap', '-')}",
-        "",
-        f"📊 Float: {enriched['float']} | Short: {enriched['short']}",
-        f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}",
-        f"📅 Earnings: {enriched['earnings']}",
-        f"📉 Vol: {enriched.get('fvz_volume', '-')} | Avg: {enriched.get('avg_volume', '-')}",
-        f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}",
-        f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}",
     ]
+
+    # 1. News (Hebrew) — first
+    if enriched['news']:
+        lines.append("")
+        lines.append(f"📰 <b>חדשות:</b>")
+        for n in enriched['news']:
+            src = n.get('source', '')
+            src_tag = f" [{src}]" if src else ""
+            lines.append(f"  • {n['title_he']}  <i>({n['date']}{src_tag})</i>")
+
+    # 2. Company background + fundamentals
+    lines.append("")
+    lines.append(f"🏢 {enriched.get('company', '-')}")
+    lines.append(f"🌎 {enriched.get('country', '-')} | {enriched.get('sector', '-')} | {enriched.get('industry', '-')}")
+    lines.append(f"🏛️ Inst: {enriched.get('inst_own', '-')} ({enriched.get('inst_trans', '-')}) | Insider: {enriched.get('insider_own', '-')} ({enriched.get('insider_trans', '-')})")
+    lines.append(f"💰 MCap: {enriched.get('market_cap', '-')}")
+    lines.append("")
+    lines.append(f"📊 Float: {enriched['float']} | Short: {enriched['short']}")
+    lines.append(f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}")
+    lines.append(f"📅 Earnings: {enriched['earnings']}")
+    lines.append(f"📉 Vol: {enriched.get('fvz_volume', '-')} | Avg: {enriched.get('avg_volume', '-')}")
+    lines.append(f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}")
+    lines.append(f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}")
 
     # VWAP line
     vwap = stock.get('vwap', 0)
@@ -2365,20 +2403,11 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     else:
         lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
-    # Fibonacci levels (text) — chart layout: highest at top
+    # 3. Fibonacci levels (text) — always last in text
     fib_text = _format_fib_text(sym, price)
     if fib_text:
         lines.append("")
         lines.append(fib_text.lstrip("\n"))
-
-    # News (Hebrew)
-    if enriched['news']:
-        lines.append("")
-        lines.append(f"📰 <b>חדשות:</b>")
-        for n in enriched['news']:
-            src = n.get('source', '')
-            src_tag = f" [{src}]" if src else ""
-            lines.append(f"  • {n['title_he']}  <i>({n['date']}{src_tag})</i>")
 
     text = "\n".join(lines)
 
@@ -2421,7 +2450,11 @@ _daily_cache: dict[str, pd.DataFrame] = {}
 
 
 def _download_daily(symbol: str) -> pd.DataFrame | None:
-    """Download 5 years daily data from IBKR."""
+    """Download 5 years daily data from IBKR.
+
+    Falls back to 4h bars resampled to daily if daily bars are blocked
+    (e.g. tradingClass='SCM' with no market data permissions).
+    """
     ib = _get_ibkr()
     if not ib:
         log.error(f"No IBKR connection for {symbol} daily download")
@@ -2443,6 +2476,29 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
                 return df
     except Exception as e:
         log.warning(f"IBKR download {symbol}: {e}")
+
+    # ── Fallback: 4h bars → resample to daily ──
+    try:
+        bars_4h = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='1 Y',
+            barSizeSetting='4 hours', whatToShow='TRADES', useRTH=False,
+            timeout=15,
+        )
+        if bars_4h and len(bars_4h) >= 20:
+            df4 = ib_util.df(bars_4h)
+            df4.index = pd.to_datetime(df4['date'] if 'date' in df4.columns else df4.index)
+            daily = df4.resample('D').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum',
+            }).dropna(subset=['close'])
+            if 'average' in df4.columns:
+                daily['average'] = df4['average'].resample('D').mean()
+            if len(daily) >= 5:
+                log.info(f"IBKR: {symbol} {len(daily)} daily bars (resampled from 4h)")
+                _daily_cache[symbol] = daily
+                return daily
+    except Exception as e:
+        log.warning(f"IBKR 4h fallback {symbol}: {e}")
     return None
 
 
@@ -3809,7 +3865,7 @@ class App:
     def __init__(self):
         self.scanner = None
         self._stock_data: dict = {}  # current scan results for table display
-        self._filter_20pct: bool = True  # show only ≥20% by default
+        self._filter_20pct: bool = False  # show top 10 by pct (no 20% filter)
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
@@ -3995,8 +4051,8 @@ class App:
         ctrl_row = tk.Frame(self.root, bg=self.BG)
         ctrl_row.pack(fill='x', padx=10, pady=(4, 0))
         self._filter_btn = tk.Button(
-            ctrl_row, text="20%+", font=("Helvetica", 11, "bold"),
-            bg="#335533", fg=self.GREEN, relief='flat', padx=6, pady=2,
+            ctrl_row, text="TOP10", font=("Helvetica", 11, "bold"),
+            bg="#553333", fg="#aaa", relief='flat', padx=6, pady=2,
             command=self._toggle_filter,
         )
         self._filter_btn.pack(side='left', padx=(0, 6))
