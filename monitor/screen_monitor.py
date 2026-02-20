@@ -1803,6 +1803,9 @@ _spike_alerted: dict[str, float] = {}                   # sym -> timestamp (cool
 _VWAP_COOLDOWN_SEC = 600    # 10 min between VWAP cross alerts per symbol
 _vwap_last_alert: dict[str, float] = {}
 _SPIKE_COOLDOWN_SEC = 300    # 5 min cooldown per symbol for spike alerts
+_VOL_ALERT_COOLDOWN_SEC = 1800  # 30 min cooldown per symbol for volume alerts
+_vol_alert_sent: dict[str, float] = {}  # sym -> last alert timestamp
+VOL_ALERT_RVOL_MIN = 3.0  # minimum RVOL for volume alert
 
 
 def _reset_alerts_if_new_day():
@@ -1819,6 +1822,7 @@ def _reset_alerts_if_new_day():
         _vwap_last_alert.clear()
         _price_history.clear()
         _spike_alerted.clear()
+        _vol_alert_sent.clear()
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
@@ -1988,6 +1992,45 @@ def check_spike(sym: str, price: float, pct: float) -> str | None:
             f"💰 ${old_price:.2f} → ${price:.2f} | יומי: {pct:+.1f}%"
         )
     return None
+
+
+def check_volume_alert(sym: str, price: float, vwap: float,
+                       rvol: float, pct: float) -> str | None:
+    """Alert on high-volume stocks above VWAP, even below 20%.
+
+    Fires for enriched stocks (≥16%) with RVOL ≥ 3.0 and price > VWAP.
+    Skips stocks already at ≥20% (those get the regular alerts).
+    30-min cooldown per symbol.
+    """
+    if price <= 0 or vwap <= 0 or rvol < VOL_ALERT_RVOL_MIN:
+        return None
+    if price <= vwap:
+        return None
+    # Skip stocks already getting ≥20% alerts
+    if pct >= ALERT_MIN_PCT:
+        return None
+
+    now = time_mod.time()
+    last = _vol_alert_sent.get(sym, 0)
+    if now - last < _VOL_ALERT_COOLDOWN_SEC:
+        return None
+
+    _vol_alert_sent[sym] = now
+
+    enrich = _enrichment.get(sym, {})
+    news = enrich.get('news', [])
+    news_line = ""
+    if news:
+        title = news[0].get('title_he', news[0].get('title_en', ''))
+        if title:
+            news_line = f"\n📰 {title}"
+
+    return (
+        f"📊 <b>VOLUME — {sym}</b>\n"
+        f"🔥 RVOL {rvol:.1f}x | מעל VWAP!\n"
+        f"💰 ${price:.2f} ({pct:+.1f}%) > VWAP ${vwap:.2f}"
+        f"{news_line}"
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -3824,6 +3867,16 @@ class ScannerThread(threading.Thread):
                     batch_alerts.append(spike_msg)
                     play_alert_sound('spike')
                     _daily_alert_counts['Spike'] = _daily_alert_counts.get('Spike', 0) + 1
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
+
+                # Volume alert — high RVOL + above VWAP (even below 20%)
+                rvol = d.get('rvol', 0)
+                vol_msg = check_volume_alert(sym, price, vwap, rvol, pct)
+                if vol_msg:
+                    batch_alerts.append(vol_msg)
+                    play_alert_sound('vwap')
+                    _daily_alert_counts['Volume'] = _daily_alert_counts.get('Volume', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
