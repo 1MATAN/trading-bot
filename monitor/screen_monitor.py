@@ -270,6 +270,22 @@ def _expected_volume_fraction() -> float:
     return 1.0                  # after-hours / closed
 
 
+def _calc_vwap_from_bars(trade_bars: list) -> float | None:
+    """Calculate true VWAP = Σ(TP × Volume) / Σ(Volume) from TRADES bars."""
+    total_tp_vol = 0.0
+    total_vol = 0.0
+    for b in trade_bars:
+        vol = b.volume if b.volume else 0
+        if vol <= 0:
+            continue
+        tp = (b.high + b.low + b.close) / 3
+        total_tp_vol += tp * vol
+        total_vol += vol
+    if total_vol > 0:
+        return total_tp_vol / total_vol
+    return None
+
+
 def _fetch_extended_hours_price(ib: IB, contract, session: str,
                                 bars: list) -> tuple[float, float, float | None, float | None, float | None]:
     """Fetch price, prev_close, and extended-hours high/low/vwap.
@@ -287,34 +303,34 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
         # Pre-market: last RTH bar is yesterday → it IS prev_close
         prev_close = last_bar.close
         try:
-            mid_bars = ib.reqHistoricalData(
+            trade_bars = ib.reqHistoricalData(
                 contract, endDateTime='',
                 durationStr='21600 S', barSizeSetting='1 min',
-                whatToShow='MIDPOINT', useRTH=False,
+                whatToShow='TRADES', useRTH=False,
                 timeout=15,
             )
-            if mid_bars:
-                price = mid_bars[-1].close
-                ext_high = max(b.high for b in mid_bars)
-                ext_low = min(b.low for b in mid_bars)
-                ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
+            if trade_bars:
+                price = trade_bars[-1].close
+                ext_high = max(b.high for b in trade_bars)
+                ext_low = min(b.low for b in trade_bars)
+                ext_vwap = _calc_vwap_from_bars(trade_bars)
         except Exception:
             pass
     elif session == 'after_hours':
         # After-hours: last RTH bar is today → prev_close is yesterday
         prev_close = bars[-2].close if len(bars) >= 2 else 0.0
         try:
-            mid_bars = ib.reqHistoricalData(
+            trade_bars = ib.reqHistoricalData(
                 contract, endDateTime='',
                 durationStr='14400 S', barSizeSetting='1 min',
-                whatToShow='MIDPOINT', useRTH=False,
+                whatToShow='TRADES', useRTH=False,
                 timeout=15,
             )
-            if mid_bars:
-                price = mid_bars[-1].close
-                ext_high = max(b.high for b in mid_bars)
-                ext_low = min(b.low for b in mid_bars)
-                ext_vwap = sum((b.high + b.low + b.close) / 3 for b in mid_bars) / len(mid_bars)
+            if trade_bars:
+                price = trade_bars[-1].close
+                ext_high = max(b.high for b in trade_bars)
+                ext_low = min(b.low for b in trade_bars)
+                ext_vwap = _calc_vwap_from_bars(trade_bars)
         except Exception:
             pass
     else:
