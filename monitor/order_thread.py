@@ -201,11 +201,12 @@ class OrderThread(threading.Thread):
             self._execute_standard_order(req)
 
     def _execute_standard_order(self, req: dict):
-        """Place a standard limit order."""
+        """Place a standard limit order. BUY orders include automatic stop-loss."""
         sym = req['sym']
         action = req['action']
         qty = req['qty']
         price = req['price']
+        stop_price = req.get('stop_price', 0)  # 0 means no stop-loss (SELL orders)
 
         ib = self._ensure_connected()
         if not ib:
@@ -237,15 +238,36 @@ class OrderThread(threading.Thread):
                 )
                 return
 
-            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}"
+            # Place stop-loss for BUY orders
+            stop_msg = ""
+            if action == 'BUY' and stop_price > 0:
+                stop_order = StopOrder('SELL', qty, stop_price)
+                stop_order.outsideRth = True
+                stop_order.tif = 'GTC'
+                stop_trade = ib.placeOrder(contract, stop_order)
+                ib.sleep(1)
+                stop_status = stop_trade.orderStatus.status
+                stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
+                log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} — {stop_status}")
+
+            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}{stop_msg}"
             log.info(f"Order placed: {msg}")
             self._report(msg, True)
-            self._telegram(
-                f"📋 <b>Order Placed</b>\n"
-                f"  {action} {qty} {sym} @ ${price:.2f}\n"
-                f"  Status: {status}\n"
-                f"  outsideRth: ✓  |  TIF: DAY"
-            )
+            if action == 'BUY' and stop_price > 0:
+                self._telegram(
+                    f"📋 <b>Order Placed + Stop-Loss</b>\n"
+                    f"  BUY {qty} {sym} @ ${price:.2f}\n"
+                    f"  Status: {status}\n"
+                    f"  🛑 Stop-Loss: ${stop_price:.2f} (−6%)\n"
+                    f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop)"
+                )
+            else:
+                self._telegram(
+                    f"📋 <b>Order Placed</b>\n"
+                    f"  {action} {qty} {sym} @ ${price:.2f}\n"
+                    f"  Status: {status}\n"
+                    f"  outsideRth: ✓  |  TIF: DAY"
+                )
         except Exception as e:
             msg = f"Order failed: {action} {qty} {sym} — {e}"
             log.error(msg)

@@ -2486,8 +2486,52 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
 
 
 # ══════════════════════════════════════════════════════════
-#  Anomaly Detection
+#  Sound Alerts
 # ══════════════════════════════════════════════════════════
+
+_SOUND_FILES = {
+    'hod':   '/usr/share/sounds/freedesktop/stereo/complete.oga',
+    'spike': '/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga',
+    'fib':   '/usr/share/sounds/freedesktop/stereo/bell.oga',
+    'lod':   '/usr/share/sounds/freedesktop/stereo/dialog-warning.oga',
+    'vwap':  '/usr/share/sounds/freedesktop/stereo/device-added.oga',
+}
+
+# Global sound state (controlled by GUI)
+_sound_enabled: bool = True
+_sound_volume: int = 70   # 0-100
+
+
+def play_alert_sound(alert_type: str = 'hod'):
+    """Play a sound alert in a background thread. Non-blocking.
+
+    ``alert_type``: one of 'hod', 'spike', 'fib', 'lod', 'vwap'.
+    Respects _sound_enabled and _sound_volume globals.
+    """
+    if not _sound_enabled or _sound_volume <= 0:
+        return
+    sound_file = _SOUND_FILES.get(alert_type, _SOUND_FILES['hod'])
+
+    def _play():
+        try:
+            # pw-play supports --volume as linear float (0.0 - 1.0)
+            vol_float = f"{_sound_volume / 100:.2f}"
+            subprocess.run(
+                ['pw-play', '--volume', vol_float, sound_file],
+                timeout=5, capture_output=True,
+            )
+        except FileNotFoundError:
+            # Fallback: use aplay (no volume control)
+            try:
+                subprocess.run(['aplay', '-q', sound_file],
+                               timeout=5, capture_output=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_play, daemon=True).start()
+
 
 # ══════════════════════════════════════════════════════════
 #  Telegram
@@ -2907,7 +2951,7 @@ class ScannerThread(threading.Thread):
             ib_getter=_get_ibkr,
             strategy=self._fib_dt_strategy,
             buying_power_getter=self._get_net_liq,
-            send_telegram_fn=send_telegram_alert,
+            send_telegram_fn=send_telegram,  # private chat only — not group
         )
         self._fib_dt_current_sym: str | None = None  # best turnover symbol
         # Cache scanner contracts for FIB DT (symbol -> Contract)
@@ -3561,6 +3605,7 @@ class ScannerThread(threading.Thread):
                 hod_msg = check_hod_break(sym, d, prev_d)
                 if hod_msg:
                     batch_alerts.append(hod_msg)
+                    play_alert_sound('hod')
                     _daily_alert_counts['HOD Break'] = _daily_alert_counts.get('HOD Break', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
@@ -3569,6 +3614,7 @@ class ScannerThread(threading.Thread):
                 fib_msg = check_fib_second_touch(sym, price, pct)
                 if fib_msg:
                     batch_alerts.append(fib_msg)
+                    play_alert_sound('fib')
                     _daily_alert_counts['FIB Touch'] = _daily_alert_counts.get('FIB Touch', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
@@ -3578,6 +3624,7 @@ class ScannerThread(threading.Thread):
                 lod_msg = check_lod_touch(sym, price, day_low, pct)
                 if lod_msg:
                     batch_alerts.append(lod_msg)
+                    play_alert_sound('lod')
                     _daily_alert_counts['LOD Touch'] = _daily_alert_counts.get('LOD Touch', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
@@ -3587,6 +3634,7 @@ class ScannerThread(threading.Thread):
                 vwap_msg = check_vwap_cross(sym, price, vwap, pct)
                 if vwap_msg:
                     batch_alerts.append(vwap_msg)
+                    play_alert_sound('vwap')
                     _daily_alert_counts['VWAP Cross'] = _daily_alert_counts.get('VWAP Cross', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
@@ -3595,6 +3643,7 @@ class ScannerThread(threading.Thread):
                 spike_msg = check_spike(sym, price, pct)
                 if spike_msg:
                     batch_alerts.append(spike_msg)
+                    play_alert_sound('spike')
                     _daily_alert_counts['Spike'] = _daily_alert_counts.get('Spike', 0) + 1
                     if sym not in batch_syms:
                         batch_syms.append(sym)
@@ -3686,7 +3735,6 @@ class App:
         self.scanner = None
         self._stock_data: dict = {}  # current scan results for table display
         self._filter_20pct: bool = True  # show only ≥20% by default
-        self._recent_alerts: list[str] = []  # last N alert messages for GUI panel
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
@@ -3711,6 +3759,12 @@ class App:
                             highlightcolor=self.ACCENT, highlightthickness=2)
         self.root.resizable(True, True)
 
+        # Font settings (user-configurable)
+        self._table_font_var = tk.StringVar(value="Courier")
+        self._table_size_var = tk.IntVar(value=14)
+        self._alerts_font_var = tk.StringVar(value="Courier")
+        self._alerts_size_var = tk.IntVar(value=12)
+
         # Header
         hdr = tk.Frame(self.root, bg=self.BG)
         hdr.pack(fill='x', padx=10, pady=(6, 0))
@@ -3725,16 +3779,48 @@ class App:
 
         tk.Frame(self.root, bg=self.ACCENT, height=1).pack(fill='x', padx=10, pady=3)
 
+        # ── Main content: left (stocks+portfolio) + right (alerts) ──
+        content = tk.Frame(self.root, bg=self.BG)
+        content.pack(fill='both', expand=True, padx=10, pady=2)
+
+        # Right panel: Alerts (fixed width, packed first for right alignment)
+        right_panel = tk.Frame(content, bg="#111122", width=360)
+        right_panel.pack(side='right', fill='y', padx=(4, 0))
+        right_panel.pack_propagate(False)
+
+        tk.Label(right_panel, text=" ALERTS", font=("Helvetica", 13, "bold"),
+                 bg="#111122", fg=self.ACCENT, anchor='w').pack(fill='x', pady=(4, 2))
+
+        self._alerts_text = tk.Text(
+            right_panel, bg="#111122", fg="#e0e0e0",
+            font=(self._alerts_font_var.get(), self._alerts_size_var.get()),
+            wrap='word', state='disabled', bd=0, highlightthickness=0,
+            padx=6, pady=4, cursor='arrow',
+        )
+        self._alerts_text.pack(fill='both', expand=True)
+        self._alerts_text.tag_configure('hod', foreground='#ff6600')
+        self._alerts_text.tag_configure('fib', foreground='#66cccc')
+        self._alerts_text.tag_configure('lod', foreground='#ffcc00')
+        self._alerts_text.tag_configure('vwap', foreground='#00d4ff')
+        self._alerts_text.tag_configure('spike', foreground='#ff4444')
+        self._alerts_text.tag_configure('report', foreground='#00c853')
+        self._alerts_text.tag_configure('default', foreground='#e0e0e0')
+
+        # Vertical separator
+        tk.Frame(content, bg="#444", width=1).pack(side='right', fill='y', padx=2)
+
+        # Left panel: stocks + portfolio
+        left_panel = tk.Frame(content, bg=self.BG)
+        left_panel.pack(side='left', fill='both', expand=True)
+
         # Column headers
-        hdr_frame = tk.Frame(self.root, bg=self.BG)
-        hdr_frame.pack(fill='x', padx=10)
-        for text, w in [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7), ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
-            tk.Label(hdr_frame, text=text, font=("Courier", 13, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        self._hdr_frame = tk.Frame(left_panel, bg=self.BG)
+        self._hdr_frame.pack(fill='x')
+        self._rebuild_column_headers()
 
         # Scrollable stock list
-        list_frame = tk.Frame(self.root, bg=self.BG)
-        list_frame.pack(fill='both', expand=True, padx=10, pady=1)
+        list_frame = tk.Frame(left_panel, bg=self.BG)
+        list_frame.pack(fill='both', expand=True, pady=1)
 
         self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=200)
         scrollbar = tk.Scrollbar(list_frame, orient='vertical', command=self.canvas.yview)
@@ -3757,66 +3843,67 @@ class App:
         self.stock_frame.bind('<Button-5>', _on_mousewheel)
 
         # ── Portfolio Panel ──
-        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
-        port_hdr = tk.Frame(self.root, bg=self.BG)
-        port_hdr.pack(fill='x', padx=10)
+        tk.Frame(left_panel, bg="#444", height=1).pack(fill='x', pady=2)
+        port_hdr = tk.Frame(left_panel, bg=self.BG)
+        port_hdr.pack(fill='x')
         tk.Label(port_hdr, text="Portfolio", font=("Helvetica", 12, "bold"),
                  bg=self.BG, fg="#888").pack(side='left', padx=(0, 10))
         for text, w in [("SYM", 6), ("QTY", 6), ("AVG", 7), ("PRICE", 7), ("P&L", 9), ("P&L%", 6)]:
             tk.Label(port_hdr, text=text, font=("Courier", 12, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
-        self._portfolio_frame = tk.Frame(self.root, bg=self.BG)
-        self._portfolio_frame.pack(fill='x', padx=10, pady=1)
-        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
+        self._portfolio_frame = tk.Frame(left_panel, bg=self.BG)
+        self._portfolio_frame.pack(fill='x', pady=1)
+        tk.Frame(left_panel, bg="#444", height=1).pack(fill='x', pady=2)
 
         # ── Trading Panel ──
         self._build_trading_panel()
 
         tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
 
-        # Settings row: all in one line
+        # Settings + Scanner slots in one row
         fs = tk.Frame(self.root, bg=self.BG)
         fs.pack(fill='x', padx=10, pady=1)
 
-        tk.Label(fs, text="Freq:", font=("Helvetica", 12),
+        tk.Label(fs, text="Freq:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self.freq = tk.IntVar(value=MONITOR_DEFAULT_FREQ)
         tk.Spinbox(fs, from_=5, to=600, increment=5, textvariable=self.freq,
-                   width=3, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 8))
+                   width=3, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 6))
 
-        tk.Label(fs, text="Alert%:", font=("Helvetica", 12),
+        tk.Label(fs, text="Alert%:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self.thresh = tk.DoubleVar(value=MONITOR_DEFAULT_ALERT_PCT)
         tk.Spinbox(fs, from_=1, to=50, increment=1, textvariable=self.thresh,
-                   width=3, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 8))
+                   width=3, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(1, 6))
 
-        tk.Label(fs, text="Min$:", font=("Helvetica", 12),
+        tk.Label(fs, text="Min$:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self.price_min = tk.DoubleVar(value=MONITOR_PRICE_MIN)
         tk.Spinbox(fs, from_=0.01, to=100, increment=0.5, textvariable=self.price_min,
-                   width=4, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 8))
+                   width=4, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 6))
 
-        tk.Label(fs, text="Max$:", font=("Helvetica", 12),
+        tk.Label(fs, text="Max$:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
         self.price_max = tk.DoubleVar(value=MONITOR_PRICE_MAX)
         tk.Spinbox(fs, from_=1, to=500, increment=1, textvariable=self.price_max,
-                   width=4, font=("Helvetica", 12), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 8))
+                   width=4, font=("Helvetica", 11), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat', format="%.2f").pack(side='left', padx=(1, 6))
 
-        # Scanner source slots (up to 3)
-        scanner_row = tk.Frame(self.root, bg=self.BG)
-        scanner_row.pack(fill='x', padx=10, pady=1)
-        tk.Label(scanner_row, text="Scanners:", font=("Helvetica", 11),
+        tk.Label(fs, text="|", font=("Helvetica", 11),
+                 bg=self.BG, fg="#444").pack(side='left', padx=4)
+
+        tk.Label(fs, text="Scan:", font=("Helvetica", 11),
                  bg=self.BG, fg="#888").pack(side='left')
+        scanner_row = fs  # scanner slots in same row
         self._scanner_slot_labels: list[tk.Label] = []
         self._scanner_slot_vars: list[tk.StringVar] = []
         for i in range(_MAX_SCANNER_SOURCES):
             var = tk.StringVar(value=f"S{i+1}: ——")
             lbl = tk.Label(scanner_row, textvariable=var,
-                           font=("Courier", 10), bg=self.BG, fg="#666", width=16, anchor='w')
+                           font=("Courier", 9), bg=self.BG, fg="#666", width=12, anchor='w')
             lbl.pack(side='left', padx=(4, 0))
             self._scanner_slot_vars.append(var)
             self._scanner_slot_labels.append(lbl)
@@ -3829,7 +3916,7 @@ class App:
                 command=lambda idx=i: self._clear_scanner(idx), relief='flat', padx=2, pady=0,
             ).pack(side='left', padx=(0, 4))
 
-        # Filter toggle + Start/Stop row
+        # Filter toggle + Sound controls + Start/Stop row
         ctrl_row = tk.Frame(self.root, bg=self.BG)
         ctrl_row.pack(fill='x', padx=10, pady=(4, 0))
         self._filter_btn = tk.Button(
@@ -3838,7 +3925,63 @@ class App:
             command=self._toggle_filter,
         )
         self._filter_btn.pack(side='left', padx=(0, 6))
-        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 18, "bold"),
+
+        # Sound mute toggle
+        self._sound_muted = False
+        self._sound_btn = tk.Button(
+            ctrl_row, text="🔊", font=("Helvetica", 13),
+            bg=self.ROW_BG, fg=self.GREEN, relief='flat', padx=4, pady=2,
+            command=self._toggle_sound,
+        )
+        self._sound_btn.pack(side='left', padx=(0, 2))
+
+        # Sound volume slider
+        self._sound_vol = tk.IntVar(value=70)
+        self._vol_slider = tk.Scale(
+            ctrl_row, from_=0, to=100, orient='horizontal',
+            variable=self._sound_vol, length=80, showvalue=False,
+            bg=self.BG, fg=self.FG, troughcolor=self.ROW_BG,
+            highlightthickness=0, sliderlength=12, width=12,
+            command=self._on_volume_change,
+        )
+        self._vol_slider.pack(side='left', padx=(0, 2))
+        self._vol_label = tk.Label(ctrl_row, text="70%", font=("Courier", 10),
+                                    bg=self.BG, fg="#888", width=4)
+        self._vol_label.pack(side='left', padx=(0, 4))
+
+        # Font controls: Table font
+        tk.Label(ctrl_row, text="|", font=("Helvetica", 11),
+                 bg=self.BG, fg="#444").pack(side='left', padx=2)
+        tk.Label(ctrl_row, text="Table:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left')
+        _fonts = ["Courier", "Consolas", "Monospace", "DejaVu Sans Mono", "Ubuntu Mono",
+                  "Liberation Mono", "Noto Sans Mono"]
+        self._tbl_font_menu = tk.OptionMenu(
+            ctrl_row, self._table_font_var, *_fonts,
+            command=lambda _: self._apply_table_font())
+        self._tbl_font_menu.config(font=("Helvetica", 9), bg=self.ROW_BG, fg=self.FG,
+                                    highlightthickness=0, relief='flat', width=8)
+        self._tbl_font_menu.pack(side='left', padx=(1, 2))
+        tk.Spinbox(ctrl_row, from_=8, to=22, textvariable=self._table_size_var,
+                   width=2, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat',
+                   command=self._apply_table_font).pack(side='left', padx=(0, 4))
+
+        # Font controls: Alerts font
+        tk.Label(ctrl_row, text="Alerts:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left')
+        self._alrt_font_menu = tk.OptionMenu(
+            ctrl_row, self._alerts_font_var, *_fonts,
+            command=lambda _: self._apply_alerts_font())
+        self._alrt_font_menu.config(font=("Helvetica", 9), bg=self.ROW_BG, fg=self.FG,
+                                     highlightthickness=0, relief='flat', width=8)
+        self._alrt_font_menu.pack(side='left', padx=(1, 2))
+        tk.Spinbox(ctrl_row, from_=8, to=22, textvariable=self._alerts_size_var,
+                   width=2, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat',
+                   command=self._apply_alerts_font).pack(side='left', padx=(0, 4))
+
+        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 16, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
                              relief='flat', activebackground="#00a844")
         self.btn.pack(side='left', fill='x', expand=True, ipady=2)
@@ -3849,18 +3992,7 @@ class App:
                  bg=self.BG, fg="#888", wraplength=1000, justify='left'
                  ).pack(padx=10, pady=1, anchor='w')
 
-        # Alerts panel (last 5 alerts)
-        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=1)
-        self._alerts_frame = tk.Frame(self.root, bg=self.BG)
-        self._alerts_frame.pack(fill='x', padx=10, pady=1)
-        tk.Label(self._alerts_frame, text="Alerts:", font=("Helvetica", 10, "bold"),
-                 bg=self.BG, fg="#888").pack(anchor='w')
-        self._alert_labels: list[tk.Label] = []
-        for _ in range(5):
-            lbl = tk.Label(self._alerts_frame, text="", font=("Courier", 10),
-                           bg=self.BG, fg="#aaa", anchor='w', wraplength=900, justify='left')
-            lbl.pack(fill='x')
-            self._alert_labels.append(lbl)
+        # (Alerts panel is in right_panel above)
 
         self._load()
         self.root.after(500, self._check_connection)
@@ -3964,6 +4096,10 @@ class App:
 
     def _build_stock_row(self, sym: str, rd: dict) -> dict:
         """Create widget row for a stock and return widget refs."""
+        ff = self._table_font_var.get()
+        fs = self._table_size_var.get()
+        font_b = (ff, fs, "bold")
+        font_r = (ff, fs)
         _click = lambda e, s=sym: self._select_stock(s)
         _dbl_click = lambda e, s=sym: self._open_tradingview(s)
 
@@ -3972,39 +4108,39 @@ class App:
         row1.bind('<Button-1>', _click)
         row1.bind('<Double-Button-1>', _dbl_click)
 
-        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=("Courier", 14, "bold"),
+        sym_lbl = tk.Label(row1, text=rd['sym_text'], font=font_b,
                            bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
         sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        price_lbl = tk.Label(row1, text=rd['price_text'], font=("Courier", 14),
+        price_lbl = tk.Label(row1, text=rd['price_text'], font=font_r,
                              bg=rd['bg'], fg=self.FG, width=8, anchor='w')
         price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click); price_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=("Courier", 14, "bold"),
+        pct_lbl = tk.Label(row1, text=rd['pct_text'], font=font_b,
                            bg=rd['bg'], fg=rd['pct_fg'], width=8, anchor='w')
         pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click); pct_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=("Courier", 13),
+        vol_lbl = tk.Label(row1, text=rd['vol_text'], font=font_r,
                            bg=rd['bg'], fg=rd['vol_fg'], width=7, anchor='w')
         vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click); vol_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=("Courier", 13, "bold"),
+        rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=font_b,
                             bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
         rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click); rvol_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=("Courier", 13),
+        vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=font_r,
                             bg=rd['bg'], fg=rd.get('vwap_fg', '#555'), width=7, anchor='w')
         vwap_lbl.pack(side='left'); vwap_lbl.bind('<Button-1>', _click); vwap_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        float_lbl = tk.Label(row1, text=rd['float_text'], font=("Courier", 13),
+        float_lbl = tk.Label(row1, text=rd['float_text'], font=font_r,
                              bg=rd['bg'], fg="#cca0ff", width=7, anchor='w')
         float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click); float_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        short_lbl = tk.Label(row1, text=rd['short_text'], font=("Courier", 13),
+        short_lbl = tk.Label(row1, text=rd['short_text'], font=font_r,
                              bg=rd['bg'], fg="#ffaa00", width=6, anchor='w')
         short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click); short_lbl.bind('<Double-Button-1>', _dbl_click)
 
-        news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=("Courier", 13),
+        news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=font_r,
                             bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
         news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Double-Button-1>', _dbl_click)
 
@@ -4017,7 +4153,7 @@ class App:
         # Fib row
         row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row2.pack(fill='x', pady=0)
-        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=("Courier", 11),
+        fib_lbl = tk.Label(row2, text=rd['fib_text'], font=font_r,
                            bg=rd['bg'], fg="#66cccc", anchor='w')
         fib_lbl.pack(side='left', padx=(12, 0))
         if not rd['fib_text']:
@@ -4253,32 +4389,87 @@ class App:
         webbrowser.open(url)
 
     def _open_chart_window(self, sym: str):
-        """Open a Toplevel window with 2x2 web-fetched chart grid.
+        """Open a fullscreen Toplevel window with 2x2 chart grid.
 
         Charts: StockCharts Daily | Finviz Daily | Finviz Weekly | Cached Fib
-        Images fetched in parallel via ThreadPoolExecutor (~1.5s total).
+        All images resized to identical cell size, filling the entire window.
         """
         win = tk.Toplevel(self.root)
         win.title(f"Charts — {sym}")
-        win.geometry("1300x850")
         win.configure(bg='#0e1117')
+        # Maximize window to fill screen
+        win.attributes('-zoomed', True)
+        win.update_idletasks()
 
+        # Title bar with symbol + auto-refresh countdown
+        title_bar = tk.Frame(win, bg='#0e1117')
+        title_bar.pack(fill='x')
         status_var = tk.StringVar(value=f"Loading charts for {sym}...")
-        tk.Label(win, textvariable=status_var, font=("Courier", 12),
-                 bg='#0e1117', fg='#888').pack(pady=5)
+        tk.Label(title_bar, textvariable=status_var, font=("Courier", 11),
+                 bg='#0e1117', fg='#888').pack(side='left', padx=8)
+        countdown_var = tk.StringVar(value="")
+        tk.Label(title_bar, textvariable=countdown_var, font=("Courier", 10),
+                 bg='#0e1117', fg='#555').pack(side='right', padx=8)
 
         chart_frame = tk.Frame(win, bg='#0e1117')
         chart_frame.pack(fill='both', expand=True)
         for r in range(2):
-            chart_frame.rowconfigure(r, weight=1)
+            chart_frame.rowconfigure(r, weight=1, uniform='row')
         for c in range(2):
-            chart_frame.columnconfigure(c, weight=1)
+            chart_frame.columnconfigure(c, weight=1, uniform='col')
 
         # Keep references to PhotoImages to prevent GC
         win._chart_images = []
+        # Auto-refresh timer ID (for cancellation on window close)
+        win._refresh_after_id = None
+        win._countdown_after_id = None
 
+        self._load_charts(win, sym, chart_frame, status_var)
+        self._start_chart_auto_refresh(win, sym, chart_frame, status_var, countdown_var)
+
+        # Cancel timers on window close
+        def _on_close():
+            if win._refresh_after_id:
+                win.after_cancel(win._refresh_after_id)
+            if win._countdown_after_id:
+                win.after_cancel(win._countdown_after_id)
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _start_chart_auto_refresh(self, win, sym: str, chart_frame: tk.Frame,
+                                    status_var: tk.StringVar, countdown_var: tk.StringVar):
+        """Schedule auto-refresh every 60 seconds with countdown display."""
+        win._chart_countdown = 60  # seconds until next refresh
+
+        def _tick():
+            try:
+                if not win.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            win._chart_countdown -= 1
+            if win._chart_countdown <= 0:
+                # Refresh now
+                self._refresh_chart_window(win, sym, chart_frame, status_var)
+                win._chart_countdown = 60
+            countdown_var.set(f"Refresh: {win._chart_countdown}s")
+            win._countdown_after_id = win.after(1000, _tick)
+
+        win._countdown_after_id = win.after(1000, _tick)
+
+    def _refresh_chart_window(self, win, sym: str, chart_frame: tk.Frame,
+                               status_var: tk.StringVar):
+        """Refresh all charts in the chart window."""
+        status_var.set(f"Refreshing charts for {sym}...")
+        for w in chart_frame.winfo_children():
+            w.destroy()
+        win._chart_images = []
+        self._load_charts(win, sym, chart_frame, status_var)
+
+    def _load_charts(self, win, sym: str, chart_frame: tk.Frame,
+                      status_var: tk.StringVar):
+        """Fetch and display 4 charts in the grid."""
         def _fetch_url_image(url: str, title: str) -> tuple[Image.Image | None, str]:
-            """Fetch an image from a URL, return (PIL.Image, title)."""
             try:
                 resp = requests.get(url, timeout=10, headers={
                     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
@@ -4289,19 +4480,17 @@ class App:
                 log.error(f"Chart fetch {sym} {title}: {e}")
                 return None, title
 
-        def _load_fib_from_disk(sym: str) -> tuple[Image.Image | None, str]:
-            """Load cached Fib chart from /tmp."""
+        def _load_fib_from_disk(s: str) -> tuple[Image.Image | None, str]:
             title = "Fibonacci Levels"
-            path = Path(f'/tmp/fib_{sym}.png')
+            path = Path(f'/tmp/fib_{s}.png')
             if path.exists():
                 try:
                     return Image.open(path), title
                 except Exception as e:
-                    log.error(f"Fib chart load {sym}: {e}")
+                    log.error(f"Fib chart load {s}: {e}")
             return None, title
 
         def _fetch_and_draw():
-            # Chart specs: (row, col, title, callable)
             urls = [
                 (0, 0, "Daily 6M (StockCharts)",
                  f"https://stockcharts.com/c-sc/sc?s={sym}&p=D&yr=0&mn=6&dy=0&id=p75498498580"),
@@ -4318,7 +4507,6 @@ class App:
                 for row, col, title, url in urls:
                     fut = pool.submit(_fetch_url_image, url, title)
                     futures[fut] = (row, col, title)
-                # Also load fib chart from disk
                 fib_fut = pool.submit(_load_fib_from_disk, sym)
                 futures[fib_fut] = (1, 1, "Fibonacci Levels")
 
@@ -4327,23 +4515,29 @@ class App:
                     img, _ = fut.result()
                     results[title] = (img, row, col)
 
-            # Draw on GUI thread
             def _draw():
-                cell_w, cell_h = 540, 350
+                # Calculate cell size from actual window dimensions
+                win.update_idletasks()
+                win_w = chart_frame.winfo_width() or 1300
+                win_h = chart_frame.winfo_height() or 800
+                cell_w = (win_w // 2) - 4    # 2 columns, minus padding
+                cell_h = (win_h // 2) - 4    # 2 rows, minus padding
+
                 for title, (img, row, col) in results.items():
                     cell = tk.Frame(chart_frame, bg='#0e1117')
-                    cell.grid(row=row, column=col, sticky='nsew', padx=2, pady=2)
+                    cell.grid(row=row, column=col, sticky='nsew', padx=1, pady=1)
                     if img:
-                        img.thumbnail((cell_w, cell_h), Image.LANCZOS)
+                        # Force resize to exact cell dimensions (fill completely)
+                        img = img.resize((cell_w, cell_h), Image.LANCZOS)
                         photo = ImageTk.PhotoImage(img)
                         win._chart_images.append(photo)
                         lbl = tk.Label(cell, image=photo, bg='#0e1117')
-                        lbl.pack(expand=True)
+                        lbl.pack(fill='both', expand=True)
                     else:
                         tk.Label(cell, text=f"No data: {title}",
-                                 font=("Courier", 12), bg='#0e1117', fg='#666').pack(
-                                     expand=True)
-                status_var.set(f"Charts loaded for {sym}")
+                                 font=("Courier", 14), bg='#0e1117', fg='#666').pack(
+                                     fill='both', expand=True)
+                status_var.set(f"Charts loaded for {sym} — {cell_w}x{cell_h} per chart")
 
             win.after(0, _draw)
 
@@ -4451,22 +4645,44 @@ class App:
             # abs() handles both long (positive) and short (negative) positions
             qty = max(1, int(abs(pos[0]) * pct))
 
+        # BUY orders include automatic 6% stop-loss
+        stop_price = 0.0
+        if action == 'BUY':
+            stop_price = round(price * 0.94, 2)  # -6%
+
         # Confirmation dialog
-        confirm = messagebox.askokcancel(
-            "Confirm Order",
-            f"{action} {qty} {sym} @ ${price:.2f}\n"
-            f"Total: ${qty * price:,.2f}\n\n"
-            f"outsideRth=True (pre/post market OK)\n"
-            f"Continue?",
-            parent=self.root,
-        )
+        if action == 'BUY':
+            confirm = messagebox.askokcancel(
+                "Confirm Order",
+                f"BUY {qty} {sym} @ ${price:.2f}\n"
+                f"Total: ${qty * price:,.2f}\n\n"
+                f"Stop-Loss: ${stop_price:.2f} (−6%)\n"
+                f"outsideRth=True (pre/post market OK)\n"
+                f"TIF: DAY (buy) + GTC (stop)\n"
+                f"Continue?",
+                parent=self.root,
+            )
+        else:
+            confirm = messagebox.askokcancel(
+                "Confirm Order",
+                f"SELL {qty} {sym} @ ${price:.2f}\n"
+                f"Total: ${qty * price:,.2f}\n\n"
+                f"outsideRth=True (pre/post market OK)\n"
+                f"Continue?",
+                parent=self.root,
+            )
         if not confirm:
             return
 
-        self._order_thread.submit({
-            'sym': sym, 'action': action, 'qty': qty, 'price': price,
-        })
-        self._order_status_var.set(f"Sending: {action} {qty} {sym} @ ${price:.2f}...")
+        req = {'sym': sym, 'action': action, 'qty': qty, 'price': price}
+        if action == 'BUY':
+            req['stop_price'] = stop_price
+        self._order_thread.submit(req)
+        if action == 'BUY':
+            self._order_status_var.set(
+                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop ${stop_price:.2f}...")
+        else:
+            self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}...")
         self._order_status_label.config(fg="#ffcc00")
 
     def _place_fib_dt_order(self):
@@ -4566,6 +4782,53 @@ class App:
             f"Sending: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
         self._order_status_label.config(fg="#ffcc00")
 
+    def _toggle_sound(self):
+        """Toggle sound alerts on/off."""
+        global _sound_enabled
+        self._sound_muted = not self._sound_muted
+        _sound_enabled = not self._sound_muted
+        if self._sound_muted:
+            self._sound_btn.config(text="🔇", fg=self.RED)
+        else:
+            self._sound_btn.config(text="🔊", fg=self.GREEN)
+            # Play a short test sound on unmute
+            play_alert_sound('vwap')
+
+    def _on_volume_change(self, val):
+        """Handle volume slider change."""
+        global _sound_volume
+        v = int(val)
+        _sound_volume = v
+        self._vol_label.config(text=f"{v}%")
+        if v == 0:
+            self._sound_btn.config(text="🔇", fg=self.RED)
+        elif not self._sound_muted:
+            self._sound_btn.config(text="🔊", fg=self.GREEN)
+
+    def _rebuild_column_headers(self):
+        """Rebuild column header labels with current font settings."""
+        for w in self._hdr_frame.winfo_children():
+            w.destroy()
+        ff = self._table_font_var.get()
+        fs = self._table_size_var.get()
+        for text, w in [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7),
+                        ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
+            tk.Label(self._hdr_frame, text=text, font=(ff, fs, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+
+    def _apply_table_font(self, _=None):
+        """Apply font changes to the stock table."""
+        self._rebuild_column_headers()
+        # Force full rebuild of stock rows
+        self._rendered_order.clear()
+        self._render_stock_table()
+
+    def _apply_alerts_font(self, _=None):
+        """Apply font changes to the alerts panel."""
+        ff = self._alerts_font_var.get()
+        fs = self._alerts_size_var.get()
+        self._alerts_text.config(font=(ff, fs))
+
     def _toggle_filter(self):
         """Toggle 20%+ filter on stock table."""
         self._filter_20pct = not self._filter_20pct
@@ -4576,17 +4839,33 @@ class App:
         self._render_stock_table()
 
     def _push_alert(self, msg: str):
-        """Add alert message to recent alerts panel (GUI thread safe)."""
+        """Add alert message to alerts panel (GUI thread safe)."""
         ts = datetime.now().strftime('%H:%M:%S')
-        line = f"[{ts}] {msg}"
-        self._recent_alerts.insert(0, line)
-        self._recent_alerts = self._recent_alerts[:5]
+        line = f"[{ts}] {msg}\n"
+        # Determine color tag based on alert type
+        ml = msg.lower()
+        if 'hod' in ml or 'high' in ml:
+            tag = 'hod'
+        elif 'fib' in ml:
+            tag = 'fib'
+        elif 'lod' in ml or 'low' in ml:
+            tag = 'lod'
+        elif 'vwap' in ml:
+            tag = 'vwap'
+        elif 'spike' in ml:
+            tag = 'spike'
+        elif 'report' in ml or 'sent' in ml:
+            tag = 'report'
+        else:
+            tag = 'default'
         def _update():
-            for i, lbl in enumerate(self._alert_labels):
-                if i < len(self._recent_alerts):
-                    lbl.config(text=self._recent_alerts[i])
-                else:
-                    lbl.config(text="")
+            self._alerts_text.config(state='normal')
+            self._alerts_text.insert('1.0', line, tag)
+            # Keep max 50 lines
+            line_count = int(self._alerts_text.index('end-1c').split('.')[0])
+            if line_count > 50:
+                self._alerts_text.delete('50.0', 'end')
+            self._alerts_text.config(state='disabled')
         self.root.after(0, _update)
 
     def _pick_scanner(self, idx: int):
@@ -4677,6 +4956,10 @@ class App:
                 'price_min': self.price_min.get(),
                 'price_max': self.price_max.get(),
                 'scanner_sources': scanner_data,
+                'table_font': self._table_font_var.get(),
+                'table_size': self._table_size_var.get(),
+                'alerts_font': self._alerts_font_var.get(),
+                'alerts_size': self._alerts_size_var.get(),
             }, f)
 
     def _load(self):
@@ -4701,6 +4984,18 @@ class App:
                 if wid and _verify_wid(wid):
                     _scanner_sources.append({'wid': wid, 'name': src.get('name', '')})
             self._refresh_scanner_slots()
+            # Restore font settings
+            if 'table_font' in s:
+                self._table_font_var.set(s['table_font'])
+            if 'table_size' in s:
+                self._table_size_var.set(int(s['table_size']))
+            if 'alerts_font' in s:
+                self._alerts_font_var.set(s['alerts_font'])
+            if 'alerts_size' in s:
+                self._alerts_size_var.set(int(s['alerts_size']))
+            # Apply loaded fonts
+            self._apply_table_font()
+            self._apply_alerts_font()
         except Exception:
             pass
 
