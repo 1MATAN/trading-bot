@@ -113,10 +113,16 @@ _IBKR_MAX_RETRIES = 3                # retries per _get_ibkr call
 
 # ── Contract cache (avoid repeated qualifyContracts round-trips) ──
 _contract_cache: dict[str, Stock] = {}
+# OCR symbol corrections discovered during IBKR validation (e.g. EVTIV→EVTV)
+_sym_corrections: dict[str, str] = {}  # bad_ocr_sym → correct_sym
 
 
 def _get_contract(sym: str) -> Stock | None:
-    """Get a qualified Stock contract, using cache when available."""
+    """Get a qualified Stock contract, using cache when available.
+
+    If sym fails validation, tries OCR-correction variants:
+    - Remove each 'I' (Tesseract inserts spurious I from l→I fix, e.g. EVTIV→EVTV)
+    """
     if sym in _contract_cache:
         return _contract_cache[sym]
     ib = _get_ibkr()
@@ -126,6 +132,24 @@ def _get_contract(sym: str) -> Stock | None:
     ib.qualifyContracts(contract)
     if contract.conId:
         _contract_cache[sym] = contract
+        return contract
+
+    # Try removing each 'I' — OCR may have inserted a spurious one (lV→IV)
+    if 'I' in sym and len(sym) >= 3:
+        for i, ch in enumerate(sym):
+            if ch == 'I':
+                variant = sym[:i] + sym[i+1:]
+                if len(variant) < 2:
+                    continue
+                vc = Stock(variant, 'SMART', 'USD')
+                ib.qualifyContracts(vc)
+                if vc.conId:
+                    log.info(f"OCR symbol fix: {sym} → {variant} (removed spurious I)")
+                    _sym_corrections[sym] = variant
+                    _contract_cache[sym] = vc       # cache under original key
+                    _contract_cache[variant] = vc   # also under corrected key
+                    return vc
+
     return contract
 
 
@@ -731,6 +755,15 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
             if new_score > old_score:
                 best[sym] = p
 
+    # Apply known OCR symbol corrections (e.g. EVTIV→EVTV from IBKR validation)
+    if _sym_corrections:
+        corrected_best: dict[str, dict] = {}
+        for sym, p in best.items():
+            real = _sym_corrections.get(sym, sym)
+            p['sym'] = real
+            corrected_best[real] = p
+        best = corrected_best
+
     stocks: dict[str, dict] = {}
     for p in best.values():
         price = p['price']
@@ -1094,6 +1127,9 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
         if not suppress_send:
             btn = _make_lookup_button(sym)
             send_telegram_alert("\n".join(lines), reply_markup=btn)
+            # Push to GUI ALERTS panel
+            if _gui_alert_cb:
+                _gui_alert_cb(f"📰 NEWS — {sym} ({len(new_headlines)} headlines)")
         log.info(f"News alert: {sym} — {len(new_headlines)} new headlines{' (warmup)' if suppress_send else ''}")
 
     # Clean up symbols that dropped below threshold
@@ -1887,6 +1923,10 @@ _enrichment: dict[str, dict] = {}
 _enrichment_ts: dict[str, float] = {}   # symbol → time.time() when enriched
 ENRICHMENT_TTL_SECS = 30 * 60           # 30 minutes
 
+# Global GUI alert callback — set by App, used by standalone functions
+# (stock reports, news alerts) to push alerts to GUI ALERTS panel.
+_gui_alert_cb: callable = None
+
 
 def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -> dict:
     """Fetch Finviz fundamentals + Fib levels for a stock. Cached with TTL.
@@ -2362,6 +2402,10 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     send_telegram_alert(text)
     if chart_path:
         send_telegram_alert_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
+    # Push summary to GUI ALERTS panel
+    if _gui_alert_cb:
+        flt = enriched.get('float', '-')
+        _gui_alert_cb(f"📋 REPORT — {sym} ${stock['price']:.2f} {stock['pct']:+.1f}% Float:{flt}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -4272,7 +4316,7 @@ class App:
         if self._filter_20pct:
             sorted_stocks = [(s, d) for s, d in all_sorted if d.get('pct', 0) >= 20.0]
         else:
-            sorted_stocks = all_sorted
+            sorted_stocks = all_sorted[:10]  # top 10 by pct
         new_order = [sym for sym, _ in sorted_stocks]
 
         if new_order == self._rendered_order:
@@ -4902,7 +4946,7 @@ class App:
         if self._filter_20pct:
             self._filter_btn.config(bg="#335533", fg=self.GREEN, text="20%+")
         else:
-            self._filter_btn.config(bg="#553333", fg="#aaa", text="ALL")
+            self._filter_btn.config(bg="#553333", fg="#aaa", text="TOP10")
         self._render_stock_table()
 
     def _push_alert(self, msg: str):
@@ -4995,6 +5039,8 @@ class App:
                 on_stocks=self._update_stock_table,
                 on_alert=self._push_alert,
             )
+            global _gui_alert_cb
+            _gui_alert_cb = self._push_alert
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
             self.status.set("Scanner running...")
