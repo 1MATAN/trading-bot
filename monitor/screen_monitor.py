@@ -3700,17 +3700,15 @@ class ScannerThread(threading.Thread):
                 self.on_status(f"#{self.count}  Enriching {sym}... ({enriched_count+1}/{len(new_syms)})")
             _enrich_stock(sym, d['price'], on_status=self.on_status)
 
-            # Filter: send Telegram report if above VWAP + float <70M + has news
+            # Filter: send Telegram report if above VWAP + has news
             enrich = _enrichment.get(sym, {})
             vwap = d.get('vwap', 0)
             pct = d.get('pct', 0)
             price = d.get('price', 0)
-            flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
-            flt_ok = 0 < flt_shares < 70_000_000
             above_vwap = vwap > 0 and price > vwap
             has_news = bool(enrich.get('news'))
 
-            if above_vwap and flt_ok and has_news and not self._warmup:
+            if above_vwap and has_news and not self._warmup:
                 _send_stock_report(sym, d, enrich)
                 global _daily_reports_sent
                 _daily_reports_sent += 1
