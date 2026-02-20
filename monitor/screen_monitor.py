@@ -1058,8 +1058,8 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
                 continue
             if h.time:
                 utc_dt = h.time.replace(tzinfo=ZoneInfo('UTC'))
-                il_dt = utc_dt.astimezone(ZoneInfo('Asia/Jerusalem'))
-                date_str = il_dt.strftime('%Y-%m-%d %H:%M')
+                et_dt = utc_dt.astimezone(ZoneInfo('US/Eastern'))
+                date_str = et_dt.strftime('%Y-%m-%d %H:%M ET')
             else:
                 date_str = ''
             results.append({
@@ -1206,9 +1206,11 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
                 raw_date = str(row.get('Date', ''))
                 try:
                     et_dt = datetime.strptime(raw_date[:19], '%Y-%m-%d %H:%M:%S')
-                    et_dt = et_dt.replace(tzinfo=ZoneInfo('US/Eastern'))
-                    il_dt = et_dt.astimezone(ZoneInfo('Asia/Jerusalem'))
-                    dates.append(il_dt.strftime('%Y-%m-%d %H:%M'))
+                    # Finviz default time is 08:00 — show date only
+                    if et_dt.hour == 8 and et_dt.minute == 0:
+                        dates.append(et_dt.strftime('%Y-%m-%d'))
+                    else:
+                        dates.append(et_dt.strftime('%Y-%m-%d %H:%M ET'))
                 except (ValueError, IndexError):
                     dates.append(raw_date[:16])
 
@@ -1236,7 +1238,7 @@ _FIB_RATIO_ICON: dict[float, str] = {
 }
 
 
-def _format_fib_text(sym: str, price: float) -> str:
+def _format_fib_text(sym: str, price: float, vwap: float = 0) -> str:
     """Build fib levels text — 10 above (descending) + 5 below with % distance and ratio icons."""
     if price > 0:
         calc_fib_levels(sym, price)
@@ -1275,16 +1277,35 @@ def _format_fib_text(sym: str, price: float) -> str:
         if v >= 0.1: return f"${v:.3f}"
         return f"${v:.4f}"
 
+    def _vwap_line(v: float) -> str:
+        pct_dist = (v - price) / price * 100
+        return f"📊 <b>VWAP {_p(v)}</b>  {pct_dist:+.1f}%"
+
     lines = [f"\n📐 <b>פיבונאצ'י</b> ({sym})"]
     lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
     lines.append("")
     # Above: descending (farthest at top, closest at bottom near price)
+    # Insert VWAP in correct position among levels
+    vwap_above = vwap > price and vwap > 0
+    vwap_below = vwap <= price and vwap > 0
+    vwap_inserted = False
     for lv in reversed(above):
+        if vwap_above and not vwap_inserted and vwap >= lv:
+            lines.append(_vwap_line(vwap))
+            vwap_inserted = True
         lines.append(_fmt(lv))
+    if vwap_above and not vwap_inserted:
+        lines.append(_vwap_line(vwap))
     lines.append(f"━━━━ ${price:.2f} ━━━━")
     # Below: ascending (closest at top near price, farthest at bottom)
+    vwap_inserted = False
     for lv in reversed(below):
+        if vwap_below and not vwap_inserted and vwap >= lv:
+            lines.append(_vwap_line(vwap))
+            vwap_inserted = True
         lines.append(_fmt(lv))
+    if vwap_below and not vwap_inserted:
+        lines.append(_vwap_line(vwap))
     return "\n".join(lines)
 
 
@@ -2411,7 +2432,7 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
     # 3. Fibonacci levels (text) — always last in text
-    fib_text = _format_fib_text(sym, price)
+    fib_text = _format_fib_text(sym, price, vwap=vwap)
     if fib_text:
         lines.append("")
         lines.append(fib_text.lstrip("\n"))
@@ -3795,9 +3816,10 @@ class ScannerThread(threading.Thread):
 
                 # Append fib levels for each alerted symbol
                 for s in batch_syms:
-                    sp = current.get(s, {}).get('price', 0)
+                    sd = current.get(s, {})
+                    sp = sd.get('price', 0)
                     if sp > 0:
-                        fib_txt = _format_fib_text(s, sp)
+                        fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0))
                         if fib_txt:
                             batch_alerts.append(fib_txt.strip())
 
