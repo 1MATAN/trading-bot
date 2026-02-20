@@ -1227,9 +1227,17 @@ def fetch_stock_info(symbol: str, max_news: int = 3) -> dict:
     return result
 
 
+_FIB_RATIO_ICON: dict[float, str] = {
+    0: '⬜', 0.236: '🔴', 0.382: '🔹', 0.5: '🟠', 0.618: '⬜', 0.764: '🔴',
+    0.88: '🔵', 1: '🟢', 1.272: '🟣', 1.414: '🔵', 1.618: '⬜',
+    2: '🟢', 2.272: '🟣', 2.414: '🔵', 2.618: '⬜',
+    3: '🟢', 3.272: '🟢', 3.414: '🔵', 3.618: '⬜',
+    4: '🟢', 4.236: '🎯', 4.414: '🔵', 4.618: '⬜', 4.764: '🔴',
+}
+
+
 def _format_fib_text(sym: str, price: float) -> str:
-    """Build compact fib levels text — 3 per row with ratio labels."""
-    # Recalculate if needed (auto-advance when price exceeds top level)
+    """Build fib levels text — 10 above (descending) + 5 below with % distance and ratio icons."""
     if price > 0:
         calc_fib_levels(sym, price)
     cached = _fib_cache.get(sym)
@@ -1245,39 +1253,38 @@ def _format_fib_text(sym: str, price: float) -> str:
     if not above and not below:
         return ""
 
-    def _fmt(lv: float) -> str:
+    def _icon(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
-        r = f"({info[0]})" if info else ""
-        # Smart rounding: ≥$1 → 2dp, ≥$0.1 → 3dp, else 4dp
+        if info:
+            return _FIB_RATIO_ICON.get(info[0], '⬜')
+        return '⬜'
+
+    def _fmt(lv: float) -> str:
+        pct_dist = (lv - price) / price * 100
+        icon = _icon(lv)
         if lv >= 1:
             p = f"${lv:.2f}"
         elif lv >= 0.1:
             p = f"${lv:.3f}"
         else:
             p = f"${lv:.4f}"
-        return f"{p} {r}"
+        return f"{icon} {p}  {pct_dist:+.1f}%"
 
-    def _rows(levels: list[float]) -> list[str]:
-        """Group levels into rows of 3."""
-        result = []
-        for i in range(0, len(levels), 3):
-            chunk = levels[i:i + 3]
-            result.append("   " + " | ".join(_fmt(lv) for lv in chunk))
-        return result
-
-    lines = ["\n📐 <b>פיבונאצ'י:</b>"]
     def _p(v: float) -> str:
         if v >= 1: return f"${v:.2f}"
         if v >= 0.1: return f"${v:.3f}"
         return f"${v:.4f}"
-    lines.append(f"🕯 נר עוגן: L {_p(anchor_low)} — H {_p(anchor_high)}  ({anchor_date})")
-    if above:
-        lines.append("⬆️ " + " | ".join(_fmt(lv) for lv in above[:3]))
-        lines.extend(_rows(above[3:]))
-    lines.append(f"━━━ ${price:.2f} ━━━")
-    if below:
-        lines.append("⬇️ " + " | ".join(_fmt(lv) for lv in below[:3]))
-        lines.extend(_rows(below[3:]))
+
+    lines = ["\n📐 <b>פיבונאצ'י</b> ({sym})"]
+    lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
+    lines.append("")
+    # Above: descending (farthest at top, closest at bottom near price)
+    for lv in reversed(above):
+        lines.append(_fmt(lv))
+    lines.append(f"━━━━ ${price:.2f} ━━━━")
+    # Below: ascending (closest at top near price, farthest at bottom)
+    for lv in reversed(below):
+        lines.append(_fmt(lv))
     return "\n".join(lines)
 
 
@@ -3785,6 +3792,14 @@ class ScannerThread(threading.Thread):
                     for ba in batch_alerts:
                         clean = re.sub(r'<[^>]+>', '', ba)[:100]
                         self.on_alert(clean)
+
+                # Append fib levels for each alerted symbol
+                for s in batch_syms:
+                    sp = current.get(s, {}).get('price', 0)
+                    if sp > 0:
+                        fib_txt = _format_fib_text(s, sp)
+                        if fib_txt:
+                            batch_alerts.append(fib_txt.strip())
 
                 keyboard_rows = []
                 for s in batch_syms:
