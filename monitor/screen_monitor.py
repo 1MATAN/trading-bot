@@ -46,6 +46,7 @@ import io
 import requests
 from PIL import Image, ImageFilter, ImageOps, ImageTk
 import pytesseract
+from bidi.algorithm import get_display as bidi_display
 from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
@@ -577,8 +578,9 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
 
 # Generic OCR patterns — Webull format: SYM +PCT% PRICE VOL FLOAT
 # PCT always starts with +/-, PRICE is plain digits — used to distinguish columns.
+# Symbols accept lowercase (Tesseract reads I→l), uppercased in parser.
 _OCR_RE_5COL = re.compile(
-    r'^([A-Z]{1,5})\s+'           # symbol
+    r'^([A-Za-z]{1,5})\s+'        # symbol (allow lowercase for OCR misreads)
     r'([+-][\d.,]+)%?\S*\s+'      # pct change (+/- prefix, optional %, ignore junk)
     r'([\d.]+)\s+'                # price
     r'([\d.,]+[KMBkmb]?)\s+'     # volume
@@ -586,18 +588,32 @@ _OCR_RE_5COL = re.compile(
     re.MULTILINE,
 )
 _OCR_RE_4COL = re.compile(
-    r'^([A-Z]{1,5})\s+'
+    r'^([A-Za-z]{1,5})\s+'
     r'([+-][\d.,]+)%?\S*\s+'
     r'([\d.]+)\s+'
     r'([\d.,]+[KMBkmb]?)\s*$',
     re.MULTILINE,
 )
 _OCR_RE_3COL = re.compile(
-    r'^([A-Z]{1,5})\s+'
+    r'^([A-Za-z]{1,5})\s+'
     r'([+-][\d.,]+)%?\S*\s+'
     r'([\d.]+)\s*$',
     re.MULTILINE,
 )
+
+
+def _fix_ocr_text(text: str) -> str:
+    """Pre-process OCR text to fix common Tesseract misreads.
+
+    - Spaces inside percentage numbers: "+37 44%" → "+37.44%"
+    - Spaces inside decimal prices: "15 38" → "15.38"
+    """
+    # Fix: Tesseract reads '.' as ' ' in percentages (e.g. "+37 44%" → "+37.44%")
+    text = re.sub(r'([+-]\d+) (\d+%)', r'\1.\2', text)
+    # Fix: Tesseract reads '.' as ' ' in prices after percentage column
+    # Pattern: ...%  DIGITS SPACE DIGITS  → ...%  DIGITS.DIGITS
+    text = re.sub(r'(%\S*\s+\d+) (\d{1,4}\b)', r'\1.\2', text)
+    return text
 
 
 def _parse_ocr_generic(text: str) -> list[dict]:
@@ -608,12 +624,13 @@ def _parse_ocr_generic(text: str) -> list[dict]:
     2. 4 columns: SYMBOL PCT% PRICE VOLUME
     3. 3 columns: SYMBOL PCT% PRICE
     """
+    text = _fix_ocr_text(text)
     results = []
     seen = set()
 
     # Try 5-column first (most data)
     for m in _OCR_RE_5COL.finditer(text):
-        sym = m.group(1)
+        sym = m.group(1).replace('l', 'I').upper()
         if sym in seen:
             continue
         try:
@@ -632,7 +649,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
 
     # Try 4-column for remaining
     for m in _OCR_RE_4COL.finditer(text):
-        sym = m.group(1)
+        sym = m.group(1).replace('l', 'I').upper()
         if sym in seen:
             continue
         try:
@@ -650,7 +667,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
 
     # Try 3-column for remaining
     for m in _OCR_RE_3COL.finditer(text):
-        sym = m.group(1)
+        sym = m.group(1).replace('l', 'I').upper()
         if sym in seen:
             continue
         try:
@@ -821,7 +838,7 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
                 day_high = rth_high
                 day_low = rth_low
 
-            # Update in-place
+            # Update in-place — keep OCR volume (more accurate in pre/after)
             d = current[sym]
             d['rvol'] = rvol
             d['vwap'] = vwap
@@ -829,8 +846,10 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             d['day_high'] = day_high
             d['day_low'] = day_low
             d['contract'] = contract
-            d['volume'] = _format_volume(volume)
-            d['volume_raw'] = int(volume)
+            if not d.get('volume_raw'):
+                # Only set volume if OCR didn't provide one
+                d['volume'] = _format_volume(volume)
+                d['volume_raw'] = int(volume)
             enriched += 1
 
         except Exception as e:
@@ -3475,6 +3494,18 @@ class ScannerThread(threading.Thread):
             current = _run_ibkr_scan(self.price_min, self.price_max)
             scan_source = "IBKR"
 
+        # Keep enriched stocks from previous scan that OCR missed this cycle.
+        # OCR is unreliable — symbols flicker due to misreads (I→l, spaces in numbers).
+        # Only keep stocks that were enriched (≥16%) to avoid accumulating garbage.
+        if scan_source == "OCR" and self.previous:
+            kept = 0
+            for sym, prev_d in self.previous.items():
+                if sym not in current and sym in _enrichment:
+                    current[sym] = dict(prev_d)
+                    kept += 1
+            if kept:
+                log.debug(f"Kept {kept} enriched stocks from previous scan (OCR miss)")
+
         # IBKR enrichment for momentum stocks from OCR scan
         if scan_source == "OCR" and current:
             momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 16.0]
@@ -4065,8 +4096,22 @@ class App:
         flt = enrich.get('float', '') if enrich else ''
         short = enrich.get('short', '') if enrich else ''
 
-        # News indicator
+        # News indicator (column "N")
         news_text = "N" if (enrich and enrich.get('news')) else ""
+
+        # News headlines row — most recent headline, BiDi-fixed for Tkinter
+        news_headlines = ""
+        if enrich and enrich.get('news'):
+            n = enrich['news'][0]
+            title = n.get('title_he', n.get('title_en', ''))
+            if title:
+                if len(title) > 90:
+                    title = title[:87] + "..."
+                try:
+                    title = bidi_display(title)
+                except Exception:
+                    pass
+                news_headlines = f"  📰 {title}"
 
         # Fib text — nearest 3 below + 5 above, smart rounding
         fib_text = ""
@@ -4092,6 +4137,7 @@ class App:
             'float_text': flt, 'short_text': short,
             'news_text': news_text,
             'fib_text': fib_text,
+            'news_headlines': news_headlines,
         }
 
     def _build_stock_row(self, sym: str, rd: dict) -> dict:
@@ -4159,12 +4205,23 @@ class App:
         if not rd['fib_text']:
             row2.pack_forget()
 
+        # News headlines row (wraplength prevents overflow into alerts panel)
+        row3 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        row3.pack(fill='x', pady=0)
+        news_hl_lbl = tk.Label(row3, text=rd.get('news_headlines', ''), font=font_r,
+                               bg=rd['bg'], fg="#ccaa00", anchor='w', justify='left',
+                               wraplength=680)
+        news_hl_lbl.pack(side='left', padx=(12, 0))
+        if not rd.get('news_headlines'):
+            row3.pack_forget()
+
         return {
-            'row1': row1, 'row2': row2,
+            'row1': row1, 'row2': row2, 'row3': row3,
             'sym_lbl': sym_lbl, 'price_lbl': price_lbl, 'pct_lbl': pct_lbl,
             'vol_lbl': vol_lbl, 'rvol_lbl': rvol_lbl,
             'vwap_lbl': vwap_lbl, 'float_lbl': float_lbl, 'short_lbl': short_lbl,
-            'news_lbl': news_lbl, 'fib_lbl': fib_lbl, 'chart_btn': chart_btn,
+            'news_lbl': news_lbl, 'fib_lbl': fib_lbl, 'news_hl_lbl': news_hl_lbl,
+            'chart_btn': chart_btn,
         }
 
     def _update_stock_row(self, widgets: dict, rd: dict):
@@ -4187,6 +4244,13 @@ class App:
             widgets['row2'].pack(fill='x', pady=0)
         else:
             widgets['row2'].pack_forget()
+        # News headlines row
+        if rd.get('news_headlines'):
+            widgets['news_hl_lbl'].config(text=rd['news_headlines'], bg=bg)
+            widgets['row3'].config(bg=bg)
+            widgets['row3'].pack(fill='x', pady=0)
+        else:
+            widgets['row3'].pack_forget()
 
     def _render_stock_table(self):
         """Render the stock table from self._stock_data.
@@ -4645,10 +4709,12 @@ class App:
             # abs() handles both long (positive) and short (negative) positions
             qty = max(1, int(abs(pos[0]) * pct))
 
-        # BUY orders include automatic 6% stop-loss
+        # BUY orders include automatic stop-loss: trigger −4%, limit −6%
         stop_price = 0.0
+        limit_price = 0.0
         if action == 'BUY':
-            stop_price = round(price * 0.94, 2)  # -6%
+            stop_price = round(price * 0.96, 2)   # -4% trigger
+            limit_price = round(price * 0.94, 2)   # -6% worst fill
 
         # Confirmation dialog
         if action == 'BUY':
@@ -4656,8 +4722,8 @@ class App:
                 "Confirm Order",
                 f"BUY {qty} {sym} @ ${price:.2f}\n"
                 f"Total: ${qty * price:,.2f}\n\n"
-                f"Stop-Loss: ${stop_price:.2f} (−6%)\n"
-                f"outsideRth=True (pre/post market OK)\n"
+                f"Stop-Loss: ${stop_price:.2f} (−4%) → Limit ${limit_price:.2f} (−6%)\n"
+                f"[STP LMT] outsideRth=True (pre/post market OK)\n"
                 f"TIF: DAY (buy) + GTC (stop)\n"
                 f"Continue?",
                 parent=self.root,
@@ -4677,10 +4743,11 @@ class App:
         req = {'sym': sym, 'action': action, 'qty': qty, 'price': price}
         if action == 'BUY':
             req['stop_price'] = stop_price
+            req['limit_price'] = limit_price
         self._order_thread.submit(req)
         if action == 'BUY':
             self._order_status_var.set(
-                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop ${stop_price:.2f}...")
+                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop ${stop_price:.2f} → Lmt ${limit_price:.2f}...")
         else:
             self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}...")
         self._order_status_label.config(fg="#ffcc00")

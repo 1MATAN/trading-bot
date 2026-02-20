@@ -19,9 +19,9 @@ import time as time_mod
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder
+from ib_insync import IB, Stock, LimitOrder, MarketOrder, Order
 
-from config.settings import MONITOR_ORDER_CLIENT_ID
+from config.settings import MONITOR_ORDER_CLIENT_ID, STOP_LIMIT_OFFSET_PCT
 
 log = logging.getLogger("monitor.orders")
 
@@ -29,6 +29,32 @@ _ET = ZoneInfo("US/Eastern")
 
 _CONNECT_TIMEOUT = 10
 _ACCOUNT_POLL_INTERVAL = 5   # seconds between account data refreshes
+
+
+def _make_stop_limit(action: str, qty: int, stop_price: float,
+                     limit_price: float = 0.0) -> Order:
+    """Create a STP LMT order that actually triggers outside RTH.
+
+    Plain StopOrder does NOT trigger in pre/after-market on IBKR.
+    Only StopLimitOrder with outsideRth=True fires 24h.
+    """
+    if limit_price <= 0:
+        # fallback: 2% offset from stop
+        offset = stop_price * STOP_LIMIT_OFFSET_PCT
+        if action == "SELL":
+            limit_price = round(stop_price - offset, 2)
+        else:
+            limit_price = round(stop_price + offset, 2)
+
+    order = Order()
+    order.action = action
+    order.orderType = "STP LMT"
+    order.totalQuantity = qty
+    order.auxPrice = round(stop_price, 2)    # trigger price
+    order.lmtPrice = round(limit_price, 2)   # worst fill price
+    order.tif = "GTC"
+    order.outsideRth = True
+    return order
 
 
 class OrderThread(threading.Thread):
@@ -206,7 +232,8 @@ class OrderThread(threading.Thread):
         action = req['action']
         qty = req['qty']
         price = req['price']
-        stop_price = req.get('stop_price', 0)  # 0 means no stop-loss (SELL orders)
+        stop_price = req.get('stop_price', 0)    # 0 means no stop-loss (SELL orders)
+        limit_price = req.get('limit_price', 0)  # worst fill price for STP LMT
 
         ib = self._ensure_connected()
         if not ib:
@@ -238,17 +265,15 @@ class OrderThread(threading.Thread):
                 )
                 return
 
-            # Place stop-loss for BUY orders
+            # Place stop-loss for BUY orders (STP LMT — triggers outside RTH)
             stop_msg = ""
             if action == 'BUY' and stop_price > 0:
-                stop_order = StopOrder('SELL', qty, stop_price)
-                stop_order.outsideRth = True
-                stop_order.tif = 'GTC'
+                stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
                 stop_trade = ib.placeOrder(contract, stop_order)
                 ib.sleep(1)
                 stop_status = stop_trade.orderStatus.status
                 stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
-                log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} — {stop_status}")
+                log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
 
             msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}{stop_msg}"
             log.info(f"Order placed: {msg}")
@@ -258,7 +283,7 @@ class OrderThread(threading.Thread):
                     f"📋 <b>Order Placed + Stop-Loss</b>\n"
                     f"  BUY {qty} {sym} @ ${price:.2f}\n"
                     f"  Status: {status}\n"
-                    f"  🛑 Stop-Loss: ${stop_price:.2f} (−6%)\n"
+                    f"  🛑 Stop: ${stop_price:.2f} (−4%) → Lmt ${limit_price:.2f} (−6%) [STP LMT]\n"
                     f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop)"
                 )
             else:
@@ -315,14 +340,12 @@ class OrderThread(threading.Thread):
                 return
             log.info(f"FIB DT: Limit BUY {qty} {sym} @ ${entry_price:.2f} — {buy_status}")
 
-            # 2. OCA bracket for first half
+            # 2. OCA bracket for first half (STP LMT — triggers outside RTH)
             oca_group = f"FibDT_{sym}_{int(time_mod.time())}"
 
-            oca_stop = StopOrder('SELL', half, stop_price)
-            oca_stop.outsideRth = True
+            oca_stop = _make_stop_limit('SELL', half, stop_price)
             oca_stop.ocaGroup = oca_group
             oca_stop.ocaType = 1
-            oca_stop.tif = 'GTC'
             ib.placeOrder(contract, oca_stop)
 
             oca_target = LimitOrder('SELL', half, target_price)
@@ -332,10 +355,8 @@ class OrderThread(threading.Thread):
             oca_target.tif = 'GTC'
             ib.placeOrder(contract, oca_target)
 
-            # 3. Standalone stop for other half
-            solo_stop = StopOrder('SELL', other_half, stop_price)
-            solo_stop.outsideRth = True
-            solo_stop.tif = 'GTC'
+            # 3. Standalone stop for other half (STP LMT — triggers outside RTH)
+            solo_stop = _make_stop_limit('SELL', other_half, stop_price)
             ib.placeOrder(contract, solo_stop)
 
             msg = (f"FIB DT: BUY {qty} {sym} @ ${entry_price:.2f} | "
