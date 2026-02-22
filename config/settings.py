@@ -256,6 +256,35 @@ FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
 FIB_DT_LIVE_TRAILING_BARS = 3            # bars without new high before trailing exit (3 × 15s = 45s)
 FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
 
+# ── Momentum Ride Backtest ──────────────────────────────
+MR_STOP_EXTRA_PCT = 0.02             # 2% below nearest fib level
+MR_VWAP_MAX_DISTANCE_PCT = 0.15      # max 15% above VWAP (skip stretched)
+MR_TRACKING_MINUTES = 90             # track stock for 90 min from first scan
+MR_GAP_MIN_PCT = 20.0                # minimum gap %
+MR_GAP_MAX_PCT = 50.0                # maximum gap %
+MR_MIN_GAP_VOLUME = 10_000           # minimum gap-day volume
+MR_EXIT_BARS_IN_MINUTE = 3           # exit after 3 of 4 15s bars with no new high
+
+# ── Gap and Go Backtest ─────────────────────────────────
+GG_GAP_MIN_PCT = 15.0
+GG_PM_VOLUME_MIN = 350_000
+GG_RVOL_MIN = 2.0
+GG_PRICE_MIN = 0.10
+GG_PRICE_MAX = 15.0
+GG_FLOAT_MAX_M = 60               # millions
+GG_STOP_PCT = 0.04                # 4%
+GG_TARGET1_PCT = 0.10             # 10% (50% of position)
+GG_TARGET2_PCT = 0.20             # 20% (25% of position)
+GG_TRAIL_PCT = 0.05               # 5% trailing (last 25%)
+GG_ENTRY_AFTER_MINUTES = 5        # enter after 9:35
+
+# ── Gap and Go LIVE ───────────────────────────────────
+GG_LIVE_GAP_MIN_PCT = 15.0
+GG_LIVE_INITIAL_CASH = 3000.0
+GG_LIVE_POSITION_SIZE_PCT = 0.95
+GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
+GG_LIVE_MAX_TRACKED_SYMBOLS = 8
+
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20
 MONITOR_ORDER_CLIENT_ID = 21   # separate IBKR connection for order execution
