@@ -60,6 +60,9 @@ from strategies.fib_dt_live_strategy import (
 from strategies.gap_go_live_strategy import (
     GapGoLiveStrategy, GGCandidate, GGEntrySignal, GGExitSignal,
 )
+from strategies.momentum_ride_live_strategy import (
+    MomentumRideLiveStrategy, MRCandidate, MREntrySignal, MRExitSignal,
+)
 from monitor.order_thread import OrderThread
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
@@ -69,6 +72,7 @@ from config.settings import (
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
     STARTING_CAPITAL,
     GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_PCT,
+    MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_PCT,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -1539,7 +1543,8 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
                          net_liq: float = 0, buying_power: float = 0,
                          fib_dt_sym: str | None = None, cycle_count: int = 0,
                          virtual_portfolio_summary: str = '',
-                         gg_portfolio_summary: str = ''):
+                         gg_portfolio_summary: str = '',
+                         mr_portfolio_summary: str = ''):
     """Send comprehensive end-of-day report at ~16:05 ET. Only once per day."""
     global _daily_summary_sent, _daily_new_stocks, _daily_reports_sent
     now_et = datetime.now(ZoneInfo('US/Eastern'))
@@ -1604,6 +1609,23 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
     if gg_portfolio_summary:
         lines.append("")
         lines.append(gg_portfolio_summary)
+
+    # ── Momentum Ride Section ──
+    mr_entries = [e for e in _daily_events if e['type'] == 'mr_entry']
+    mr_exits = [e for e in _daily_events if e['type'] == 'mr_exit']
+
+    lines.append("")
+    lines.append("📈 <b>אסטרטגיית Momentum Ride:</b>")
+    lines.append(f"  • כניסות: {len(mr_entries)}")
+    for e in mr_entries:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+    lines.append(f"  • יציאות: {len(mr_exits)}")
+    for e in mr_exits:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+
+    if mr_portfolio_summary:
+        lines.append("")
+        lines.append(mr_portfolio_summary)
 
     # ── Open Positions ──
     if positions:
@@ -3595,6 +3617,168 @@ class GGVirtualPortfolio:
         return "\n".join(lines)
 
 
+# ──────────────────────────────────────────────────────────
+#  MR Virtual Portfolio (Momentum Ride paper simulation)
+# ──────────────────────────────────────────────────────────
+
+class MRVirtualPortfolio:
+    """Virtual portfolio for Momentum Ride paper simulation.
+
+    Similar to GGVirtualPortfolio — buy/sell driven by strategy signals.
+    Uses trailing stop + safety stop from the strategy.
+    """
+
+    INITIAL_CASH = MR_LIVE_INITIAL_CASH
+    JOURNAL_PATH = DATA_DIR / "mr_virtual_trades.csv"
+
+    def __init__(self):
+        self.cash: float = self.INITIAL_CASH
+        self.positions: dict[str, dict] = {}
+        # sym -> {qty, entry_price, vwap_at_entry, signal_type}
+        self.trades: list[dict] = []
+        self._init_journal()
+
+    def _init_journal(self):
+        if not self.JOURNAL_PATH.exists():
+            with open(self.JOURNAL_PATH, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'date', 'time_et', 'symbol', 'side', 'reason',
+                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
+                    'cash_after', 'net_liq', 'positions_open',
+                ])
+
+    def _log_journal(self, sym: str, side: str, reason: str,
+                     qty: int, price: float, entry_price: float,
+                     pnl: float, net_liq_val: float):
+        now = datetime.now(_ET)
+        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
+        try:
+            with open(self.JOURNAL_PATH, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    now.strftime('%Y-%m-%d'),
+                    now.strftime('%H:%M:%S'),
+                    sym, side, reason,
+                    qty, f'{price:.4f}', f'{entry_price:.4f}',
+                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
+                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
+                    len(self.positions),
+                ])
+        except Exception as e:
+            log.warning(f"MR journal write error: {e}")
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
+
+    def buy(self, sym: str, qty: int, price: float, vwap: float,
+            signal_type: str = '') -> str | None:
+        """Open an MR virtual position. Returns Telegram alert text or None."""
+        if qty < 1 or sym in self.positions:
+            return None
+        cost = qty * price
+        if cost > self.cash:
+            return None
+
+        old_cash = self.cash
+        self.cash -= cost
+
+        self.positions[sym] = {
+            'qty': qty,
+            'entry_price': price,
+            'vwap_at_entry': vwap,
+            'signal_type': signal_type,
+        }
+
+        self.trades.append({
+            'sym': sym, 'side': 'BUY', 'qty': qty,
+            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
+        })
+
+        net = self.cash + cost
+        self._log_journal(sym, 'BUY', f'ENTRY ({signal_type})', qty, price, price, 0, net)
+
+        msg = (
+            f"📈 <b>Momentum Ride [MR-SIM] — BUY {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  💰 {qty}sh @ ${price:.4f} | VWAP: ${vwap:.4f}\n"
+            f"  📋 Signal: {signal_type}\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f}"
+        )
+        log.info(f"MR VIRTUAL BUY: {sym} {qty}sh @ ${price:.4f} vwap=${vwap:.4f} ({signal_type})")
+        return msg
+
+    def sell(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell entire MR position. Returns Telegram alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos:
+            return None
+
+        qty = pos['qty']
+        entry_price = pos['entry_price']
+        pnl = (price - entry_price) * qty
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+
+        old_cash = self.cash
+        self.cash += qty * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': qty,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        del self.positions[sym]
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
+
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        msg = (
+            f"📈 <b>Momentum Ride [MR-SIM] — SELL {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  {pnl_icon} {qty}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f}\n"
+            f"  📝 Reason: {reason}"
+        )
+        log.info(f"MR VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
+        return msg
+
+    def net_liq(self, current_prices: dict) -> float:
+        val = self.cash
+        for sym, pos in self.positions.items():
+            px = current_prices.get(sym, pos['entry_price'])
+            val += pos['qty'] * px
+        return val
+
+    def summary_text(self, current_prices: dict) -> str:
+        nlv = self.net_liq(current_prices)
+        total_pnl = nlv - self.INITIAL_CASH
+        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
+
+        lines = [
+            f"📈 <b>Momentum Ride [MR-SIM] Portfolio</b>",
+            f"  💵 Cash: ${self.cash:,.0f}",
+            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
+        ]
+        if self.positions:
+            lines.append(f"  📋 Open positions: {len(self.positions)}")
+            for sym, pos in self.positions.items():
+                px = current_prices.get(sym, pos['entry_price'])
+                sym_pnl = (px - pos['entry_price']) * pos['qty']
+                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+        if self.trades:
+            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
+            lines.append(f"  📝 Trades today: {len(today_trades)}")
+            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
+            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
+
+        return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════
 #  Scanner Thread (replaces MonitorThread)
 # ══════════════════════════════════════════════════════════
@@ -3626,6 +3810,9 @@ class ScannerThread(threading.Thread):
         # ── Gap and Go Auto-Strategy ──
         self._gg_strategy = GapGoLiveStrategy(ib_getter=_get_ibkr)
         self._gg_portfolio = GGVirtualPortfolio()
+        # ── Momentum Ride Auto-Strategy ──
+        self._mr_strategy = MomentumRideLiveStrategy(ib_getter=_get_ibkr)
+        self._mr_portfolio = MRVirtualPortfolio()
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
@@ -4064,6 +4251,78 @@ class ScannerThread(threading.Thread):
         except Exception as e:
             log.error(f"GG cycle error: {e}")
 
+    def _run_momentum_ride_cycle(self, current: dict):
+        """Run Momentum Ride auto-strategy: VWAP cross/pullback + SMA9 hourly, 5% trailing stop."""
+        try:
+            # ── 1. Build candidate list (20-50% gap, has contract) ──
+            candidates = []
+            for sym, d in current.items():
+                pct = d.get('pct', 0)
+                price = d.get('price', 0)
+                contract = d.get('contract')
+                prev_close = d.get('prev_close', 0)
+
+                if pct < MR_GAP_MIN_PCT or pct > MR_GAP_MAX_PCT or price <= 0 or not contract:
+                    continue
+                if prev_close <= 0:
+                    continue
+
+                candidates.append(MRCandidate(
+                    symbol=sym,
+                    contract=contract,
+                    gap_pct=pct,
+                    prev_close=prev_close,
+                    current_price=price,
+                ))
+
+            if not candidates:
+                return
+
+            # Sort by gap % descending
+            candidates.sort(key=lambda c: c.gap_pct, reverse=True)
+
+            log.info(f"MR candidates ({len(candidates)}): "
+                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates[:5]))
+
+            # ── 2. Run strategy cycle ──
+            entries, exits = self._mr_strategy.process_cycle(candidates)
+
+            # ── 3. Execute exits first ──
+            for exit_sig in exits:
+                price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
+                alert = self._mr_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
+                if alert:
+                    send_telegram(alert)
+                    self._mr_strategy.mark_position_closed(exit_sig.symbol)
+                    _log_daily_event('mr_exit', exit_sig.symbol,
+                                     f"[MR-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
+
+            # ── 4. Execute entries ──
+            for entry in entries:
+                scan_price = current.get(entry.symbol, {}).get('price', entry.price)
+                entry_price = scan_price if scan_price > 0 else entry.price
+
+                qty = int(self._mr_portfolio.cash * MR_LIVE_POSITION_SIZE_PCT / entry_price) if entry_price > 0 else 0
+                if qty >= 1:
+                    alert = self._mr_portfolio.buy(
+                        entry.symbol, qty, entry_price, entry.vwap,
+                        signal_type=entry.signal_type,
+                    )
+                    if alert:
+                        send_telegram(alert)
+                        self._mr_strategy.mark_in_position(entry.symbol, entry_price, entry_price)
+                        _log_daily_event('mr_entry', entry.symbol,
+                                         f"[MR-SIM] BUY({entry.signal_type}) {qty}sh @ ${entry_price:.4f} "
+                                         f"VWAP=${entry.vwap:.4f} SMA9h=${entry.sma9_hourly:.4f}")
+                    else:
+                        log.warning(f"MR: Virtual buy failed for {entry.symbol}")
+                else:
+                    log.warning(f"MR: Insufficient virtual cash for {entry.symbol} "
+                                f"(cash=${self._mr_portfolio.cash:.0f}, price=${entry_price:.4f})")
+
+        except Exception as e:
+            log.error(f"MR cycle error: {e}")
+
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
         """Merge scan data with cached enrichment for GUI display."""
@@ -4363,6 +4622,9 @@ class ScannerThread(threading.Thread):
         # ── Gap and Go Auto-Strategy ──
         self._run_gap_go_cycle(current)
 
+        # ── Momentum Ride Auto-Strategy ──
+        self._run_momentum_ride_cycle(current)
+
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)
 
@@ -4377,6 +4639,7 @@ class ScannerThread(threading.Thread):
             vp_prices = {s: d.get('price', 0) for s, d in current.items() if d.get('price', 0) > 0}
             vp_summary = self._virtual_portfolio.summary_text(vp_prices) if self._virtual_portfolio else ''
             gg_summary = self._gg_portfolio.summary_text(vp_prices) if self._gg_portfolio else ''
+            mr_summary = self._mr_portfolio.summary_text(vp_prices) if self._mr_portfolio else ''
             _check_daily_summary(
                 positions=self._cached_positions,
                 net_liq=self._cached_net_liq,
@@ -4385,6 +4648,7 @@ class ScannerThread(threading.Thread):
                 cycle_count=self.count,
                 virtual_portfolio_summary=vp_summary,
                 gg_portfolio_summary=gg_summary,
+                mr_portfolio_summary=mr_summary,
             )
 
         # ── Final GUI update with all enrichment ──

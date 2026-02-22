@@ -285,6 +285,14 @@ GG_LIVE_POSITION_SIZE_PCT = 0.95
 GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
 GG_LIVE_MAX_TRACKED_SYMBOLS = 8
 
+# ── Momentum Ride LIVE ───────────────────────────────
+MR_LIVE_INITIAL_CASH = 3000.0
+MR_LIVE_POSITION_SIZE_PCT = 0.95
+MR_LIVE_MAX_TRACKED_SYMBOLS = 5
+MR_LIVE_TRAILING_STOP_PCT = 0.05       # 5% trailing from highest high
+MR_LIVE_SAFETY_STOP_PCT = 0.05         # 5% below entry
+MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
+
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20
 MONITOR_ORDER_CLIENT_ID = 21   # separate IBKR connection for order execution
