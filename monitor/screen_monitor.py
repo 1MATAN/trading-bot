@@ -57,7 +57,6 @@ from strategies.fibonacci_engine import (
 from strategies.fib_dt_live_strategy import (
     FibDTLiveStrategySync, DTEntryRequest, DTTrailingExit, GapSignal,
 )
-from strategies.fib_dt_live_entry import FibDTLiveEntrySync
 from monitor.order_thread import OrderThread
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
@@ -1534,7 +1533,8 @@ def _track_daily_stats(current: dict, new_count: int = 0):
 
 def _check_daily_summary(positions: dict[str, tuple] | None = None,
                          net_liq: float = 0, buying_power: float = 0,
-                         fib_dt_sym: str | None = None, cycle_count: int = 0):
+                         fib_dt_sym: str | None = None, cycle_count: int = 0,
+                         virtual_portfolio_summary: str = ''):
     """Send comprehensive end-of-day report at ~16:05 ET. Only once per day."""
     global _daily_summary_sent, _daily_new_stocks, _daily_reports_sent
     now_et = datetime.now(ZoneInfo('US/Eastern'))
@@ -1578,6 +1578,10 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
     lines.append(f"  • יציאות/סגירות: {len(fib_closes)}")
     for e in fib_closes:
         lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+
+    if virtual_portfolio_summary:
+        lines.append("")
+        lines.append(virtual_portfolio_summary)
 
     # ── Open Positions ──
     if positions:
@@ -3139,6 +3143,278 @@ class TelegramListenerThread(threading.Thread):
 
 
 # ══════════════════════════════════════════════════════════
+#  Virtual Portfolio for FIB DT Simulation
+# ══════════════════════════════════════════════════════════
+
+class VirtualPortfolio:
+    """Virtual portfolio for FIB DT paper simulation.
+
+    Tracks cash, positions, and P&L independently of the IBKR account.
+    Uses real-time prices for stop/target checks.
+    Writes all trades to a CSV journal for performance analysis.
+    """
+
+    INITIAL_CASH = 3000.0
+    JOURNAL_PATH = DATA_DIR / "virtual_trades.csv"
+
+    def __init__(self):
+        self.cash: float = self.INITIAL_CASH
+        self.positions: dict[str, dict] = {}
+        # sym -> {qty, entry_price, stop, target, half, other_half, phase}
+        # phase: IN_POSITION | TRAILING
+        self.trades: list[dict] = []  # history
+        self._init_journal()
+
+    def _init_journal(self):
+        """Create CSV journal with header if it doesn't exist."""
+        if not self.JOURNAL_PATH.exists():
+            with open(self.JOURNAL_PATH, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'date', 'time_et', 'symbol', 'side', 'reason',
+                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
+                    'cash_after', 'net_liq', 'positions_open',
+                ])
+
+    def _log_journal(self, sym: str, side: str, reason: str,
+                     qty: int, price: float, entry_price: float,
+                     pnl: float, net_liq: float):
+        """Append a row to the CSV journal."""
+        now = datetime.now(_ET)
+        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
+        try:
+            with open(self.JOURNAL_PATH, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    now.strftime('%Y-%m-%d'),
+                    now.strftime('%H:%M:%S'),
+                    sym, side, reason,
+                    qty, f'{price:.4f}', f'{entry_price:.4f}',
+                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
+                    f'{self.cash:.2f}', f'{net_liq:.2f}',
+                    len(self.positions),
+                ])
+        except Exception as e:
+            log.warning(f"Journal write error: {e}")
+
+    @staticmethod
+    def _ts() -> str:
+        """Current ET timestamp for alerts."""
+        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
+
+    def buy(self, sym: str, qty: int, price: float,
+            stop: float, target: float) -> str | None:
+        """Open a virtual position. Returns Telegram alert text or None."""
+        if qty < 2:
+            return None
+        if sym in self.positions:
+            return None
+
+        cost = qty * price
+        if cost > self.cash:
+            return None
+
+        half = qty // 2
+        other_half = qty - half
+        old_cash = self.cash
+        self.cash -= cost
+
+        self.positions[sym] = {
+            'qty': qty,
+            'entry_price': price,
+            'stop': stop,
+            'target': target,
+            'half': half,
+            'other_half': other_half,
+            'phase': 'IN_POSITION',
+            'high_since_target': 0.0,
+            'trailing_synced': False,
+        }
+
+        self.trades.append({
+            'sym': sym, 'side': 'BUY', 'qty': qty,
+            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
+        })
+
+        net = self.cash + cost
+        self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
+
+        msg = (
+            f"📐 <b>FIB DT [SIM] — BUY {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  💰 {qty}sh @ ${price:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f}"
+        )
+        log.info(f"VIRTUAL BUY: {sym} {qty}sh @ ${price:.2f} stop=${stop:.2f} target=${target:.2f}")
+        return msg
+
+    def check_stops_and_targets(self, current_prices: dict) -> list[str]:
+        """Check all positions against current prices. Returns list of alert texts."""
+        alerts = []
+        closed = []
+
+        for sym, pos in self.positions.items():
+            price = current_prices.get(sym, 0)
+            if price <= 0:
+                continue
+            phase = pos['phase']
+
+            # ── STOP HIT (any phase with remaining shares) ──
+            if price <= pos['stop']:
+                remaining = pos['qty']
+                if phase == 'TRAILING':
+                    remaining = pos['other_half']
+
+                pnl = (price - pos['entry_price']) * remaining
+                pnl_pct = (price / pos['entry_price'] - 1) * 100
+                old_cash = self.cash
+                self.cash += remaining * price
+
+                self.trades.append({
+                    'sym': sym, 'side': 'SELL', 'qty': remaining,
+                    'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+                })
+
+                net_liq = self._net_liq_internal(current_prices, exclude=sym)
+                self._log_journal(sym, 'SELL', f'STOP ({phase})', remaining, price,
+                                  pos['entry_price'], pnl, net_liq)
+
+                alert = (
+                    f"📐 <b>FIB DT [SIM] — STOP HIT {sym}</b>\n"
+                    f"  🕐 {self._ts()}\n"
+                    f"  🔴 {remaining}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
+                    f"  📉 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+                    f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+                    f"  📊 Portfolio: ${net_liq:,.0f}"
+                )
+                alerts.append(alert)
+                closed.append(sym)
+                log.info(f"VIRTUAL STOP: {sym} {remaining}sh @ ${price:.2f} P&L=${pnl:+.2f}")
+                continue
+
+            # ── UPDATE HIGH (TRAILING phase) ──
+            if phase == 'TRAILING' and price > pos.get('high_since_target', 0):
+                pos['high_since_target'] = price
+
+            # ── TARGET HIT (first half) — only in IN_POSITION phase ──
+            if phase == 'IN_POSITION' and price >= pos['target']:
+                half = pos['half']
+                pnl = (price - pos['entry_price']) * half
+                pnl_pct = (price / pos['entry_price'] - 1) * 100
+                old_cash = self.cash
+                self.cash += half * price
+
+                self.trades.append({
+                    'sym': sym, 'side': 'SELL', 'qty': half,
+                    'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+                })
+
+                pos['phase'] = 'TRAILING'
+                pos['qty'] = pos['other_half']
+                pos['high_since_target'] = price
+                pos['stop'] = pos['entry_price']  # breakeven stop
+
+                net_liq = self._net_liq_internal(current_prices)
+                self._log_journal(sym, 'SELL', 'TARGET (half)', half, price,
+                                  pos['entry_price'], pnl, net_liq)
+
+                alert = (
+                    f"📐 <b>FIB DT [SIM] — TARGET HIT {sym}</b>\n"
+                    f"  🕐 {self._ts()}\n"
+                    f"  🟢 {half}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
+                    f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+                    f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+                    f"  📊 Portfolio: ${net_liq:,.0f} ({pos['other_half']}sh still in position)\n"
+                    f"  🛡️ Stop → breakeven ${pos['entry_price']:.2f}"
+                )
+                alerts.append(alert)
+                log.info(f"VIRTUAL TARGET: {sym} {half}sh @ ${price:.2f} P&L=${pnl:+.2f}")
+
+        for sym in closed:
+            del self.positions[sym]
+
+        return alerts
+
+    def trailing_exit(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell remaining shares in trailing phase. Returns alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos or pos['phase'] != 'TRAILING':
+            return None
+
+        remaining = pos['other_half']
+        pnl = (price - pos['entry_price']) * remaining
+        pnl_pct = (price / pos['entry_price'] - 1) * 100
+        old_cash = self.cash
+        self.cash += remaining * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': remaining,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        del self.positions[sym]
+
+        net_liq = self.net_liq({})
+        self._log_journal(sym, 'SELL', f'TRAILING ({reason})', remaining, price,
+                          pos['entry_price'], pnl, net_liq)
+
+        alert = (
+            f"📐 <b>FIB DT [SIM] — TRAILING EXIT {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  🔵 {remaining}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net_liq:,.0f}\n"
+            f"  📝 Reason: {reason}"
+        )
+        log.info(f"VIRTUAL TRAILING EXIT: {sym} {remaining}sh @ ${price:.2f} P&L=${pnl:+.2f} ({reason})")
+        return alert
+
+    def _net_liq_internal(self, current_prices: dict, exclude: str = '') -> float:
+        """Calculate net liquidation value. Optionally exclude a symbol being closed."""
+        val = self.cash
+        for sym, pos in self.positions.items():
+            if sym == exclude:
+                continue
+            px = current_prices.get(sym, pos['entry_price'])
+            remaining = pos['qty']
+            if pos['phase'] == 'TRAILING':
+                remaining = pos['other_half']
+            val += remaining * px
+        return val
+
+    def net_liq(self, current_prices: dict) -> float:
+        """Public net liquidation value."""
+        return self._net_liq_internal(current_prices)
+
+    def summary_text(self, current_prices: dict) -> str:
+        """Generate summary text for daily report."""
+        nlv = self.net_liq(current_prices)
+        total_pnl = nlv - self.INITIAL_CASH
+        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
+
+        lines = [
+            f"📐 <b>FIB DT [SIM] Portfolio</b>",
+            f"  💵 Cash: ${self.cash:,.0f}",
+            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
+        ]
+        if self.positions:
+            lines.append(f"  📋 Open positions: {len(self.positions)}")
+            for sym, pos in self.positions.items():
+                px = current_prices.get(sym, pos['entry_price'])
+                sym_pnl = (px - pos['entry_price']) * pos.get('qty', pos.get('other_half', 0))
+                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+        if self.trades:
+            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
+            lines.append(f"  📝 Trades today: {len(today_trades)}")
+            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
+            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
+
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════
 #  Scanner Thread (replaces MonitorThread)
 # ══════════════════════════════════════════════════════════
 
@@ -3159,27 +3435,16 @@ class ScannerThread(threading.Thread):
         self._last_session: str = _get_market_session()  # track session transitions
         # ── FIB DT Auto-Strategy ──
         self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
-        self._fib_dt_entry = FibDTLiveEntrySync(
-            ib_getter=_get_ibkr,
-            strategy=self._fib_dt_strategy,
-            buying_power_getter=self._get_net_liq,
-            send_telegram_fn=send_telegram,  # private chat only — not group
-        )
+        self._virtual_portfolio = VirtualPortfolio()
         self._fib_dt_current_sym: str | None = None  # best turnover symbol
         # Cache scanner contracts for FIB DT (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
         self._cached_net_liq: float = 0.0
         self._cached_positions: dict[str, tuple] = {}  # sym → (qty, avg, mkt, pnl)
-        # Track FIB DT open positions for order fill monitoring
-        self._fib_dt_positions: dict[str, dict] = {}  # symbol -> entry_info
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
-
-    def _get_net_liq(self) -> float:
-        """Return cached NetLiquidation for position sizing."""
-        return self._cached_net_liq
 
     def stop(self):
         self.running = False
@@ -3394,12 +3659,12 @@ class ScannerThread(threading.Thread):
                 if vwap > 0 and price <= vwap:
                     continue
 
-                # Get float from enrichment cache
+                # Get float from enrichment cache (optional — no filter)
                 enrich = _enrichment.get(sym, {})
                 flt_str = enrich.get('float', '-')
                 flt_shares = _parse_float_to_shares(flt_str)
-                if flt_shares <= 0 or flt_shares >= 70_000_000:
-                    continue
+                if flt_shares <= 0:
+                    flt_shares = 10_000_000  # default if unknown
                 if volume_raw <= 0:
                     continue
 
@@ -3411,42 +3676,44 @@ class ScannerThread(threading.Thread):
 
             # Sort by turnover descending
             candidates.sort(key=lambda x: x[1], reverse=True)
-            best_sym, best_turnover, best_data, best_float = candidates[0]
 
-            # Log ranking (top 3)
-            top3 = candidates[:3]
+            # Log ranking (top 5)
+            top5 = candidates[:5]
             ranking_str = " | ".join(
-                f"{s} {t:.2f}x" for s, t, _, _ in top3
+                f"{s} {t:.2f}x" for s, t, _, _ in top5
             )
-            log.info(f"FIB DT turnover ranking: {ranking_str}")
+            log.info(f"FIB DT candidates ({len(candidates)}): {ranking_str}")
 
-            # ── 2. Build GapSignal for best candidate ──
-            gap_signal = GapSignal(
-                symbol=best_sym,
-                contract=best_data['contract'],
-                gap_pct=best_data['pct'],
-                prev_close=best_data['prev_close'],
-                current_price=best_data['price'],
-                float_shares=best_float,
-            )
+            # ── 2. Build GapSignals for ALL candidates ──
+            gap_signals = []
+            for sym, turnover, d, flt_shares in candidates:
+                gap_signals.append(GapSignal(
+                    symbol=sym,
+                    contract=d['contract'],
+                    gap_pct=d['pct'],
+                    prev_close=d['prev_close'],
+                    current_price=d['price'],
+                    float_shares=flt_shares,
+                ))
 
+            best_sym = candidates[0][0]
             if self._fib_dt_current_sym != best_sym:
+                best_turnover = candidates[0][1]
+                best_data = candidates[0][2]
                 log.info(
-                    f"FIB DT: tracking {best_sym} "
+                    f"FIB DT: top candidate {best_sym} "
                     f"(turnover={best_turnover:.2f}x, "
                     f"+{best_data['pct']:.1f}%, "
                     f"float={_enrichment.get(best_sym, {}).get('float', '?')})"
                 )
-                _log_daily_event('fib_dt_track', best_sym,
-                                 f"turnover={best_turnover:.2f}x, +{best_data['pct']:.1f}%")
                 self._fib_dt_current_sym = best_sym
 
-            # ── 3. Run strategy cycle ──
+            # ── 3. Run strategy cycle on ALL candidates ──
             entry_requests, trailing_exits = self._fib_dt_strategy.process_cycle(
-                [gap_signal]
+                gap_signals
             )
 
-            # ── 4. Execute entries ──
+            # ── 4. Execute entries (virtual portfolio) ──
             for req in entry_requests:
                 now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
                 log.info(
@@ -3457,175 +3724,90 @@ class ScannerThread(threading.Thread):
                 _log_daily_event('fib_dt_signal', req.symbol,
                                  f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
                                  f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}")
-                success = self._fib_dt_entry.execute_entry(req)
-                if success:
-                    log.info(f"FIB DT: Entry executed for {req.symbol} [{now_et}]")
-                    # Track position for order fill monitoring
-                    info = self._fib_dt_entry.last_entry_info
-                    if info:
-                        self._fib_dt_positions[req.symbol] = dict(info)
-                        log.info(f"FIB DT: Tracking position {req.symbol} for fill monitoring")
-                        _log_daily_event('fib_dt_entry', req.symbol,
-                                         f"BUY {info.get('qty', '?')}sh @ ${info.get('entry_price', 0):.2f}")
-                else:
-                    log.warning(f"FIB DT: Entry failed for {req.symbol} [{now_et}]")
 
-            # ── 5. Execute trailing exits ──
+                # Use scan price (same source as stop monitoring) instead of
+                # strategy bar_close which can diverge from OCR/enrichment price
+                scan_price = current.get(req.symbol, {}).get('price', 0)
+                entry_price = scan_price if scan_price > 0 else req.entry_price
+
+                # Adjust stop/target proportionally to scan price
+                if scan_price > 0 and scan_price != req.entry_price and req.entry_price > 0:
+                    stop_ratio = req.stop_price / req.entry_price
+                    adjusted_stop = round(entry_price * stop_ratio, 4)
+                    target_ratio = req.target_price / req.entry_price
+                    adjusted_target = round(entry_price * target_ratio, 4)
+                else:
+                    adjusted_stop = req.stop_price
+                    adjusted_target = req.target_price
+
+                # Sanity: skip if stop is already above current price
+                if entry_price <= adjusted_stop:
+                    log.warning(
+                        f"FIB DT: Skipping {req.symbol} — scan price ${entry_price:.4f} "
+                        f"≤ stop ${adjusted_stop:.4f} (strategy bar_close was ${req.entry_price:.4f})"
+                    )
+                    continue
+
+                qty = int(self._virtual_portfolio.cash * 0.95 / entry_price) if entry_price > 0 else 0
+                if qty >= 2:
+                    alert = self._virtual_portfolio.buy(
+                        req.symbol, qty, entry_price,
+                        adjusted_stop, adjusted_target,
+                    )
+                    if alert:
+                        send_telegram(alert)  # private chat, not group
+                        self._fib_dt_strategy.record_entry()
+                        self._fib_dt_strategy.mark_in_position(req.symbol)
+                        _log_daily_event('fib_dt_entry', req.symbol,
+                                         f"[SIM] BUY {qty}sh @ ${entry_price:.2f} "
+                                         f"(strategy=${req.entry_price:.2f}, scan=${scan_price:.2f})")
+                    else:
+                        log.warning(f"FIB DT: Virtual buy failed for {req.symbol} [{now_et}]")
+                else:
+                    log.warning(f"FIB DT: Insufficient virtual cash for {req.symbol} "
+                                f"(cash=${self._virtual_portfolio.cash:.0f}, price=${entry_price:.2f})")
+
+            # ── 5. Execute trailing exits (virtual portfolio) ──
             for exit_sig in trailing_exits:
                 now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
                 log.info(f"FIB DT TRAILING EXIT [{now_et}]: {exit_sig.symbol} — {exit_sig.reason}")
-                self._fib_dt_entry.execute_trailing_exit(exit_sig)
-                # Clean up tracking
-                if exit_sig.symbol in self._fib_dt_positions:
-                    self._fib_dt_positions[exit_sig.symbol]['phase'] = 'CLOSED'
+                pos = self._virtual_portfolio.positions.get(exit_sig.symbol)
+                if pos:
+                    price = current.get(exit_sig.symbol, {}).get('price', pos['entry_price'])
+                    alert = self._virtual_portfolio.trailing_exit(exit_sig.symbol, price, exit_sig.reason)
+                    if alert:
+                        send_telegram(alert)  # private chat, not group
+                    self._fib_dt_strategy.mark_position_closed(exit_sig.symbol)
 
         except Exception as e:
             log.error(f"FIB DT cycle error: {e}")
 
-    def _monitor_fib_dt_positions(self):
-        """Monitor FIB DT positions for order fills and position changes.
+    def _monitor_virtual_positions(self, current: dict):
+        """Monitor virtual portfolio positions for stop/target hits.
 
-        Detects:
-        - OCA target filled → mark_trailing (start no-new-high exit for remaining half)
-        - OCA stop filled → half stopped (other half still has its own stop)
-        - Position qty → 0 → fully closed, clean up
+        Uses real-time prices from current scan data.
         """
-        if not self._fib_dt_positions:
+        if not self._virtual_portfolio.positions:
             return
 
-        ib = _get_ibkr()
-        if not ib:
-            return
+        # Build current prices from scan data
+        current_prices = {}
+        for sym, d in current.items():
+            px = d.get('price', 0)
+            if px > 0:
+                current_prices[sym] = px
 
-        # Build lookup: symbol → actual position qty
-        pos_by_sym: dict[str, int] = {}
-        try:
-            for item in ib.portfolio():
-                if item.position > 0:
-                    pos_by_sym[item.contract.symbol] = int(item.position)
-        except Exception as e:
-            log.debug(f"FIB DT monitor: portfolio fetch error: {e}")
-            return
+        # Check stops and targets
+        alerts = self._virtual_portfolio.check_stops_and_targets(current_prices)
+        for alert in alerts:
+            send_telegram(alert)  # private chat, not group
 
-        closed_symbols = []
-
-        for sym, info in self._fib_dt_positions.items():
-            phase = info.get('phase', '')
-            if phase == 'CLOSED':
-                closed_symbols.append(sym)
-                continue
-
-            actual_qty = pos_by_sym.get(sym, 0)
-
-            # ── Position fully closed ──
-            if actual_qty == 0:
-                now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-                log.info(f"FIB DT MONITOR: {sym} position closed (qty=0)")
-                _log_daily_event('fib_dt_close', sym,
-                                 f"entry was ${info.get('entry_price', 0):.2f}")
-                self._fib_dt_strategy.mark_position_closed(sym)
-                info['phase'] = 'CLOSED'
-                closed_symbols.append(sym)
-
-                # Cancel any remaining open orders for this symbol
-                self._cancel_symbol_orders(ib, sym)
-
-                if self._send_telegram_fn:
-                    self._send_telegram_fn(
-                        f"📐 <b>FIB DT Position Closed</b>\n"
-                        f"  🕐 {now_str}\n"
-                        f"  {sym} — all shares sold\n"
-                        f"  Entry was ${info.get('entry_price', 0):.2f}"
-                    )
-                continue
-
-            # ── Check order fills for IN_POSITION phase ──
-            if phase == 'IN_POSITION':
-                expected_qty = info.get('qty', 0)
-
-                # If qty decreased, an exit order filled
-                if actual_qty < expected_qty:
-                    # Check which order filled
-                    oca_target_trade = info.get('oca_target_trade')
-                    oca_stop_trade = info.get('oca_stop_trade')
-
-                    target_filled = (
-                        oca_target_trade and
-                        oca_target_trade.orderStatus.status == 'Filled'
-                    )
-                    stop_filled = (
-                        oca_stop_trade and
-                        oca_stop_trade.orderStatus.status == 'Filled'
-                    )
-
-                    if target_filled:
-                        now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-                        half = info.get('half', 0)
-                        target_px = info.get('target_price', 0)
-                        entry_px = info.get('entry_price', 0)
-                        profit = (target_px - entry_px) * half
-                        log.info(
-                            f"FIB DT MONITOR: {sym} OCA TARGET filled — "
-                            f"{half}sh @ ${target_px:.2f} (+${profit:.2f})"
-                        )
-                        self._fib_dt_strategy.mark_trailing(sym)
-                        info['phase'] = 'TRAILING'
-
-                        if self._send_telegram_fn:
-                            self._send_telegram_fn(
-                                f"📐 <b>FIB DT Target Hit</b> 🎯\n"
-                                f"  🕐 {now_str}\n"
-                                f"  {sym}: {half}sh sold @ ${target_px:.2f}\n"
-                                f"  Profit: +${profit:.2f}\n"
-                                f"  Trailing {info.get('other_half', 0)}sh remaining"
-                            )
-
-                    elif stop_filled:
-                        now_str = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-                        half = info.get('half', 0)
-                        stop_px = info.get('stop_price', 0)
-                        entry_px = info.get('entry_price', 0)
-                        loss = (stop_px - entry_px) * half
-                        log.info(
-                            f"FIB DT MONITOR: {sym} OCA STOP filled — "
-                            f"{half}sh @ ${stop_px:.2f} (${loss:.2f})"
-                        )
-                        info['phase'] = 'HALF_STOPPED'
-
-                        if self._send_telegram_fn:
-                            self._send_telegram_fn(
-                                f"📐 <b>FIB DT Half Stopped</b> 🛑\n"
-                                f"  🕐 {now_str}\n"
-                                f"  {sym}: {half}sh stopped @ ${stop_px:.2f}\n"
-                                f"  Loss: ${loss:.2f}\n"
-                                f"  {info.get('other_half', 0)}sh still held (stop active)"
-                            )
-
-            # ── HALF_STOPPED: other half still has solo stop, just watch for close ──
-            # (actual_qty == 0 is already handled above)
-
-        # Clean up fully closed positions
-        for sym in closed_symbols:
-            del self._fib_dt_positions[sym]
-
-    @property
-    def _send_telegram_fn(self):
-        """Return the telegram send function."""
-        return self._fib_dt_entry._send_telegram
-
-    @staticmethod
-    def _cancel_symbol_orders(ib: IB, symbol: str):
-        """Cancel all open orders for a given symbol."""
-        try:
-            for trade_obj in ib.openTrades():
-                if trade_obj.contract.symbol == symbol:
-                    try:
-                        ib.cancelOrder(trade_obj.order)
-                        log.info(f"FIB DT: Cancelled order {trade_obj.order.orderId} for {symbol}")
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.debug(f"FIB DT: Error cancelling orders for {symbol}: {e}")
+        # Sync strategy state for positions entering TRAILING (once only)
+        for sym in list(self._virtual_portfolio.positions.keys()):
+            pos = self._virtual_portfolio.positions[sym]
+            if pos['phase'] == 'TRAILING' and not pos.get('trailing_synced'):
+                self._fib_dt_strategy.mark_trailing(sym)
+                pos['trailing_synced'] = True
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -3914,11 +4096,11 @@ class ScannerThread(threading.Thread):
             else:
                 status += "  ✓"
 
-        # ── Fetch account data before FIB DT (needs buying power) ──
+        # ── Fetch account data (for daily summary) ──
         self._fetch_account_data()
 
-        # ── Monitor FIB DT open positions for fills ──
-        self._monitor_fib_dt_positions()
+        # ── Monitor virtual portfolio positions for stops/targets ──
+        self._monitor_virtual_positions(current)
 
         # ── FIB DT Auto-Strategy ──
         self._run_fib_dt_cycle(current, status)
@@ -3933,12 +4115,16 @@ class ScannerThread(threading.Thread):
             _track_session_stocks(current)
             _check_stocks_in_play(current)
             _check_session_summary()
+            # Build current prices for virtual portfolio summary
+            vp_prices = {s: d.get('price', 0) for s, d in current.items() if d.get('price', 0) > 0}
+            vp_summary = self._virtual_portfolio.summary_text(vp_prices) if self._virtual_portfolio else ''
             _check_daily_summary(
                 positions=self._cached_positions,
                 net_liq=self._cached_net_liq,
                 buying_power=self._cached_buying_power,
                 fib_dt_sym=self._fib_dt_current_sym,
                 cycle_count=self.count,
+                virtual_portfolio_summary=vp_summary,
             )
 
         # ── Final GUI update with all enrichment ──
