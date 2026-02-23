@@ -127,6 +127,21 @@ _TWS_PROCESS_PATTERN = "jts"         # pattern to find TWS Java process
 _tws_last_restart: float = 0.0       # time.time() of last restart attempt
 
 
+def _ensure_tws_running() -> None:
+    """Ensure TWS is running at monitor startup. Launch via IBC if not."""
+    if _is_tws_running():
+        log.info("TWS is already running")
+        return
+    log.warning("TWS not running — launching before starting scanner...")
+    # Bypass cooldown for startup launch
+    global _tws_last_restart
+    _tws_last_restart = 0.0
+    if _restart_tws():
+        log.info("TWS launched successfully at monitor startup")
+    else:
+        log.error("Failed to launch TWS at startup — scanner will retry via auto-restart")
+
+
 def _is_tws_running() -> bool:
     """Check if TWS Java process is alive."""
     try:
@@ -4501,6 +4516,8 @@ class ScannerThread(threading.Thread):
     _CYCLE_FORCE_SECS = 120     # force IBKR reconnect if cycle exceeds this
 
     def run(self):
+        # Ensure TWS is running before starting the scanner
+        _ensure_tws_running()
         # Ensure asyncio event loop exists in this thread (ib_insync needs one)
         try:
             asyncio.get_event_loop()
