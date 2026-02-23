@@ -1210,9 +1210,10 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
             src_tag = f" [{src}]" if src else ""
             lines.append(f"  • {title_he}  <i>({h['date']}{src_tag})</i>")
 
-        # Append fib + VWAP
+        # Append fib + VWAP + MAs (recalculate from cached bars)
         if price > 0:
-            fib_txt = _format_fib_text(sym, price, vwap=d.get('vwap', 0))
+            fresh_ma = _get_fresh_ma_rows(sym, price)
+            fib_txt = _format_fib_text(sym, price, vwap=d.get('vwap', 0), ma_rows=fresh_ma)
             if fib_txt:
                 lines.append(fib_txt.strip())
 
@@ -2319,6 +2320,34 @@ def _calc_ma_table(current_price: float,
     return rows
 
 
+def _get_fresh_ma_rows(sym: str, price: float) -> list[dict] | None:
+    """Recalculate ma_rows from cached intraday bars (no new downloads).
+
+    Returns fresh ma_rows if cached bars exist, else cached ma_rows from
+    enrichment, else None.
+    """
+    _tf_specs = [
+        ('1m',  '1 min'),  ('5m',  '5 mins'), ('15m', '15 mins'),
+        ('30m', '30 mins'), ('1h',  '1 hour'), ('2h',  '2 hours'),
+        ('4h',  '4 hours'), ('W',   '1 week'),
+    ]
+    ma_frames: dict[str, pd.DataFrame | None] = {}
+    any_found = False
+    for tf_key, bar_size in _tf_specs:
+        cache_key = f"{sym}_{bar_size}"
+        entry = _intraday_cache.get(cache_key)
+        if entry:
+            ma_frames[tf_key] = entry[1]
+            any_found = True
+        else:
+            ma_frames[tf_key] = None
+    ma_frames['D'] = _daily_cache.get(sym)
+    if any_found or ma_frames['D'] is not None:
+        return _calc_ma_table(price, ma_frames)
+    # Fallback: cached ma_rows from enrichment
+    return _enrichment.get(sym, {}).get('ma_rows')
+
+
 def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
                        ma_type: str, x_start: float, y_start: float):
     """Render a compact MA table overlay on the chart axes.
@@ -2577,6 +2606,9 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     ma_frames['D'] = _daily_cache.get(sym)
 
     ma_rows = _calc_ma_table(price, ma_frames)
+    # Cache ma_rows in enrichment so other alerts (news, batch) can use them
+    if sym in _enrichment:
+        _enrichment[sym]['ma_rows'] = ma_rows
     resist_str = _find_closest_resist(price, ma_rows)
 
     # ── EPS indicator ──
@@ -4827,12 +4859,13 @@ class ScannerThread(threading.Thread):
                         clean = re.sub(r'<[^>]+>', '', ba)[:100]
                         self.on_alert(clean)
 
-                # Append fib levels for each alerted symbol
+                # Append fib levels + MAs for each alerted symbol (fresh from cache)
                 for s in batch_syms:
                     sd = current.get(s, {})
                     sp = sd.get('price', 0)
                     if sp > 0:
-                        fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0))
+                        fresh_ma = _get_fresh_ma_rows(s, sp)
+                        fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
                         if fib_txt:
                             batch_alerts.append(fib_txt.strip())
 
