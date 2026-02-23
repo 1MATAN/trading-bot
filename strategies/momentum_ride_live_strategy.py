@@ -219,6 +219,7 @@ class MomentumRideLiveStrategy:
             whatToShow="TRADES",
             useRTH=False,
             formatDate=2,
+            timeout=10,
         )
         if not bars or len(bars) < 10:
             return None, None

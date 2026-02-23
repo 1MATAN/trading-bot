@@ -3145,33 +3145,101 @@ def play_alert_sound(alert_type: str = 'hod'):
 
 
 # ══════════════════════════════════════════════════════════
-#  Telegram
+#  Telegram — Background Sender Thread
 # ══════════════════════════════════════════════════════════
 
 _TG_MAX_LEN = 4000  # Telegram limit is 4096, keep margin for safety
+_TG_SEND_TIMEOUT = 8       # seconds for text messages
+_TG_PHOTO_TIMEOUT = 12     # seconds for photo uploads
+_TG_QUEUE_MAX = 200        # max queued messages before dropping oldest
 
 
-def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
-    """Send text message to personal chat and group (if configured).
+class _TelegramSender(threading.Thread):
+    """Background thread that drains a queue and sends Telegram messages.
 
-    Auto-splits messages that exceed Telegram's 4096-char limit.
-    ``reply_markup`` can be an InlineKeyboardMarkup dict for buttons.
+    All public send_* functions enqueue work here so the scanner thread
+    is never blocked by slow/failed Telegram API calls.
     """
-    if not BOT_TOKEN or not CHAT_ID:
+
+    def __init__(self):
+        super().__init__(daemon=True, name="TelegramSender")
+        self._q: queue.Queue = queue.Queue(maxsize=_TG_QUEUE_MAX)
+
+    # ── Public (thread-safe) ──
+
+    def enqueue(self, func, *args, **kwargs):
+        """Put a send job on the queue. Drops oldest if full."""
+        try:
+            self._q.put_nowait((func, args, kwargs))
+        except queue.Full:
+            try:
+                self._q.get_nowait()           # drop oldest
+            except queue.Empty:
+                pass
+            try:
+                self._q.put_nowait((func, args, kwargs))
+            except queue.Full:
+                pass
+
+    # ── Thread loop ──
+
+    def run(self):
+        while True:
+            try:
+                func, args, kwargs = self._q.get()
+                func(*args, **kwargs)
+            except Exception as e:
+                log.error(f"TelegramSender error: {e}")
+
+
+_tg_sender = _TelegramSender()
+_tg_sender.start()
+
+
+# ── Low-level send helpers (run INSIDE _TelegramSender thread) ──
+
+def _do_send_message(chat_id: str, text: str, reply_markup: dict | None = None,
+                     reply_to: int | None = None) -> bool:
+    """Actually POST a text message to Telegram (blocking)."""
+    try:
+        payload: dict = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+        if reply_to:
+            payload['reply_to_message_id'] = reply_to
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload, timeout=_TG_SEND_TIMEOUT,
+        )
+        if not resp.ok:
+            log.warning(f"Telegram send failed ({chat_id}): {resp.status_code}")
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram ({chat_id}): {e}")
         return False
 
-    # Split long messages at double-newline boundaries
-    if len(text) > _TG_MAX_LEN:
-        chunks = _split_telegram_message(text)
-        ok = True
-        for i, chunk in enumerate(chunks):
-            # Only attach buttons to the last chunk
-            rm = reply_markup if i == len(chunks) - 1 else None
-            ok = _send_telegram_raw(chunk, rm) and ok
-        return ok
 
-    return _send_telegram_raw(text, reply_markup)
+def _do_send_photo(chat_id: str, image_path: str | Path, caption: str = "",
+                   reply_to: int | None = None) -> bool:
+    """Actually POST a photo to Telegram (blocking)."""
+    try:
+        data: dict = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
+        if reply_to:
+            data['reply_to_message_id'] = reply_to
+        with open(image_path, 'rb') as photo:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data=data, files={'photo': photo}, timeout=_TG_PHOTO_TIMEOUT,
+            )
+        if not resp.ok:
+            log.warning(f"Telegram photo failed ({chat_id}): {resp.status_code}")
+        return resp.ok
+    except Exception as e:
+        log.error(f"Telegram photo ({chat_id}): {e}")
+        return False
 
+
+# ── Public API (non-blocking — enqueue to background thread) ──
 
 def _split_telegram_message(text: str) -> list[str]:
     """Split text into chunks ≤ _TG_MAX_LEN chars, breaking at paragraph boundaries."""
@@ -3187,72 +3255,40 @@ def _split_telegram_message(text: str) -> list[str]:
     return chunks if chunks else [text[:_TG_MAX_LEN]]
 
 
-def _send_telegram_raw(text: str, reply_markup: dict | None = None) -> bool:
-    """Send a single message to private chat only (system messages)."""
-    if not CHAT_ID:
+def send_telegram(text: str, reply_markup: dict | None = None) -> bool:
+    """Send text to personal chat (non-blocking via background thread)."""
+    if not BOT_TOKEN or not CHAT_ID:
         return False
-    try:
-        payload: dict = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json=payload, timeout=10,
-        )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram ({CHAT_ID}): {e}")
-        return False
+    if len(text) > _TG_MAX_LEN:
+        chunks = _split_telegram_message(text)
+        for i, chunk in enumerate(chunks):
+            rm = reply_markup if i == len(chunks) - 1 else None
+            _tg_sender.enqueue(_do_send_message, CHAT_ID, chunk, rm)
+    else:
+        _tg_sender.enqueue(_do_send_message, CHAT_ID, text, reply_markup)
+    return True
 
 
 def send_telegram_alert(text: str, reply_markup: dict | None = None) -> bool:
-    """Send alert message to group chat only (stock alerts, momentum, etc.)."""
+    """Send alert to group chat (non-blocking via background thread)."""
     if not BOT_TOKEN or not GROUP_CHAT_ID:
         return False
-
     if len(text) > _TG_MAX_LEN:
         chunks = _split_telegram_message(text)
-        ok = True
         for i, chunk in enumerate(chunks):
             rm = reply_markup if i == len(chunks) - 1 else None
-            ok = _send_alert_raw(chunk, rm) and ok
-        return ok
-
-    return _send_alert_raw(text, reply_markup)
-
-
-def _send_alert_raw(text: str, reply_markup: dict | None = None) -> bool:
-    """Send a single alert message to group chat."""
-    try:
-        payload: dict = {'chat_id': GROUP_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
-        if reply_markup:
-            payload['reply_markup'] = reply_markup
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json=payload, timeout=10,
-        )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram alert ({GROUP_CHAT_ID}): {e}")
-        return False
+            _tg_sender.enqueue(_do_send_message, GROUP_CHAT_ID, chunk, rm)
+    else:
+        _tg_sender.enqueue(_do_send_message, GROUP_CHAT_ID, text, reply_markup)
+    return True
 
 
 def send_telegram_alert_photo(image_path: Path, caption: str = "") -> bool:
-    """Send a photo alert to group chat only."""
+    """Send a photo alert to group chat (non-blocking)."""
     if not BOT_TOKEN or not GROUP_CHAT_ID:
         return False
-    try:
-        with open(image_path, 'rb') as photo:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={'chat_id': GROUP_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
-                files={'photo': photo},
-                timeout=30,
-            )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram alert photo ({GROUP_CHAT_ID}): {e}")
-        return False
+    _tg_sender.enqueue(_do_send_photo, GROUP_CHAT_ID, str(image_path), caption)
+    return True
 
 
 def _make_lookup_button(sym: str) -> dict:
@@ -3266,59 +3302,28 @@ def _make_lookup_button(sym: str) -> dict:
 
 
 def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
-    """Send a photo to private chat only (system messages)."""
+    """Send a photo to private chat (non-blocking)."""
     if not BOT_TOKEN or not CHAT_ID:
         return False
-    try:
-        with open(image_path, 'rb') as photo:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data={'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'},
-                files={'photo': photo},
-                timeout=30,
-            )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram photo ({CHAT_ID}): {e}")
-        return False
+    _tg_sender.enqueue(_do_send_photo, CHAT_ID, str(image_path), caption)
+    return True
 
 
 def send_telegram_to(chat_id: str, text: str, reply_to: int | None = None) -> bool:
-    """Send text message to a specific chat (for lookup replies)."""
+    """Send text to a specific chat (non-blocking)."""
     if not BOT_TOKEN:
         return False
-    try:
-        payload: dict = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-        if reply_to:
-            payload['reply_to_message_id'] = reply_to
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json=payload, timeout=10,
-        )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram send_to ({chat_id}): {e}")
-        return False
+    _tg_sender.enqueue(_do_send_message, chat_id, text, None, reply_to)
+    return True
 
 
 def send_telegram_photo_to(chat_id: str, image_path: Path, caption: str = "",
                            reply_to: int | None = None) -> bool:
-    """Send photo to a specific chat (for lookup replies)."""
+    """Send photo to a specific chat (non-blocking)."""
     if not BOT_TOKEN:
         return False
-    try:
-        data: dict = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
-        if reply_to:
-            data['reply_to_message_id'] = reply_to
-        with open(image_path, 'rb') as photo:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                data=data, files={'photo': photo}, timeout=30,
-            )
-        return resp.ok
-    except Exception as e:
-        log.error(f"Telegram photo_to ({chat_id}): {e}")
-        return False
+    _tg_sender.enqueue(_do_send_photo, chat_id, str(image_path), caption, reply_to)
+    return True
 
 
 # ══════════════════════════════════════════════════════════
@@ -4372,6 +4377,9 @@ class ScannerThread(threading.Thread):
             if self.on_stocks and merged:
                 self.on_stocks(merged)
 
+    _CYCLE_WARN_SECS = 60      # warn if cycle exceeds this
+    _CYCLE_FORCE_SECS = 120     # force IBKR reconnect if cycle exceeds this
+
     def run(self):
         # Ensure asyncio event loop exists in this thread (ib_insync needs one)
         try:
@@ -4383,7 +4391,9 @@ class ScannerThread(threading.Thread):
         self._telegram_listener = TelegramListenerThread(self._lookup_queue)
         self._telegram_listener.start()
         log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
+        self._consecutive_slow = 0
         while self.running:
+            cycle_start = time_mod.time()
             try:
                 self._cycle()
             except Exception as e:
@@ -4392,6 +4402,29 @@ class ScannerThread(threading.Thread):
                     self.on_status(f"Error: {e}")
                 # Backoff on error to prevent spin loop
                 time_mod.sleep(5)
+            # ── Watchdog: detect slow/stuck cycles ──
+            cycle_dur = time_mod.time() - cycle_start
+            if cycle_dur > self._CYCLE_FORCE_SECS:
+                self._consecutive_slow += 1
+                log.warning(f"WATCHDOG: cycle took {cycle_dur:.0f}s (>{self._CYCLE_FORCE_SECS}s). "
+                            f"Consecutive slow: {self._consecutive_slow}. Forcing IBKR reconnect.")
+                global _ibkr
+                if _ibkr:
+                    try:
+                        _ibkr.disconnect()
+                    except Exception:
+                        pass
+                    _ibkr = None
+                send_telegram(
+                    f"⚠️ <b>Watchdog: cycle איטי</b>\n"
+                    f"  משך: {cycle_dur:.0f}s | רצף: {self._consecutive_slow}\n"
+                    f"  מאפס חיבור IBKR..."
+                )
+            elif cycle_dur > self._CYCLE_WARN_SECS:
+                self._consecutive_slow += 1
+                log.warning(f"WATCHDOG: cycle took {cycle_dur:.0f}s (>{self._CYCLE_WARN_SECS}s)")
+            else:
+                self._consecutive_slow = 0
             for _ in range(self.freq):
                 if not self.running:
                     break
@@ -4875,6 +4908,12 @@ class ScannerThread(threading.Thread):
                 log.debug(f"Fib refresh {sym}: {e}")
 
     def _cycle(self):
+        _t0 = time_mod.time()
+        def _phase(name):
+            elapsed = time_mod.time() - _t0
+            if elapsed > 10:
+                log.info(f"  cycle phase '{name}' @ {elapsed:.1f}s")
+
         _check_market_reminders()
         _check_holiday_alerts()
         _reset_alerts_if_new_day()
@@ -4901,11 +4940,13 @@ class ScannerThread(threading.Thread):
         self._last_session = current_session
 
         # ── OCR scan with IBKR fallback ──
+        _phase('scan_start')
         current = _run_ocr_scan(self.price_min, self.price_max)
         scan_source = "OCR"
         if not current:
             current = _run_ibkr_scan(self.price_min, self.price_max)
             scan_source = "IBKR"
+        _phase('scan_done')
 
         # Track when each stock was last found by a fresh scan
         now_ts = time_mod.time()
@@ -4934,7 +4975,9 @@ class ScannerThread(threading.Thread):
             if momentum_syms:
                 if self.on_status:
                     self.on_status(f"Enriching {len(momentum_syms)} momentum stocks via IBKR...")
+                _phase('ibkr_enrich_start')
                 _enrich_with_ibkr(current, momentum_syms)
+                _phase('ibkr_enrich_done')
 
         if not current and not self.previous:
             if self.on_status:
@@ -4969,6 +5012,7 @@ class ScannerThread(threading.Thread):
             log.info(f"Enrichment filter: {len(new_syms)} stocks ≥{MIN_ENRICH_PCT}% (skipped {skipped} below threshold)")
 
         # ── Enrich stocks (Finviz + Fib) ──
+        _phase('finviz_enrich_start')
         enriched_count = 0
         for sym in new_syms:
             if sym in _enrichment:
@@ -5158,19 +5202,24 @@ class ScannerThread(threading.Thread):
                 status += "  ✓"
 
         # ── Fetch account data (for daily summary) ──
+        _phase('alerts_done')
         self._fetch_account_data()
 
         # ── Monitor virtual portfolio positions for stops/targets ──
         self._monitor_virtual_positions(current)
 
         # ── FIB DT Auto-Strategy ──
+        _phase('fib_dt_start')
         self._run_fib_dt_cycle(current, status)
+        _phase('fib_dt_done')
 
         # ── Gap and Go Auto-Strategy ──
         self._run_gap_go_cycle(current)
+        _phase('gg_done')
 
         # ── Momentum Ride Auto-Strategy ──
         self._run_momentum_ride_cycle(current)
+        _phase('mr_done')
 
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)

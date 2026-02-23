@@ -29,6 +29,8 @@ _ET = ZoneInfo("US/Eastern")
 
 _CONNECT_TIMEOUT = 10
 _ACCOUNT_POLL_INTERVAL = 5   # seconds between account data refreshes
+_ACCOUNT_FETCH_TIMEOUT = 8   # max seconds for a single account data fetch
+_STALE_THRESHOLD = 30        # force reconnect if no successful fetch for this long
 
 
 def _make_stop_limit(action: str, qty: int, stop_price: float,
@@ -95,6 +97,7 @@ class OrderThread(threading.Thread):
         self._running = False
         self._ib: IB | None = None
         self._contract_cache: dict[str, Stock] = {}
+        self._last_successful_fetch: float = time_mod.time()
 
         # Cached account data (accessible from GUI thread)
         self.net_liq: float = 0.0
@@ -212,6 +215,17 @@ class OrderThread(threading.Thread):
     # ── Account data ──
 
     def _fetch_account_data(self):
+        # Force reconnect if we haven't had a successful fetch recently
+        elapsed_since_ok = time_mod.time() - self._last_successful_fetch
+        if elapsed_since_ok > _STALE_THRESHOLD:
+            log.warning(f"OrderThread: no successful fetch for {elapsed_since_ok:.0f}s, forcing reconnect")
+            if self._ib:
+                try:
+                    self._ib.disconnect()
+                except Exception:
+                    pass
+                self._ib = None
+
         ib = self._ensure_connected()
         if not ib:
             return
@@ -254,6 +268,7 @@ class OrderThread(threading.Thread):
             self.net_liq = net_liq
             self.buying_power = buying_power
             self.positions = positions
+            self._last_successful_fetch = time_mod.time()
 
             if positions:
                 pos_str = ", ".join(f"{s} {p[0]}@${p[1]:.2f}" for s, p in positions.items())
@@ -265,6 +280,15 @@ class OrderThread(threading.Thread):
                 self.on_account(net_liq, buying_power, positions)
         except Exception as e:
             log.error(f"OrderThread: account fetch failed: {e}")
+            # If fetch keeps failing, force reconnect sooner
+            if time_mod.time() - self._last_successful_fetch > _STALE_THRESHOLD / 2:
+                log.warning("OrderThread: consecutive failures, will reconnect next cycle")
+                if self._ib:
+                    try:
+                        self._ib.disconnect()
+                    except Exception:
+                        pass
+                    self._ib = None
 
     # ── Order execution ──
 
