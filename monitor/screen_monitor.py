@@ -1770,6 +1770,178 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
 
 
 # ══════════════════════════════════════════════════════════
+#  Weekly Report & Reset
+# ══════════════════════════════════════════════════════════
+
+_WEEKLY_STATE_PATH = DATA_DIR / "weekly_reset_state.json"
+_weekly_report_sent: str = ''   # week key, e.g. '2026-W08'
+_weekly_reset_done: str = ''    # week key
+
+# Load persisted weekly guards on module init
+try:
+    if _WEEKLY_STATE_PATH.exists():
+        with open(_WEEKLY_STATE_PATH) as _f:
+            _ws = json.load(_f)
+            _weekly_report_sent = _ws.get('report_sent', '')
+            _weekly_reset_done = _ws.get('reset_done', '')
+        del _ws, _f
+except Exception:
+    pass
+
+
+def _save_weekly_state():
+    """Persist weekly report/reset guards to disk."""
+    try:
+        with open(_WEEKLY_STATE_PATH, 'w') as f:
+            json.dump({
+                'report_sent': _weekly_report_sent,
+                'reset_done': _weekly_reset_done,
+            }, f, indent=2)
+    except Exception as e:
+        log.warning(f"Weekly state save error: {e}")
+
+
+def _week_key() -> str:
+    """Return ISO week key like '2026-W08' for the current week."""
+    now = datetime.now(_ET)
+    return f"{now.year}-W{now.isocalendar()[1]:02d}"
+
+
+def _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict) -> str:
+    """Build a comprehensive weekly performance report for all 3 portfolios."""
+    lines = [
+        f"📊 <b>דוח שבועי — שבוע {_week_key()}</b>",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for label, vp, journal_path in [
+        ("📐 FIB DT [SIM]", fib_vp, VirtualPortfolio.JOURNAL_PATH),
+        ("🚀 Gap&Go [GG-SIM]", gg_vp, GGVirtualPortfolio.JOURNAL_PATH),
+        ("📈 Momentum Ride [MR-SIM]", mr_vp, MRVirtualPortfolio.JOURNAL_PATH),
+    ]:
+        nlv = vp.net_liq(current_prices)
+        total_pnl = nlv - vp.INITIAL_CASH
+        pnl_pct = (nlv / vp.INITIAL_CASH - 1) * 100
+
+        # Read journal for trade stats
+        wins, losses, total_realized = 0, 0, 0.0
+        best_trade = ('', 0.0)
+        worst_trade = ('', 0.0)
+        total_sells = 0
+        try:
+            if journal_path.exists():
+                df = pd.read_csv(journal_path)
+                sells = df[df['side'] == 'SELL'] if 'side' in df.columns else pd.DataFrame()
+                total_sells = len(sells)
+                if not sells.empty and 'pnl' in sells.columns:
+                    pnls = sells['pnl'].astype(float)
+                    wins = int((pnls > 0).sum())
+                    losses = int((pnls < 0).sum())
+                    total_realized = float(pnls.sum())
+                    if len(pnls) > 0:
+                        best_idx = pnls.idxmax()
+                        worst_idx = pnls.idxmin()
+                        best_sym = sells.loc[best_idx, 'symbol'] if 'symbol' in sells.columns else '?'
+                        worst_sym = sells.loc[worst_idx, 'symbol'] if 'symbol' in sells.columns else '?'
+                        best_trade = (best_sym, float(pnls.loc[best_idx]))
+                        worst_trade = (worst_sym, float(pnls.loc[worst_idx]))
+        except Exception as e:
+            log.warning(f"Weekly report CSV read error ({label}): {e}")
+
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+
+        lines.append("")
+        lines.append(f"<b>{label}</b>")
+        lines.append(f"  💵 Cash: ${vp.cash:,.0f}")
+        lines.append(f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)")
+        lines.append(f"  💰 Realized P&L: ${total_realized:+,.2f}")
+        lines.append(f"  📝 Sells: {total_sells} | Wins: {wins} | Losses: {losses} | Win Rate: {win_rate:.0f}%")
+        if best_trade[1] != 0:
+            lines.append(f"  🏆 Best: {best_trade[0]} ${best_trade[1]:+.2f}")
+        if worst_trade[1] != 0:
+            lines.append(f"  💀 Worst: {worst_trade[0]} ${worst_trade[1]:+.2f}")
+        if vp.positions:
+            lines.append(f"  📋 Open positions ({len(vp.positions)}):")
+            for sym, pos in vp.positions.items():
+                px = current_prices.get(sym, pos['entry_price'])
+                qty = pos.get('qty', pos.get('other_half', 0))
+                sym_pnl = (px - pos['entry_price']) * qty
+                lines.append(f"    • {sym}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+
+    # Combined totals
+    combined_nlv = sum(vp.net_liq(current_prices) for vp in [fib_vp, gg_vp, mr_vp])
+    combined_initial = fib_vp.INITIAL_CASH + gg_vp.INITIAL_CASH + mr_vp.INITIAL_CASH
+    combined_pnl = combined_nlv - combined_initial
+    combined_pct = (combined_nlv / combined_initial - 1) * 100
+
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<b>סה\"כ משולב (3 אסטרטגיות):</b>")
+    lines.append(f"  💰 השקעה: ${combined_initial:,.0f}")
+    lines.append(f"  📊 Net Liq: ${combined_nlv:,.0f} ({combined_pct:+.1f}%)")
+    lines.append(f"  {'💚' if combined_pnl >= 0 else '❤️'} P&L: ${combined_pnl:+,.2f}")
+    lines.append("")
+    lines.append("🔄 איפוס שבועי ביום שני 04:00 ET")
+
+    return "\n".join(lines)
+
+
+def _check_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict):
+    """Send weekly performance report on Friday 16:03-16:10 ET."""
+    global _weekly_report_sent
+    now_et = datetime.now(_ET)
+
+    wk = _week_key()
+    if wk == _weekly_report_sent:
+        return
+    # Only on Friday (weekday=4)
+    if now_et.weekday() != 4:
+        return
+    t = now_et.time()
+    if not (time(16, 3) <= t <= time(16, 10)):
+        return
+
+    _weekly_report_sent = wk
+    _save_weekly_state()
+
+    report = _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices)
+    send_telegram(report)
+    log.info(f"Weekly report sent for {wk}")
+
+
+def _check_weekly_reset(fib_vp, gg_vp, mr_vp):
+    """Reset all 3 portfolios on Monday 03:30-04:00 ET."""
+    global _weekly_reset_done
+    now_et = datetime.now(_ET)
+
+    wk = _week_key()
+    if wk == _weekly_reset_done:
+        return
+    # Only on Monday (weekday=0)
+    if now_et.weekday() != 0:
+        return
+    t = now_et.time()
+    if not (time(3, 30) <= t <= time(4, 0)):
+        return
+
+    _weekly_reset_done = wk
+    _save_weekly_state()
+
+    fib_vp.reset()
+    gg_vp.reset()
+    mr_vp.reset()
+
+    send_telegram(
+        f"🔄 <b>איפוס שבועי — {wk}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"כל 3 הפורטפוליו אופסו ל-$3,000.\n"
+        f"📐 FIB DT | 🚀 Gap&Go | 📈 Momentum Ride\n"
+        f"שבוע חדש מתחיל! 🚀"
+    )
+    log.info(f"Weekly reset done for {wk}")
+
+
+# ══════════════════════════════════════════════════════════
 #  Session Summaries (pre-market / market / after-hours)
 # ══════════════════════════════════════════════════════════
 
@@ -1927,6 +2099,9 @@ _VOL_ALERT_COOLDOWN_SEC = 1800  # 30 min cooldown per symbol for volume alerts
 _vol_alert_sent: dict[str, float] = {}  # sym -> last alert timestamp
 VOL_ALERT_RVOL_MIN = 3.0  # minimum RVOL for volume alert
 
+_DOJI_COOLDOWN_SEC = 300  # 5 min cooldown per symbol+timeframe
+_doji_alerted: dict[str, float] = {}  # "SYM_5m" → timestamp
+
 
 def _reset_alerts_if_new_day():
     """Clear all alert tracking state when date changes."""
@@ -1943,6 +2118,7 @@ def _reset_alerts_if_new_day():
         _price_history.clear()
         _spike_alerted.clear()
         _vol_alert_sent.clear()
+        _doji_alerted.clear()
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
@@ -1972,7 +2148,7 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
         _hod_break_alerted[sym] = cur_high
         pct = current.get('pct', 0)
         return (
-            f"🔺 <b>HOD BREAK — {sym}</b>\n"
+            f"🟢 🔺 <b>HOD BREAK — {sym}</b>\n"
             f"💰 ${price:.2f} → שיא יומי חדש!\n"
             f"📊 קודם: ${prev_high:.2f} | שינוי: {pct:+.1f}%"
         )
@@ -2008,7 +2184,7 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
                     info = ratio_map.get(lv_key)
                     ratio_label = f"{info[0]} {info[1]}" if info else ""
                     return (
-                        f"🎯🎯 <b>FIB TOUCH x2 — {sym}</b>\n"
+                        f"🟢 🎯🎯 <b>FIB TOUCH x2 — {sym}</b>\n"
                         f"📍 רמה: ${lv:.4f} ({ratio_label})\n"
                         f"💰 ${price:.2f} | שינוי: {pct:+.1f}%"
                     )
@@ -2031,7 +2207,7 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
         _lod_touch_tracker[sym] = count
         if count == 2:
             return (
-                f"🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
+                f"🔴 🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
                 f"📍 נמוך יומי: ${day_low:.2f}\n"
                 f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                 f"⚠️ נגיעה שנייה — תמיכה/שבירה?"
@@ -2059,13 +2235,13 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
 
     if prev_side == 'below':
         return (
-            f"⚡ <b>VWAP CROSS — {sym}</b>\n"
+            f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"🟢 חצה מעל VWAP!\n"
             f"💰 ${price:.2f} > VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
     else:
         return (
-            f"⚡ <b>VWAP CROSS — {sym}</b>\n"
+            f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"🔴 חצה מתחת VWAP!\n"
             f"💰 ${price:.2f} < VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
@@ -2114,7 +2290,7 @@ def check_spike(sym: str, price: float, pct: float) -> str | None:
     if change_pct >= 8.0:
         _spike_alerted[sym] = now
         return (
-            f"🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b>\n"
+            f"🟠 🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b>\n"
             f"⏱️ עלייה של {change_pct:.1f}% ב-{elapsed_min:.1f} דקות!\n"
             f"💰 ${old_price:.2f} → ${price:.2f} | יומי: {pct:+.1f}%"
         )
@@ -2153,11 +2329,53 @@ def check_volume_alert(sym: str, price: float, vwap: float,
             news_line = f"\n📰 {title}"
 
     return (
-        f"📊 <b>VOLUME — {sym}</b>\n"
+        f"🟣 📊 <b>VOLUME — {sym}</b>\n"
         f"🔥 RVOL {rvol:.1f}x | מעל VWAP!\n"
         f"💰 ${price:.2f} ({pct:+.1f}%) > VWAP ${vwap:.2f}"
         f"{news_line}"
     )
+
+
+def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
+    """Alert on Doji candles across 1m/5m/15m/30m/1h timeframes."""
+    if sym not in _enrichment:
+        return None
+
+    tf_specs = [
+        ('1 min',   '1m',  '2 D'),
+        ('5 mins',  '5m',  '5 D'),
+        ('15 mins', '15m', '2 W'),
+        ('30 mins', '30m', '1 M'),
+        ('1 hour',  '1h',  '3 M'),
+    ]
+    doji_hits = []
+    now = time_mod.time()
+
+    for bar_size, tf_label, duration in tf_specs:
+        cooldown_key = f"{sym}_{tf_label}"
+        if now - _doji_alerted.get(cooldown_key, 0) < _DOJI_COOLDOWN_SEC:
+            continue
+
+        df = _download_intraday(sym, bar_size=bar_size, duration=duration)
+        if df is None or len(df) < 2:
+            continue
+
+        last = df.iloc[-1]
+        o, h, l, c = last['open'], last['high'], last['low'], last['close']
+        total_range = h - l
+        if total_range <= 0 or h <= 0:
+            continue
+        body = abs(c - o)
+        # Doji: body ≤ 10% of range, range ≥ 0.3% of price (not flat)
+        if body <= total_range * 0.10 and total_range / h >= 0.003:
+            doji_hits.append(tf_label)
+            _doji_alerted[cooldown_key] = now
+
+    if not doji_hits:
+        return None
+
+    tf_str = ", ".join(doji_hits)
+    return f"🟡 ⏸️ <b>Doji [{tf_str}]</b> — {sym}  ${price:.2f}  {pct:+.1f}%"
 
 
 # ══════════════════════════════════════════════════════════
@@ -3623,6 +3841,25 @@ class VirtualPortfolio:
 
         return "\n".join(lines)
 
+    def reset(self):
+        """Reset portfolio for new week. Archive old journal, start fresh."""
+        # Archive old journal
+        if self.JOURNAL_PATH.exists():
+            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
+            archive = self.JOURNAL_PATH.with_name(f"virtual_trades_week_{week_label}.csv")
+            try:
+                self.JOURNAL_PATH.rename(archive)
+                log.info(f"FIB DT journal archived → {archive.name}")
+            except Exception as e:
+                log.warning(f"FIB DT journal archive error: {e}")
+        # Reset state
+        self.cash = self.INITIAL_CASH
+        self.positions = {}
+        self.trades = []
+        self._init_journal()
+        self._save_state()
+        log.info("FIB DT portfolio reset to $3,000")
+
 
 # ══════════════════════════════════════════════════════════
 #  Gap and Go Virtual Portfolio
@@ -3661,17 +3898,12 @@ class GGVirtualPortfolio:
             log.warning(f"GG state save error: {e}")
 
     def _load_state(self):
-        """Load portfolio state from disk if same trading day."""
+        """Load portfolio state from disk (persists across days within the week)."""
         try:
             if not self._STATE_PATH.exists():
                 return
             with open(self._STATE_PATH) as f:
                 state = json.load(f)
-            saved_date = state.get('date', '')
-            today = datetime.now(_ET).strftime('%Y-%m-%d')
-            if saved_date != today:
-                log.info(f"GG state from {saved_date}, today is {today} — starting fresh")
-                return
             self.cash = state.get('cash', self.INITIAL_CASH)
             self.positions = state.get('positions', {})
             if self.positions:
@@ -3820,6 +4052,23 @@ class GGVirtualPortfolio:
 
         return "\n".join(lines)
 
+    def reset(self):
+        """Reset portfolio for new week. Archive old journal, start fresh."""
+        if self.JOURNAL_PATH.exists():
+            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
+            archive = self.JOURNAL_PATH.with_name(f"gg_virtual_trades_week_{week_label}.csv")
+            try:
+                self.JOURNAL_PATH.rename(archive)
+                log.info(f"GG journal archived → {archive.name}")
+            except Exception as e:
+                log.warning(f"GG journal archive error: {e}")
+        self.cash = self.INITIAL_CASH
+        self.positions = {}
+        self.trades = []
+        self._init_journal()
+        self._save_state()
+        log.info("GG portfolio reset to $3,000")
+
 
 # ──────────────────────────────────────────────────────────
 #  MR Virtual Portfolio (Momentum Ride paper simulation)
@@ -3858,17 +4107,12 @@ class MRVirtualPortfolio:
             log.warning(f"MR state save error: {e}")
 
     def _load_state(self):
-        """Load portfolio state from disk if same trading day."""
+        """Load portfolio state from disk (persists across days within the week)."""
         try:
             if not self._STATE_PATH.exists():
                 return
             with open(self._STATE_PATH) as f:
                 state = json.load(f)
-            saved_date = state.get('date', '')
-            today = datetime.now(_ET).strftime('%Y-%m-%d')
-            if saved_date != today:
-                log.info(f"MR state from {saved_date}, today is {today} — starting fresh")
-                return
             self.cash = state.get('cash', self.INITIAL_CASH)
             self.positions = state.get('positions', {})
             if self.positions:
@@ -4019,6 +4263,23 @@ class MRVirtualPortfolio:
             lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
 
         return "\n".join(lines)
+
+    def reset(self):
+        """Reset portfolio for new week. Archive old journal, start fresh."""
+        if self.JOURNAL_PATH.exists():
+            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
+            archive = self.JOURNAL_PATH.with_name(f"mr_virtual_trades_week_{week_label}.csv")
+            try:
+                self.JOURNAL_PATH.rename(archive)
+                log.info(f"MR journal archived → {archive.name}")
+            except Exception as e:
+                log.warning(f"MR journal archive error: {e}")
+        self.cash = self.INITIAL_CASH
+        self.positions = {}
+        self.trades = []
+        self._init_journal()
+        self._save_state()
+        log.info("MR portfolio reset to $3,000")
 
 
 # ══════════════════════════════════════════════════════════
@@ -4852,6 +5113,15 @@ class ScannerThread(threading.Thread):
                     if sym not in batch_syms:
                         batch_syms.append(sym)
 
+                # Doji candle alert
+                doji_msg = check_doji_candle(sym, price, pct)
+                if doji_msg:
+                    batch_alerts.append(doji_msg)
+                    play_alert_sound('spike')
+                    _daily_alert_counts['Doji'] = _daily_alert_counts.get('Doji', 0) + 1
+                    if sym not in batch_syms:
+                        batch_syms.append(sym)
+
             # Send all alerts as one batch
             if batch_alerts:
                 if self.on_alert:
@@ -4927,6 +5197,8 @@ class ScannerThread(threading.Thread):
                 gg_portfolio_summary=gg_summary,
                 mr_portfolio_summary=mr_summary,
             )
+            _check_weekly_report(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, vp_prices)
+            _check_weekly_reset(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
