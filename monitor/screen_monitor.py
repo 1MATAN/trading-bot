@@ -1323,10 +1323,11 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
     if not above and not below:
         return ""
 
-    # Build sorted list of MA values for interleaving with fib levels
-    # Only meaningful timeframes (skip 1m, 5m, 15m, 4h — too noisy)
-    _TF_KEEP = {'1h': 'H1', 'D': 'D', 'W': 'W', 'MO': 'MO'}
-    ma_sorted: list[tuple[float, str]] = []  # (value, label)
+    # Build sorted list of MA values for interleaving between fib levels
+    # All timeframes except 4h
+    _TF_KEEP = {'1m': 'M1', '5m': 'M5', '15m': 'M15', '1h': 'H1',
+                'D': 'D', 'W': 'W', 'MO': 'MO'}
+    ma_all: list[tuple[float, str]] = []  # (value, label)
     if ma_rows:
         for r in ma_rows:
             tf_s = _TF_KEEP.get(r['tf'])
@@ -1335,8 +1336,7 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
             for ma_type, key in [('S', 'sma'), ('E', 'ema')]:
                 val = r.get(key)
                 if val and val > 0:
-                    ma_sorted.append((val, f"{ma_type}{r['period']} {tf_s}"))
-        ma_sorted.sort(reverse=True)  # highest first (matches descending fib order)
+                    ma_all.append((val, f"{ma_type}{r['period']} {tf_s}"))
 
     def _icon(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
@@ -1359,46 +1359,39 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
         pct_dist = (v - price) / price * 100
         return f"📊 <b>VWAP {_p(v)}</b>  {pct_dist:+.1f}%"
 
-    def _ma_line(labels: list[str]) -> str:
-        return f"  ╌╌ {', '.join(labels)}"
+    # Build descending anchor list: fib levels + VWAP + price separator
+    anchors: list[float] = sorted(
+        set([lv for lv in above] + [lv for lv in below]
+            + ([vwap] if vwap > 0 else []) + [price]),
+        reverse=True,
+    )
+    fib_range_lo = below[-1] if below else price
+    fib_range_hi = above[0] if above else price
 
-    # Build unified descending list: fib levels + VWAP + MAs, all by value
-    # Collect all items as (value, type, content)
-    items: list[tuple[float, int, str]] = []  # (value, priority, line)
-    # priority: 0=fib, 1=vwap, 2=ma (fib first when same value)
-    for lv in all_levels:
-        if lv in [l for l in above] or lv in [l for l in below]:
-            items.append((lv, 0, _fmt(lv)))
-    if vwap > 0:
-        items.append((vwap, 1, _vwap_line(vwap)))
-
-    # Group nearby MAs (within 0.5% of each other) into single lines
-    if ma_sorted:
-        groups: list[list[tuple[float, str]]] = []
-        for val, label in ma_sorted:
-            if groups and abs(val - groups[-1][0][0]) / max(groups[-1][0][0], 0.001) * 100 <= 0.5:
-                groups[-1].append((val, label))
-            else:
-                groups.append([(val, label)])
-        for grp in groups:
-            avg_val = sum(v for v, _ in grp) / len(grp)
-            labels = [lb for _, lb in grp]
-            items.append((avg_val, 2, _ma_line(labels)))
-
-    # Sort descending by value, then by priority (fib before MA at same level)
-    items.sort(key=lambda x: (-x[0], x[1]))
+    # Bucket MAs into intervals between adjacent anchors (only within fib range)
+    # bucket[i] holds MAs that fall between anchors[i] and anchors[i+1]
+    buckets: list[list[str]] = [[] for _ in range(len(anchors) - 1)]
+    for val, label in ma_all:
+        if val > fib_range_hi or val < fib_range_lo:
+            continue  # skip MAs outside the displayed fib range
+        for i in range(len(anchors) - 1):
+            if anchors[i] >= val > anchors[i + 1]:
+                buckets[i].append(label)
+                break
 
     lines = [f"\n📐 <b>פיבונאצ'י</b> ({sym})"]
     lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
     lines.append("")
-    price_line_added = False
-    for val, prio, line in items:
-        if not price_line_added and val <= price:
+    for i, a in enumerate(anchors):
+        if a == price:
             lines.append(f"━━━━ ${price:.2f} ━━━━")
-            price_line_added = True
-        lines.append(line)
-    if not price_line_added:
-        lines.append(f"━━━━ ${price:.2f} ━━━━")
+        elif a == vwap and vwap > 0:
+            lines.append(_vwap_line(vwap))
+        else:
+            lines.append(_fmt(a))
+        # Append MA bucket between this anchor and the next
+        if i < len(buckets) and buckets[i]:
+            lines.append(f"  ╌╌ {', '.join(buckets[i])}")
     return "\n".join(lines)
 
 
