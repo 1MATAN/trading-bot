@@ -119,6 +119,103 @@ _IBKR_BACKOFF_BASE = 5               # initial backoff seconds
 _IBKR_BACKOFF_MAX = 120              # max backoff seconds
 _IBKR_MAX_RETRIES = 3                # retries per _get_ibkr call
 
+# ── TWS Auto-Restart ──
+_TWS_LAUNCHER = Path.home() / "Jts" / "interil" / "tws"
+_TWS_CONFIG_DIR = Path.home() / "Jts"
+_TWS_RESTART_COOLDOWN = 300          # minimum seconds between restart attempts
+_TWS_API_WAIT_TIMEOUT = 90           # seconds to wait for API port after launch
+_TWS_PROCESS_PATTERN = "jts"         # pattern to find TWS Java process
+_tws_last_restart: float = 0.0       # time.time() of last restart attempt
+
+
+def _is_tws_running() -> bool:
+    """Check if TWS Java process is alive."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"java.*{_TWS_PROCESS_PATTERN}"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _wait_for_tws_api(timeout: int = _TWS_API_WAIT_TIMEOUT) -> bool:
+    """Wait until TWS API port accepts connections."""
+    import socket
+    deadline = time_mod.time() + timeout
+    while time_mod.time() < deadline:
+        try:
+            with socket.create_connection((IBKR_HOST, IBKR_PORT), timeout=2):
+                return True
+        except (ConnectionRefusedError, OSError, socket.timeout):
+            time_mod.sleep(3)
+    return False
+
+
+def _restart_tws() -> bool:
+    """Launch TWS if it's not running. Returns True if launch was attempted.
+
+    Respects a cooldown to avoid spamming restarts.
+    TWS needs DISPLAY for its GUI — we inherit from the monitor process.
+    """
+    global _tws_last_restart
+
+    # Cooldown guard
+    elapsed = time_mod.time() - _tws_last_restart
+    if elapsed < _TWS_RESTART_COOLDOWN:
+        log.info(f"TWS restart cooldown: {_TWS_RESTART_COOLDOWN - elapsed:.0f}s remaining")
+        return False
+
+    # Already running?
+    if _is_tws_running():
+        log.info("TWS process is alive — not restarting")
+        return False
+
+    # Launcher exists?
+    if not _TWS_LAUNCHER.is_file():
+        log.error(f"TWS launcher not found: {_TWS_LAUNCHER}")
+        return False
+
+    _tws_last_restart = time_mod.time()
+    log.warning("TWS process not found — attempting auto-restart...")
+    send_telegram(
+        "🔄 <b>TWS Auto-Restart</b>\n"
+        "  TWS process not detected — launching...\n"
+        f"  Waiting up to {_TWS_API_WAIT_TIMEOUT}s for API port {IBKR_PORT}"
+    )
+
+    try:
+        # Launch TWS in background (the script uses exec internally)
+        # We need to wrap in bash because the tws script uses exec
+        subprocess.Popen(
+            ["bash", "-c", f'"{_TWS_LAUNCHER}" -J-DjtsConfigDir="{_TWS_CONFIG_DIR}" &'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # detach from our process group
+        )
+        log.info("TWS launch command sent, waiting for API port...")
+
+        if _wait_for_tws_api():
+            log.info(f"TWS API port {IBKR_PORT} is accepting connections!")
+            send_telegram(
+                f"✅ <b>TWS Restarted Successfully</b>\n"
+                f"  API port {IBKR_PORT} is ready\n"
+                f"  Reconnecting scanner..."
+            )
+            return True
+        else:
+            log.error(f"TWS API port {IBKR_PORT} did not open within {_TWS_API_WAIT_TIMEOUT}s")
+            send_telegram(
+                f"❌ <b>TWS Restart Failed</b>\n"
+                f"  API port {IBKR_PORT} not available after {_TWS_API_WAIT_TIMEOUT}s\n"
+                f"  Manual intervention may be required"
+            )
+            return False
+    except Exception as e:
+        log.error(f"TWS restart failed: {e}")
+        return False
+
 # ── Contract cache (avoid repeated qualifyContracts round-trips) ──
 _contract_cache: dict[str, Stock] = {}
 # OCR symbol corrections discovered during IBKR validation (e.g. EVTIV→EVTV)
@@ -250,6 +347,22 @@ def _get_ibkr() -> IB | None:
             f"  ניסיון הבא עוד {backoff:.0f} שניות\n"
             f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+
+    # ── TWS Auto-Restart: if process is dead, try to relaunch ──
+    if _ibkr_fail_count >= 2 and not _is_tws_running():
+        log.warning("TWS process not found after multiple IBKR failures — auto-restarting")
+        if _restart_tws():
+            # TWS is back — try connecting one more time
+            try:
+                _ibkr = IB()
+                _ibkr.connect(IBKR_HOST, IBKR_PORT, clientId=MONITOR_IBKR_CLIENT_ID, timeout=15)
+                log.info("IBKR connected after TWS auto-restart!")
+                _ibkr_fail_count = 0
+                return _ibkr
+            except Exception as e:
+                log.error(f"IBKR connect after TWS restart failed: {e}")
+                _ibkr = None
+
     return None
 
 
