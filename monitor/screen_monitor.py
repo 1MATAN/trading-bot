@@ -1323,26 +1323,20 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
     if not above and not below:
         return ""
 
-    # Build flat list of MA values for proximity matching
-    _TF_SHORT = {'1m': 'M1', '5m': 'M5', '15m': 'M15', '1h': 'H1',
-                 '4h': 'H4', 'D': 'D', 'W': 'W', 'MO': 'MO'}
-    ma_flat: list[tuple[str, float]] = []  # (label, value)
+    # Build sorted list of MA values for interleaving with fib levels
+    # Only meaningful timeframes (skip 1m, 5m, 15m, 4h — too noisy)
+    _TF_KEEP = {'1h': 'H1', 'D': 'D', 'W': 'W', 'MO': 'MO'}
+    ma_sorted: list[tuple[float, str]] = []  # (value, label)
     if ma_rows:
         for r in ma_rows:
-            tf_s = _TF_SHORT.get(r['tf'], r['tf'])
+            tf_s = _TF_KEEP.get(r['tf'])
+            if not tf_s:
+                continue
             for ma_type, key in [('S', 'sma'), ('E', 'ema')]:
                 val = r.get(key)
                 if val and val > 0:
-                    ma_flat.append((f"{ma_type}{r['period']} {tf_s}", val))
-
-    def _nearby_mas(lv: float, threshold_pct: float = 3.0) -> str:
-        if not ma_flat:
-            return ""
-        hits = []
-        for label, val in ma_flat:
-            if abs(val - lv) / lv * 100 <= threshold_pct:
-                hits.append(f"{label} {_p(val)}")
-        return f"  ◀ {', '.join(hits)}" if hits else ""
+                    ma_sorted.append((val, f"{ma_type}{r['period']} {tf_s}"))
+        ma_sorted.sort(reverse=True)  # highest first (matches descending fib order)
 
     def _icon(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
@@ -1354,8 +1348,7 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
         pct_dist = (lv - price) / price * 100
         icon = _icon(lv)
         p = _p(lv)
-        ma_str = _nearby_mas(lv)
-        return f"{icon} {p}  {pct_dist:+.1f}%{ma_str}"
+        return f"{icon} {p}  {pct_dist:+.1f}%"
 
     def _p(v: float) -> str:
         if v >= 1: return f"${v:.2f}"
@@ -1366,31 +1359,46 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
         pct_dist = (v - price) / price * 100
         return f"📊 <b>VWAP {_p(v)}</b>  {pct_dist:+.1f}%"
 
+    def _ma_line(labels: list[str]) -> str:
+        return f"  ╌╌ {', '.join(labels)}"
+
+    # Build unified descending list: fib levels + VWAP + MAs, all by value
+    # Collect all items as (value, type, content)
+    items: list[tuple[float, int, str]] = []  # (value, priority, line)
+    # priority: 0=fib, 1=vwap, 2=ma (fib first when same value)
+    for lv in all_levels:
+        if lv in [l for l in above] or lv in [l for l in below]:
+            items.append((lv, 0, _fmt(lv)))
+    if vwap > 0:
+        items.append((vwap, 1, _vwap_line(vwap)))
+
+    # Group nearby MAs (within 0.5% of each other) into single lines
+    if ma_sorted:
+        groups: list[list[tuple[float, str]]] = []
+        for val, label in ma_sorted:
+            if groups and abs(val - groups[-1][0][0]) / max(groups[-1][0][0], 0.001) * 100 <= 0.5:
+                groups[-1].append((val, label))
+            else:
+                groups.append([(val, label)])
+        for grp in groups:
+            avg_val = sum(v for v, _ in grp) / len(grp)
+            labels = [lb for _, lb in grp]
+            items.append((avg_val, 2, _ma_line(labels)))
+
+    # Sort descending by value, then by priority (fib before MA at same level)
+    items.sort(key=lambda x: (-x[0], x[1]))
+
     lines = [f"\n📐 <b>פיבונאצ'י</b> ({sym})"]
     lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
     lines.append("")
-    # Above: descending (farthest at top, closest at bottom near price)
-    # Insert VWAP in correct position among levels
-    vwap_above = vwap > price and vwap > 0
-    vwap_below = vwap <= price and vwap > 0
-    vwap_inserted = False
-    for lv in reversed(above):
-        if vwap_above and not vwap_inserted and vwap >= lv:
-            lines.append(_vwap_line(vwap))
-            vwap_inserted = True
-        lines.append(_fmt(lv))
-    if vwap_above and not vwap_inserted:
-        lines.append(_vwap_line(vwap))
-    lines.append(f"━━━━ ${price:.2f} ━━━━")
-    # Below: ascending (closest at top near price, farthest at bottom)
-    vwap_inserted = False
-    for lv in reversed(below):
-        if vwap_below and not vwap_inserted and vwap >= lv:
-            lines.append(_vwap_line(vwap))
-            vwap_inserted = True
-        lines.append(_fmt(lv))
-    if vwap_below and not vwap_inserted:
-        lines.append(_vwap_line(vwap))
+    price_line_added = False
+    for val, prio, line in items:
+        if not price_line_added and val <= price:
+            lines.append(f"━━━━ ${price:.2f} ━━━━")
+            price_line_added = True
+        lines.append(line)
+    if not price_line_added:
+        lines.append(f"━━━━ ${price:.2f} ━━━━")
     return "\n".join(lines)
 
 
