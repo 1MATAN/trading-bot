@@ -57,6 +57,18 @@ def _make_stop_limit(action: str, qty: int, stop_price: float,
     return order
 
 
+def _make_trailing_stop(action: str, qty: int, trailing_pct: float) -> Order:
+    """Create a TRAIL order (percentage-based) that triggers outside RTH."""
+    order = Order()
+    order.action = action
+    order.orderType = "TRAIL"
+    order.totalQuantity = qty
+    order.trailingPercent = trailing_pct
+    order.tif = "GTC"
+    order.outsideRth = True
+    return order
+
+
 class OrderThread(threading.Thread):
     """Independent order execution thread with its own IBKR connection.
 
@@ -312,17 +324,32 @@ class OrderThread(threading.Thread):
                 stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
                 log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
 
-            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}{stop_msg}"
+            # Place trailing take-profit for BUY orders
+            trailing_pct = req.get('trailing_pct', 0)
+            trail_msg = ""
+            if action == 'BUY' and trailing_pct > 0:
+                trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
+                trail_trade = ib.placeOrder(contract, trail_order)
+                ib.sleep(1)
+                trail_status = trail_trade.orderStatus.status
+                trail_msg = f" | Trail {trailing_pct}% ({trail_status})"
+                log.info(f"Trailing take-profit placed: SELL {qty} {sym} trail {trailing_pct}% — {trail_status}")
+
+            msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}{stop_msg}{trail_msg}"
             log.info(f"Order placed: {msg}")
             self._report(msg, True)
+            stop_desc = req.get('stop_desc', f"${stop_price:.2f}")
             if action == 'BUY' and stop_price > 0:
-                self._telegram(
-                    f"📋 <b>Order Placed + Stop-Loss</b>\n"
-                    f"  BUY {qty} {sym} @ ${price:.2f}\n"
-                    f"  Status: {status}\n"
-                    f"  🛑 Stop: ${stop_price:.2f} (−4%) → Lmt ${limit_price:.2f} (−6%) [STP LMT]\n"
-                    f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop)"
-                )
+                tg_lines = [
+                    f"📋 <b>Order Placed + Bracket</b>",
+                    f"  BUY {qty} {sym} @ ${price:.2f}",
+                    f"  Status: {status}",
+                    f"  🛑 Stop: {stop_desc} → Lmt ${limit_price:.2f} [STP LMT GTC]",
+                ]
+                if trailing_pct > 0:
+                    tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
+                tg_lines.append(f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop/trail)")
+                self._telegram("\n".join(tg_lines))
             else:
                 self._telegram(
                     f"📋 <b>Order Placed</b>\n"

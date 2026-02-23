@@ -70,6 +70,7 @@ from config.settings import (
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT,
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
+    BRACKET_FIB_STOP_PCT, BRACKET_TRAILING_PROFIT_PCT, STOP_LIMIT_OFFSET_PCT,
     STARTING_CAPITAL,
     GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_PCT,
     MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_PCT,
@@ -5674,12 +5675,30 @@ class App:
             # abs() handles both long (positive) and short (negative) positions
             qty = max(1, int(abs(pos[0]) * pct))
 
-        # BUY orders include automatic stop-loss: trigger −4%, limit −6%
+        # BUY orders: fib-based stop-loss + trailing take-profit
         stop_price = 0.0
         limit_price = 0.0
+        trailing_pct = 0.0
+        stop_desc = ""       # human-readable for confirmation + Telegram
         if action == 'BUY':
-            stop_price = round(price * 0.96, 2)   # -4% trigger
-            limit_price = round(price * 0.94, 2)   # -6% worst fill
+            # Find nearest fib support for smart stop-loss
+            with _fib_cache_lock:
+                cached = _fib_cache.get(sym)
+            if cached:
+                _al, _ah, all_levels, _rm, *_ = cached
+                supports = [lv for lv in all_levels if lv <= price]
+                if supports:
+                    nearest_support = supports[-1]
+                    stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
+                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
+                else:
+                    stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
+                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
+            else:
+                stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
+                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
+            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+            trailing_pct = BRACKET_TRAILING_PROFIT_PCT
 
         # Confirmation dialog
         if action == 'BUY':
@@ -5687,9 +5706,11 @@ class App:
                 "Confirm Order",
                 f"BUY {qty} {sym} @ ${price:.2f}\n"
                 f"Total: ${qty * price:,.2f}\n\n"
-                f"Stop-Loss: ${stop_price:.2f} (−4%) → Limit ${limit_price:.2f} (−6%)\n"
-                f"[STP LMT] outsideRth=True (pre/post market OK)\n"
-                f"TIF: DAY (buy) + GTC (stop)\n"
+                f"🛑 Stop: {stop_desc}\n"
+                f"   → Limit ${limit_price:.2f} [STP LMT GTC]\n"
+                f"📈 Trailing: {trailing_pct}% trailing stop [GTC]\n\n"
+                f"outsideRth=True (pre/post market OK)\n"
+                f"TIF: DAY (buy) + GTC (stop/trail)\n"
                 f"Continue?",
                 parent=self.root,
             )
@@ -5709,10 +5730,12 @@ class App:
         if action == 'BUY':
             req['stop_price'] = stop_price
             req['limit_price'] = limit_price
+            req['trailing_pct'] = trailing_pct
+            req['stop_desc'] = stop_desc
         self._order_thread.submit(req)
         if action == 'BUY':
             self._order_status_var.set(
-                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop ${stop_price:.2f} → Lmt ${limit_price:.2f}...")
+                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop {stop_desc} | Trail {trailing_pct}%...")
         else:
             self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}...")
         self._order_status_label.config(fg="#ffcc00")

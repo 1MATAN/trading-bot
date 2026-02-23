@@ -92,6 +92,10 @@ MIN_COMMISSION = 1.00  # minimum $1 per order
 LIMIT_OFFSET_CENTS = 0.02  # $0.02 above ask (buy) / below bid (sell)
 STOP_LIMIT_OFFSET_PCT = 0.02  # 2% below stop price for limit portion
 
+# Smart bracket: fib-based stop + trailing take-profit
+BRACKET_FIB_STOP_PCT = 0.03        # 3% below nearest fib support
+BRACKET_TRAILING_PROFIT_PCT = 3.0   # 3% trailing stop for take-profit
+
 # ── Fibonacci Engine (Dual-Series) ────────────────────
 FIB_LOOKBACK_YEARS = 5  # find lowest daily candle in 5 years
 FIB_CACHE_TTL_HOURS = 24
