@@ -1366,8 +1366,8 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
             + ([vwap] if vwap > 0 else []) + [price]),
         reverse=True,
     )
-    fib_range_lo = below[-1] if below else price
-    fib_range_hi = above[0] if above else price
+    fib_range_lo = below[0] if below else price    # lowest displayed level
+    fib_range_hi = above[-1] if above else price  # highest displayed level
 
     # Bucket MAs into intervals between adjacent anchors (only within fib range)
     # bucket[i] holds MAs that fall between anchors[i] and anchors[i+1]
