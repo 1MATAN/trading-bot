@@ -3301,6 +3301,7 @@ class VirtualPortfolio:
 
     INITIAL_CASH = 3000.0
     JOURNAL_PATH = DATA_DIR / "virtual_trades.csv"
+    _STATE_PATH = DATA_DIR / "fib_dt_state.json"
 
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
@@ -3309,6 +3310,32 @@ class VirtualPortfolio:
         # phase: IN_POSITION | TRAILING
         self.trades: list[dict] = []  # history
         self._init_journal()
+        self._load_state()
+
+    def _save_state(self):
+        """Persist portfolio state to disk (survives restarts)."""
+        try:
+            state = {'cash': self.cash, 'positions': self.positions}
+            with open(self._STATE_PATH, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"FIB DT state save error: {e}")
+
+    def _load_state(self):
+        """Load portfolio state from disk."""
+        try:
+            if not self._STATE_PATH.exists():
+                return
+            with open(self._STATE_PATH) as f:
+                state = json.load(f)
+            self.cash = state.get('cash', self.INITIAL_CASH)
+            self.positions = state.get('positions', {})
+            if self.positions:
+                log.info(f"FIB DT state restored: cash=${self.cash:.0f}, "
+                         f"{len(self.positions)} positions: "
+                         + ", ".join(self.positions.keys()))
+        except Exception as e:
+            log.warning(f"FIB DT state load error: {e}")
 
     def _init_journal(self):
         """Create CSV journal with header if it doesn't exist."""
@@ -3381,8 +3408,9 @@ class VirtualPortfolio:
             'price': price, 'pnl': 0, 'time': datetime.now(_ET),
         })
 
-        net = self.cash + cost
+        net = self._net_liq_internal({})
         self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
+        self._save_state()
 
         msg = (
             f"📐 <b>FIB DT [SIM] — BUY {sym}</b>\n"
@@ -3474,10 +3502,14 @@ class VirtualPortfolio:
                     f"  🛡️ Stop → breakeven ${pos['entry_price']:.2f}"
                 )
                 alerts.append(alert)
+                self._save_state()
                 log.info(f"VIRTUAL TARGET: {sym} {half}sh @ ${price:.2f} P&L=${pnl:+.2f}")
 
         for sym in closed:
             del self.positions[sym]
+
+        if closed:
+            self._save_state()
 
         return alerts
 
@@ -3499,6 +3531,7 @@ class VirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._save_state()
 
         net_liq = self.net_liq({})
         self._log_journal(sym, 'SELL', f'TRAILING ({reason})', remaining, price,
@@ -3572,6 +3605,7 @@ class GGVirtualPortfolio:
 
     INITIAL_CASH = GG_LIVE_INITIAL_CASH
     JOURNAL_PATH = DATA_DIR / "gg_virtual_trades.csv"
+    _STATE_PATH = DATA_DIR / "gg_state.json"
 
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
@@ -3579,6 +3613,41 @@ class GGVirtualPortfolio:
         # sym -> {qty, entry_price, vwap_at_entry}
         self.trades: list[dict] = []
         self._init_journal()
+        self._load_state()
+
+    def _save_state(self):
+        """Persist portfolio state to disk (survives restarts)."""
+        try:
+            state = {
+                'cash': self.cash,
+                'positions': self.positions,
+                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
+            }
+            with open(self._STATE_PATH, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"GG state save error: {e}")
+
+    def _load_state(self):
+        """Load portfolio state from disk if same trading day."""
+        try:
+            if not self._STATE_PATH.exists():
+                return
+            with open(self._STATE_PATH) as f:
+                state = json.load(f)
+            saved_date = state.get('date', '')
+            today = datetime.now(_ET).strftime('%Y-%m-%d')
+            if saved_date != today:
+                log.info(f"GG state from {saved_date}, today is {today} — starting fresh")
+                return
+            self.cash = state.get('cash', self.INITIAL_CASH)
+            self.positions = state.get('positions', {})
+            if self.positions:
+                log.info(f"GG state restored: cash=${self.cash:.0f}, "
+                         f"{len(self.positions)} positions: "
+                         + ", ".join(self.positions.keys()))
+        except Exception as e:
+            log.warning(f"GG state load error: {e}")
 
     def _init_journal(self):
         if not self.JOURNAL_PATH.exists():
@@ -3636,8 +3705,9 @@ class GGVirtualPortfolio:
             'price': price, 'pnl': 0, 'time': datetime.now(_ET),
         })
 
-        net = self.cash + cost
+        net = self.net_liq({})
         self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
+        self._save_state()
 
         msg = (
             f"🚀 <b>Gap&Go [GG-SIM] — BUY {sym}</b>\n"
@@ -3669,6 +3739,7 @@ class GGVirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._save_state()
 
         net = self.net_liq({})
         self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
@@ -3731,6 +3802,7 @@ class MRVirtualPortfolio:
 
     INITIAL_CASH = MR_LIVE_INITIAL_CASH
     JOURNAL_PATH = DATA_DIR / "mr_virtual_trades.csv"
+    _STATE_PATH = DATA_DIR / "mr_state.json"
 
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
@@ -3738,6 +3810,41 @@ class MRVirtualPortfolio:
         # sym -> {qty, entry_price, vwap_at_entry, signal_type}
         self.trades: list[dict] = []
         self._init_journal()
+        self._load_state()
+
+    def _save_state(self):
+        """Persist portfolio state to disk (survives restarts)."""
+        try:
+            state = {
+                'cash': self.cash,
+                'positions': self.positions,
+                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
+            }
+            with open(self._STATE_PATH, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"MR state save error: {e}")
+
+    def _load_state(self):
+        """Load portfolio state from disk if same trading day."""
+        try:
+            if not self._STATE_PATH.exists():
+                return
+            with open(self._STATE_PATH) as f:
+                state = json.load(f)
+            saved_date = state.get('date', '')
+            today = datetime.now(_ET).strftime('%Y-%m-%d')
+            if saved_date != today:
+                log.info(f"MR state from {saved_date}, today is {today} — starting fresh")
+                return
+            self.cash = state.get('cash', self.INITIAL_CASH)
+            self.positions = state.get('positions', {})
+            if self.positions:
+                log.info(f"MR state restored: cash=${self.cash:.0f}, "
+                         f"{len(self.positions)} positions: "
+                         + ", ".join(self.positions.keys()))
+        except Exception as e:
+            log.warning(f"MR state load error: {e}")
 
     def _init_journal(self):
         if not self.JOURNAL_PATH.exists():
@@ -3797,8 +3904,9 @@ class MRVirtualPortfolio:
             'price': price, 'pnl': 0, 'time': datetime.now(_ET),
         })
 
-        net = self.cash + cost
+        net = self.net_liq({})
         self._log_journal(sym, 'BUY', f'ENTRY ({signal_type})', qty, price, price, 0, net)
+        self._save_state()
 
         msg = (
             f"📈 <b>Momentum Ride [MR-SIM] — BUY {sym}</b>\n"
@@ -3831,6 +3939,7 @@ class MRVirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._save_state()
 
         net = self.net_liq({})
         self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
@@ -3914,9 +4023,15 @@ class ScannerThread(threading.Thread):
         # ── Gap and Go Auto-Strategy ──
         self._gg_strategy = GapGoLiveStrategy(ib_getter=_get_ibkr)
         self._gg_portfolio = GGVirtualPortfolio()
+        # Sync strategy state from restored portfolio
+        if self._gg_portfolio.positions:
+            self._gg_strategy.sync_from_portfolio(set(self._gg_portfolio.positions.keys()))
         # ── Momentum Ride Auto-Strategy ──
         self._mr_strategy = MomentumRideLiveStrategy(ib_getter=_get_ibkr)
         self._mr_portfolio = MRVirtualPortfolio()
+        # Sync strategy state from restored portfolio
+        if self._mr_portfolio.positions:
+            self._mr_strategy.sync_from_portfolio(self._mr_portfolio.positions)
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None

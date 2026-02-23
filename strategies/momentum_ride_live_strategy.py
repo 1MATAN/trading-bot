@@ -145,6 +145,17 @@ class MomentumRideLiveStrategy:
         state.entry_price = 0.0
         state.highest_high = 0.0
 
+    def sync_from_portfolio(self, held_positions: dict):
+        """Sync strategy state from portfolio after restart.
+
+        Args:
+            held_positions: {sym: {'entry_price': float, ...}}
+        """
+        for sym, pos in held_positions.items():
+            entry_price = pos.get('entry_price', 0)
+            self.mark_in_position(sym, entry_price, entry_price)
+            logger.info(f"MR strategy sync: {sym} marked in_position @ ${entry_price:.4f}")
+
     def process_cycle(
         self, candidates: list[MRCandidate]
     ) -> tuple[list[MREntrySignal], list[MRExitSignal]]:

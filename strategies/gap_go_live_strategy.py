@@ -161,6 +161,14 @@ class GapGoLiveStrategy:
     def mark_position_closed(self, symbol: str):
         self._get_state(symbol).in_position = False
 
+    def sync_from_portfolio(self, held_symbols: set):
+        """Sync strategy state from portfolio after restart."""
+        for sym in held_symbols:
+            state = self._get_state(sym)
+            state.in_position = True
+            state.first_entry_done = True
+            logger.info(f"GG strategy sync: {sym} marked in_position")
+
     def process_cycle(
         self, candidates: list[GGCandidate]
     ) -> tuple[list[GGEntrySignal], list[GGExitSignal]]:
