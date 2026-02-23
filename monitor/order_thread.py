@@ -214,8 +214,23 @@ class OrderThread(threading.Thread):
                 elif av.tag == 'BuyingPower' and av.currency == 'USD':
                     buying_power = float(av.value)
 
+            # Use ib.positions() (reqPositions) — more reliable than ib.portfolio()
+            # which can return empty on secondary clientId connections.
             positions = {}
+            for item in ib.positions():
+                if item.position == 0:
+                    continue
+                sym = item.contract.symbol
+                positions[sym] = (
+                    int(item.position),
+                    round(item.avgCost, 4),
+                    0.0,  # marketPrice not available from positions()
+                    0.0,  # unrealizedPNL not available from positions()
+                )
+            # Enrich with portfolio data if available (has marketPrice, PNL)
             for item in ib.portfolio():
+                if item.position == 0:
+                    continue
                 sym = item.contract.symbol
                 positions[sym] = (
                     int(item.position),
@@ -227,6 +242,12 @@ class OrderThread(threading.Thread):
             self.net_liq = net_liq
             self.buying_power = buying_power
             self.positions = positions
+
+            if positions:
+                pos_str = ", ".join(f"{s} {p[0]}@${p[1]:.2f}" for s, p in positions.items())
+                log.info(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: {pos_str}")
+            else:
+                log.info(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: (none)")
 
             if self.on_account:
                 self.on_account(net_liq, buying_power, positions)
