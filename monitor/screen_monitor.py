@@ -738,7 +738,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', ''))
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
             price = float(m.group(3))
         except ValueError:
             continue
@@ -757,7 +757,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', ''))
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
             price = float(m.group(3))
         except ValueError:
             continue
@@ -775,7 +775,7 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', ''))
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
             price = float(m.group(3))
         except ValueError:
             continue
@@ -3847,6 +3847,8 @@ class ScannerThread(threading.Thread):
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
         self.count = 0
         self._warmup = True   # suppress alerts on first cycle
+        self._warmup_pending: dict[str, dict] = {}  # sym → stock data, enriched during warmup
+        self._reports_sent: set[str] = set()      # stocks that got Telegram report this session
         self._last_session: str = _get_market_session()  # track session transitions
         # ── FIB DT Auto-Strategy ──
         self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
@@ -4526,6 +4528,7 @@ class ScannerThread(threading.Thread):
 
             if above_vwap and has_news and not self._warmup:
                 _send_stock_report(sym, d, enrich)
+                self._reports_sent.add(sym)
                 global _daily_reports_sent
                 _daily_reports_sent += 1
                 _log_daily_event('stock_report', sym,
@@ -4536,6 +4539,9 @@ class ScannerThread(threading.Thread):
                     'volume': d.get('volume', ''),
                     'msg': f"🆕 {sym}: ${d['price']:.2f} {d['pct']:+.1f}%",
                 })
+            elif above_vwap and has_news and self._warmup:
+                self._warmup_pending[sym] = dict(d)  # save snapshot
+                log.info(f"Deferred report (warmup): {sym} pct={pct:+.1f}% vwap=above news=yes")
             else:
                 log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={enrich.get('float', '-')} news={'yes' if has_news else 'no'}")
 
@@ -4733,6 +4739,18 @@ class ScannerThread(threading.Thread):
             _check_news_updates(current, suppress_send=True)
             self._warmup = False
             log.info("Warmup complete — alerts enabled")
+            # Send deferred Telegram reports for stocks enriched during warmup
+            for sym, saved_d in list(self._warmup_pending.items()):
+                if sym in self._reports_sent:
+                    continue
+                d = current.get(sym, saved_d)  # prefer fresh data, fallback to saved
+                enrich = _enrichment.get(sym, {})
+                if d and enrich:
+                    _send_stock_report(sym, d, enrich)
+                    self._reports_sent.add(sym)
+                    _daily_reports_sent += 1
+                    log.info(f"Sent deferred report for {sym} (was warmup)")
+            self._warmup_pending.clear()
         if self.on_status:
             self.on_status(status)
         log.info(status)
