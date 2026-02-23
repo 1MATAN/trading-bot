@@ -119,11 +119,10 @@ _IBKR_BACKOFF_BASE = 5               # initial backoff seconds
 _IBKR_BACKOFF_MAX = 120              # max backoff seconds
 _IBKR_MAX_RETRIES = 3                # retries per _get_ibkr call
 
-# ── TWS Auto-Restart ──
-_TWS_LAUNCHER = Path.home() / "Jts" / "interil" / "tws"
-_TWS_CONFIG_DIR = Path.home() / "Jts"
+# ── TWS Auto-Restart via IBC ──
+_IBC_LAUNCH_SCRIPT = Path.home() / "ibc" / "twsstart.sh"
 _TWS_RESTART_COOLDOWN = 300          # minimum seconds between restart attempts
-_TWS_API_WAIT_TIMEOUT = 90           # seconds to wait for API port after launch
+_TWS_API_WAIT_TIMEOUT = 120          # seconds to wait for API port after launch
 _TWS_PROCESS_PATTERN = "jts"         # pattern to find TWS Java process
 _tws_last_restart: float = 0.0       # time.time() of last restart attempt
 
@@ -154,10 +153,10 @@ def _wait_for_tws_api(timeout: int = _TWS_API_WAIT_TIMEOUT) -> bool:
 
 
 def _restart_tws() -> bool:
-    """Launch TWS if it's not running. Returns True if launch was attempted.
+    """Launch TWS via IBC (auto-login with credentials from ~/ibc/config.ini).
 
+    IBC handles: username/password entry, 2FA prompt, API port setup.
     Respects a cooldown to avoid spamming restarts.
-    TWS needs DISPLAY for its GUI — we inherit from the monitor process.
     """
     global _tws_last_restart
 
@@ -172,29 +171,29 @@ def _restart_tws() -> bool:
         log.info("TWS process is alive — not restarting")
         return False
 
-    # Launcher exists?
-    if not _TWS_LAUNCHER.is_file():
-        log.error(f"TWS launcher not found: {_TWS_LAUNCHER}")
+    # IBC script exists?
+    if not _IBC_LAUNCH_SCRIPT.is_file():
+        log.error(f"IBC launch script not found: {_IBC_LAUNCH_SCRIPT}")
         return False
 
     _tws_last_restart = time_mod.time()
-    log.warning("TWS process not found — attempting auto-restart...")
+    log.warning("TWS process not found — launching via IBC (auto-login)...")
     send_telegram(
-        "🔄 <b>TWS Auto-Restart</b>\n"
-        "  TWS process not detected — launching...\n"
+        "🔄 <b>TWS Auto-Restart (IBC)</b>\n"
+        "  TWS not detected — launching with auto-login...\n"
+        "  ⏳ 2FA approval may be needed on IBKR Mobile\n"
         f"  Waiting up to {_TWS_API_WAIT_TIMEOUT}s for API port {IBKR_PORT}"
     )
 
     try:
-        # Launch TWS in background (the script uses exec internally)
-        # We need to wrap in bash because the tws script uses exec
+        # Launch IBC's twsstart.sh which handles login automatically
         subprocess.Popen(
-            ["bash", "-c", f'"{_TWS_LAUNCHER}" -J-DjtsConfigDir="{_TWS_CONFIG_DIR}" &'],
+            [str(_IBC_LAUNCH_SCRIPT), "-inline"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,  # detach from our process group
         )
-        log.info("TWS launch command sent, waiting for API port...")
+        log.info("IBC launch command sent, waiting for API port...")
 
         if _wait_for_tws_api():
             log.info(f"TWS API port {IBKR_PORT} is accepting connections!")
