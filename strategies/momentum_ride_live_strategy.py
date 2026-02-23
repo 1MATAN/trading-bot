@@ -289,6 +289,10 @@ class MomentumRideLiveStrategy:
                     sma9_hourly=sma9_val,
                     signal_type=entry_signal,
                 )
+                # Mark position immediately to prevent duplicate entries
+                state.in_position = True
+                state.entry_price = price
+                state.highest_high = price
                 # Update VWAP tracking
                 state.prev_below_vwap = not price_above_vwap
                 state.prev_above_vwap = price_above_vwap

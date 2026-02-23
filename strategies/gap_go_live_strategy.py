@@ -274,12 +274,15 @@ class GapGoLiveStrategy:
             if not latest_1m["is_green"] or not latest_5m["is_green"]:
                 return None, None
 
-            # All conditions met
+            # All conditions met — mark position immediately to prevent duplicate entries
+            is_first = not state.first_entry_done
+            state.in_position = True
+            state.first_entry_done = True
             entry = GGEntrySignal(
                 symbol=sym,
                 price=price,
                 vwap=current_vwap,
-                is_first_entry=not state.first_entry_done,
+                is_first_entry=is_first,
                 ha_1m_green=True,
                 ha_5m_green=True,
             )

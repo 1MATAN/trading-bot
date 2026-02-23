@@ -4268,15 +4268,18 @@ class ScannerThread(threading.Thread):
                     alert = self._gg_portfolio.buy(entry.symbol, qty, entry_price, entry.vwap)
                     if alert:
                         send_telegram(alert)
-                        self._gg_strategy.mark_in_position(entry.symbol)
-                        self._gg_strategy._get_state(entry.symbol).first_entry_done = True
+                        # State already marked in strategy; just log
                         entry_type = "1st" if entry.is_first_entry else "re"
                         _log_daily_event('gg_entry', entry.symbol,
                                          f"[GG-SIM] BUY({entry_type}) {qty}sh @ ${entry_price:.4f} "
                                          f"VWAP=${entry.vwap:.4f}")
                     else:
+                        # Buy failed — rollback strategy state
+                        self._gg_strategy.mark_position_closed(entry.symbol)
                         log.warning(f"GG: Virtual buy failed for {entry.symbol}")
                 else:
+                    # Insufficient cash — rollback strategy state
+                    self._gg_strategy.mark_position_closed(entry.symbol)
                     log.warning(f"GG: Insufficient virtual cash for {entry.symbol} "
                                 f"(cash=${self._gg_portfolio.cash:.0f}, price=${entry_price:.4f})")
 
@@ -4342,13 +4345,17 @@ class ScannerThread(threading.Thread):
                     )
                     if alert:
                         send_telegram(alert)
-                        self._mr_strategy.mark_in_position(entry.symbol, entry_price, entry_price)
+                        # State already marked in strategy; just log
                         _log_daily_event('mr_entry', entry.symbol,
                                          f"[MR-SIM] BUY({entry.signal_type}) {qty}sh @ ${entry_price:.4f} "
                                          f"VWAP=${entry.vwap:.4f} SMA9h=${entry.sma9_hourly:.4f}")
                     else:
+                        # Buy failed — rollback strategy state
+                        self._mr_strategy.mark_position_closed(entry.symbol)
                         log.warning(f"MR: Virtual buy failed for {entry.symbol}")
                 else:
+                    # Insufficient cash — rollback strategy state
+                    self._mr_strategy.mark_position_closed(entry.symbol)
                     log.warning(f"MR: Insufficient virtual cash for {entry.symbol} "
                                 f"(cash=${self._mr_portfolio.cash:.0f}, price=${entry_price:.4f})")
 
@@ -5257,6 +5264,12 @@ class App:
             for i, (sym, d) in enumerate(sorted_stocks):
                 rd = self._compute_row_data(sym, d, i)
                 self._row_widgets[sym] = self._build_stock_row(sym, rd)
+
+        # Auto-update trade price for the selected (picked) stock
+        sel = self._selected_symbol_name
+        if sel and sel in self._stock_data:
+            new_price = self._stock_data[sel]['price']
+            self._trade_price.set(f"{new_price:.2f}")
 
     # ── Portfolio Panel ─────────────────────────────────────
 
