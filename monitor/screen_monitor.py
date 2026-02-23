@@ -1325,9 +1325,9 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
 
     # Build sorted list of MA values for interleaving between fib levels
     # All timeframes except 4h
-    _TF_KEEP = {'1m': 'M1', '5m': 'M5', '15m': 'M15', '1h': 'H1',
-                'D': 'D', 'W': 'W', 'MO': 'MO'}
-    ma_all: list[tuple[float, str]] = []  # (value, label)
+    _TF_KEEP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+                '1h': '1h', '2h': '2h', 'D': 'D', 'W': 'W', 'MO': 'M'}
+    ma_all: list[tuple[float, str, str, int]] = []  # (value, tf_short, ma_type, period)
     if ma_rows:
         for r in ma_rows:
             tf_s = _TF_KEEP.get(r['tf'])
@@ -1336,7 +1336,7 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
             for ma_type, key in [('S', 'sma'), ('E', 'ema')]:
                 val = r.get(key)
                 if val and val > 0:
-                    ma_all.append((val, f"{ma_type}{r['period']} {tf_s}"))
+                    ma_all.append((val, tf_s, ma_type, r['period']))
 
     def _icon(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
@@ -1370,28 +1370,42 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0,
 
     # Bucket MAs into intervals between adjacent anchors (only within fib range)
     # bucket[i] holds MAs that fall between anchors[i] and anchors[i+1]
-    buckets: list[list[str]] = [[] for _ in range(len(anchors) - 1)]
-    for val, label in ma_all:
+    _TF_ORDER = {'1m': 0, '5m': 1, '15m': 2, '30m': 3, '1h': 4, '2h': 5, 'D': 6, 'W': 7, 'M': 8}
+    buckets: list[list[tuple[str, str, int]]] = [[] for _ in range(len(anchors) - 1)]
+    for val, tf_s, ma_type, period in ma_all:
         if val > fib_range_hi or val < fib_range_lo:
-            continue  # skip MAs outside the displayed fib range
+            continue
         for i in range(len(anchors) - 1):
             if anchors[i] >= val > anchors[i + 1]:
-                buckets[i].append(label)
+                buckets[i].append((tf_s, ma_type, period))
                 break
+
+    def _compact_ma(items: list[tuple[str, str, int]]) -> str:
+        """Format MAs compactly grouped by timeframe: '1m-S9 E50, D-S9 E20'"""
+        from collections import OrderedDict
+        by_tf: dict[str, list[str]] = OrderedDict()
+        for tf_s, ma_type, period in sorted(items, key=lambda x: (_TF_ORDER.get(x[0], 9), x[2])):
+            by_tf.setdefault(tf_s, []).append(f"{ma_type}{period}")
+        parts = []
+        for tf_s, mas in by_tf.items():
+            parts.append(f"{tf_s}-{' '.join(mas)}")
+        return f"<code>{', '.join(parts)}</code>"
 
     lines = [f"\n📐 <b>פיבונאצ'י</b> ({sym})"]
     lines.append(f"🕯 עוגן: {_p(anchor_low)} — {_p(anchor_high)}  ({anchor_date})")
     lines.append("")
     for i, a in enumerate(anchors):
+        # Build the main line
         if a == price:
-            lines.append(f"━━━━ ${price:.2f} ━━━━")
+            line = f"━━━━ ${price:.2f} ━━━━"
         elif a == vwap and vwap > 0:
-            lines.append(_vwap_line(vwap))
+            line = _vwap_line(vwap)
         else:
-            lines.append(_fmt(a))
-        # Append MA bucket between this anchor and the next
+            line = _fmt(a)
+        # Append MA bucket on same line
         if i < len(buckets) and buckets[i]:
-            lines.append(f"  ╌╌ {', '.join(buckets[i])}")
+            line += f" {_compact_ma(buckets[i])}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -2272,7 +2286,7 @@ def _calc_ma_table(current_price: float,
     Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '4h', 'D', 'W']
+    tf_order = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', 'D', 'W']
     rows = []
     for tf in tf_order:
         frame = ma_frames.get(tf)
@@ -2314,7 +2328,7 @@ def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
     """
     green, red, grey = '#26a69a', '#ef5350', '#555'
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '1h', '4h', 'D', 'W']
+    tf_order = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', 'D', 'W']
 
     ma_lookup = {}
     for r in ma_rows:
@@ -2552,7 +2566,9 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         ('1m',  '1 min',   '2 D'),
         ('5m',  '5 mins',  '5 D'),
         ('15m', '15 mins', '2 W'),
+        ('30m', '30 mins', '1 M'),
         ('1h',  '1 hour',  '3 M'),
+        ('2h',  '2 hours', '6 M'),
         ('4h',  '4 hours', '1 Y'),
         ('W',   '1 week',  '5 Y'),
     ]
