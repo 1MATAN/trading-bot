@@ -117,12 +117,19 @@ class OrderThread(threading.Thread):
         last_account = 0.0
         while self._running:
             # Process all pending orders immediately
+            had_orders = False
             while not self._queue.empty():
                 try:
                     req = self._queue.get_nowait()
                     self._execute_order(req)
+                    had_orders = True
                 except queue.Empty:
                     break
+
+            # After executing orders, force immediate account refresh
+            # so SELL buttons see the new position right away.
+            if had_orders:
+                last_account = 0  # force refresh on next check
 
             # Periodic account data refresh
             now = time_mod.time()
@@ -130,7 +137,15 @@ class OrderThread(threading.Thread):
                 self._fetch_account_data()
                 last_account = now
 
-            time_mod.sleep(0.3)  # responsive loop — checks queue ~3x/sec
+            # Use ib.sleep() instead of time.sleep() so ib_insync processes
+            # TWS messages (portfolio updates, fills, account data).
+            try:
+                if self._ib and self._ib.isConnected():
+                    self._ib.sleep(0.3)
+                else:
+                    time_mod.sleep(0.3)
+            except Exception:
+                time_mod.sleep(0.3)
 
         # Cleanup
         if self._ib and self._ib.isConnected():
@@ -189,6 +204,7 @@ class OrderThread(threading.Thread):
         if not ib:
             return
         try:
+            ib.sleep(0.1)  # pump event loop to get latest TWS data
             acct_vals = ib.accountValues()
             net_liq = 0.0
             buying_power = 0.0

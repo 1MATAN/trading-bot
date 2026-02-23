@@ -157,7 +157,7 @@ def _get_contract(sym: str) -> Stock | None:
                     _contract_cache[variant] = vc   # also under corrected key
                     return vc
 
-    return contract
+    return None  # qualification failed — don't return invalid contract (conId=0)
 
 
 def _get_ibkr() -> IB | None:
@@ -244,8 +244,11 @@ def _get_market_session() -> str:
     """Return current US market session based on Eastern Time.
 
     Returns one of: 'pre_market', 'market', 'after_hours', 'closed'.
+    Weekend (Sat/Sun) always returns 'closed'.
     """
     now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return 'closed'
     t = now_et.time()
     if time(4, 0) <= t < time(9, 30):
         return 'pre_market'
@@ -362,7 +365,6 @@ def _format_volume(volume: float) -> str:
 
 # Cache avg volume per symbol so repeat scans only need 2D of data
 _avg_vol_cache: dict[str, float] = {}
-_avg_vol_cache_day: str = ""  # "YYYY-MM-DD" — reset cache daily
 
 
 def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
@@ -469,12 +471,14 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
                 # Pre-market: use only extended-hours data (RTH bar is yesterday)
                 day_high = round(ext_high, 4)
                 day_low = round(ext_low, 4)
-                vwap = round(ext_vwap, 4)
+                if ext_vwap is not None:
+                    vwap = round(ext_vwap, 4)
             elif session == 'after_hours' and ext_high is not None:
                 # After-hours: combine RTH + AH data
                 day_high = round(max(rth_high, ext_high), 4)
                 day_low = round(min(rth_low, ext_low), 4)
-                vwap = round(ext_vwap, 4)
+                if ext_vwap is not None:
+                    vwap = round(ext_vwap, 4)
             else:
                 day_high = rth_high
                 day_low = rth_low
@@ -508,6 +512,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 
 # Multi-scanner sources: up to 3 user-picked windows for OCR scanning
 _scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 3
+_scanner_sources_lock = threading.Lock()
 _MAX_SCANNER_SOURCES = 3
 
 
@@ -540,33 +545,36 @@ def _get_window_name(wid: int) -> str:
 def add_scanner_source(wid: int, name: str = ""):
     """Add a scanner source window. Max 3."""
     global _scanner_sources
-    if len(_scanner_sources) >= _MAX_SCANNER_SOURCES:
-        log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
-        return False
-    # Don't add duplicates
-    if any(s['wid'] == wid for s in _scanner_sources):
-        log.info(f"Scanner source WID {wid} already added")
-        return False
     if not name:
         name = _get_window_name(wid)
-    _scanner_sources.append({'wid': wid, 'name': name})
-    log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
-    return True
+    with _scanner_sources_lock:
+        if len(_scanner_sources) >= _MAX_SCANNER_SOURCES:
+            log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
+            return False
+        # Don't add duplicates
+        if any(s['wid'] == wid for s in _scanner_sources):
+            log.info(f"Scanner source WID {wid} already added")
+            return False
+        _scanner_sources.append({'wid': wid, 'name': name})
+        log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
+        return True
 
 
 def remove_scanner_source(idx: int):
     """Remove scanner source by slot index (0-based)."""
     global _scanner_sources
-    if 0 <= idx < len(_scanner_sources):
-        removed = _scanner_sources.pop(idx)
-        log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
-    else:
-        log.warning(f"Invalid scanner source index: {idx}")
+    with _scanner_sources_lock:
+        if 0 <= idx < len(_scanner_sources):
+            removed = _scanner_sources.pop(idx)
+            log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
+        else:
+            log.warning(f"Invalid scanner source index: {idx}")
 
 
 def get_scanner_sources() -> list[dict]:
     """Get current scanner sources list."""
-    return list(_scanner_sources)
+    with _scanner_sources_lock:
+        return list(_scanner_sources)
 
 
 def _capture_and_ocr(wid: int) -> str:
@@ -768,15 +776,19 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
     """
     global _scanner_sources
 
-    # Prune dead windows
-    _scanner_sources = [s for s in _scanner_sources if _verify_wid(s['wid'])]
+    # Snapshot under lock, prune outside (avoid holding lock during I/O)
+    with _scanner_sources_lock:
+        snapshot = list(_scanner_sources)
+    valid = [s for s in snapshot if _verify_wid(s['wid'])]
+    with _scanner_sources_lock:
+        _scanner_sources = valid
 
-    if not _scanner_sources:
+    if not valid:
         log.info("No scanner sources configured, will fallback to IBKR scan")
         return {}
 
     all_parsed: list[dict] = []
-    for src in _scanner_sources:
+    for src in valid:
         text = _capture_and_ocr(src['wid'])
         if not text.strip():
             log.warning(f"OCR empty for source WID={src['wid']} ({src['name']})")
@@ -911,11 +923,13 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             if session == 'pre_market' and ext_high is not None:
                 day_high = round(ext_high, 4)
                 day_low = round(ext_low, 4)
-                vwap = round(ext_vwap, 4)
+                if ext_vwap is not None:
+                    vwap = round(ext_vwap, 4)
             elif session == 'after_hours' and ext_high is not None:
                 day_high = round(max(rth_high, ext_high), 4)
                 day_low = round(min(rth_low, ext_low), 4)
-                vwap = round(ext_vwap, 4)
+                if ext_vwap is not None:
+                    vwap = round(ext_vwap, 4)
             else:
                 day_high = rth_high
                 day_low = rth_low
@@ -1271,7 +1285,8 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0) -> str:
     """Build fib levels text — 10 above (descending) + 5 below with % distance and ratio icons."""
     if price > 0:
         calc_fib_levels(sym, price)
-    cached = _fib_cache.get(sym)
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
     if not cached:
         return ""
     all_levels = cached[2]
@@ -1878,6 +1893,9 @@ def _reset_alerts_if_new_day():
         _enrichment.clear()
         _enrichment_ts.clear()
         _intraday_cache.clear()
+        with _fib_cache_lock:
+            _fib_cache.clear()
+        _daily_cache.clear()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -1908,12 +1926,16 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
     """Alert on 2nd+ touch of a Fibonacci level (≥20% only, 0.8% proximity)."""
     if pct < ALERT_MIN_PCT or price <= 0:
         return None
-    if sym not in _fib_cache:
+    with _fib_cache_lock:
+        has_cache = sym in _fib_cache
+    if not has_cache:
         calc_fib_levels(sym, price)
-    if sym not in _fib_cache:
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
+    if not cached:
         return None
 
-    _, _, all_levels, ratio_map, *_ = _fib_cache[sym]
+    _, _, all_levels, ratio_map, *_ = cached
     if sym not in _fib_touch_tracker:
         _fib_touch_tracker[sym] = {}
 
@@ -2554,7 +2576,8 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
 
     # ── Fib chart image ──
     chart_path: Path | None = None
-    cached = _fib_cache.get(sym)
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
     if cached:
         all_levels = cached[2]
         ratio_map = cached[3]
@@ -2585,6 +2608,7 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
 # Cache: {symbol: (anchor_low, anchor_high, all_levels_sorted, ratio_map, anchor_date)}
 # ratio_map: {price: (ratio, "S1"|"S2")}
 _fib_cache: dict[str, tuple] = {}
+_fib_cache_lock = threading.Lock()
 
 # Cache daily DataFrames for chart generation (filled by _download_daily)
 _daily_cache: dict[str, pd.DataFrame] = {}
@@ -2689,14 +2713,15 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
     Returns (3_below, 3_above) relative to current_price.
     Auto-advances when price > 4.236 of the LOWER series (S1).
     """
-    cached = _fib_cache.get(symbol)
-    if cached:
-        anchor_low, anchor_high, all_levels, _ratio_map, *_ = cached
-        # Invalidate cache if price exceeded the top cached level (needs re-advance)
-        if all_levels and current_price > all_levels[-1]:
-            log.info(f"Fib cache invalidated for {symbol}: price ${current_price:.2f} > top level ${all_levels[-1]:.4f}")
-            del _fib_cache[symbol]
-            cached = None
+    with _fib_cache_lock:
+        cached = _fib_cache.get(symbol)
+        if cached:
+            anchor_low, anchor_high, all_levels, _ratio_map, *_ = cached
+            # Invalidate cache if price exceeded the top cached level (needs re-advance)
+            if all_levels and current_price > all_levels[-1]:
+                log.info(f"Fib cache invalidated for {symbol}: price ${current_price:.2f} > top level ${all_levels[-1]:.4f}")
+                del _fib_cache[symbol]
+                cached = None
 
     if not cached:
         df = _download_daily(symbol)
@@ -2737,7 +2762,8 @@ def calc_fib_levels(symbol: str, current_price: float) -> tuple[list[float], lis
                 deduped.append(lv)
         all_levels = deduped
 
-        _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map, anchor_date)
+        with _fib_cache_lock:
+            _fib_cache[symbol] = (anchor_low, anchor_high, all_levels, ratio_map, anchor_date)
 
     below = [l for l in all_levels if l <= current_price][-5:]
     above = [l for l in all_levels if l > current_price][:10]
@@ -3795,6 +3821,7 @@ class ScannerThread(threading.Thread):
         self.on_alert = on_alert    # callback(str) for alert messages
         self.running = False
         self.previous: dict = {}
+        self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
         self.count = 0
         self._warmup = True   # suppress alerts on first cycle
         self._last_session: str = _get_market_session()  # track session transitions
@@ -3833,6 +3860,10 @@ class ScannerThread(threading.Thread):
         raw = _run_ocr_scan(self.price_min, self.price_max)
         if not raw:
             return
+        # Update last-seen timestamps for carry-over freshness
+        now_ts = time_mod.time()
+        for sym in raw:
+            self._last_seen_in_scan[sym] = now_ts
         updated = False
         for sym, d in raw.items():
             if sym not in self.previous:
@@ -4369,6 +4400,7 @@ class ScannerThread(threading.Thread):
                 f"  Resetting scanner data..."
             )
             self.previous.clear()
+            self._last_seen_in_scan.clear()
             _enrichment.clear()
             _session_stocks.clear()
             self._warmup = True  # suppress alerts on first cycle of new session
@@ -4383,17 +4415,26 @@ class ScannerThread(threading.Thread):
             current = _run_ibkr_scan(self.price_min, self.price_max)
             scan_source = "IBKR"
 
+        # Track when each stock was last found by a fresh scan
+        now_ts = time_mod.time()
+        for sym in current:
+            self._last_seen_in_scan[sym] = now_ts
+
         # Keep enriched stocks from previous scan that OCR missed this cycle.
         # OCR is unreliable — symbols flicker due to misreads (I→l, spaces in numbers).
-        # Only keep stocks that were enriched (≥16%) to avoid accumulating garbage.
+        # Only carry over if stock was seen by a scan within the last 5 minutes;
+        # beyond that it has genuinely dropped off the scanner.
+        _CARRYOVER_MAX_AGE = 60  # 1 minute
         if scan_source == "OCR" and self.previous:
             kept = 0
             for sym, prev_d in self.previous.items():
                 if sym not in current and sym in _enrichment:
-                    current[sym] = dict(prev_d)
-                    kept += 1
+                    last_seen = self._last_seen_in_scan.get(sym, 0)
+                    if now_ts - last_seen <= _CARRYOVER_MAX_AGE:
+                        current[sym] = dict(prev_d)
+                        kept += 1
             if kept:
-                log.debug(f"Kept {kept} enriched stocks from previous scan (OCR miss)")
+                log.debug(f"Kept {kept} enriched stocks from previous scan (OCR miss, <5min)")
 
         # IBKR enrichment for momentum stocks from OCR scan
         if scan_source == "OCR" and current:
@@ -4952,7 +4993,11 @@ class App:
 
     def _check_connection(self):
         """Check IBKR connection status for both scanner and order thread."""
-        scan_ok = _ibkr and _ibkr.isConnected()
+        try:
+            ib = _ibkr
+            scan_ok = ib is not None and ib.isConnected()
+        except Exception:
+            scan_ok = False
         order_ok = self._order_thread.connected
         if scan_ok and order_ok:
             self.conn_var.set("Scan ✓ | Orders ✓")
@@ -5692,7 +5737,8 @@ class App:
             return
 
         # Look up fib levels
-        cached = _fib_cache.get(sym)
+        with _fib_cache_lock:
+            cached = _fib_cache.get(sym)
         if not cached:
             messagebox.showwarning("No Fib Data",
                                    f"No Fibonacci data for {sym}.\nWait for enrichment.",
@@ -5784,7 +5830,7 @@ class App:
     def _on_volume_change(self, val):
         """Handle volume slider change."""
         global _sound_volume
-        v = int(val)
+        v = int(float(val))
         _sound_volume = v
         self._vol_label.config(text=f"{v}%")
         if v == 0:
@@ -5868,16 +5914,19 @@ class App:
                 if result.returncode == 0 and result.stdout.strip():
                     wid = int(result.stdout.strip())
                     name = _get_window_name(wid)
-                    # If slot already occupied, remove old one first
-                    if idx < len(_scanner_sources):
-                        remove_scanner_source(idx)
-                    # Pad sources list if needed
-                    while len(_scanner_sources) < idx:
-                        _scanner_sources.append({'wid': 0, 'name': ''})
-                    if idx < len(_scanner_sources):
-                        _scanner_sources[idx] = {'wid': wid, 'name': name}
-                    else:
-                        add_scanner_source(wid, name)
+                    with _scanner_sources_lock:
+                        # If slot already occupied, remove old one first
+                        if idx < len(_scanner_sources):
+                            removed = _scanner_sources.pop(idx)
+                            log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
+                        # Pad sources list if needed
+                        while len(_scanner_sources) < idx:
+                            _scanner_sources.append({'wid': 0, 'name': ''})
+                        if idx < len(_scanner_sources):
+                            _scanner_sources[idx] = {'wid': wid, 'name': name}
+                        else:
+                            _scanner_sources.append({'wid': wid, 'name': name})
+                            log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
                     short_name = name[:12] if name else str(wid)
                     self.root.after(0, lambda: self._scanner_slot_vars[idx].set(f"S{idx+1}: {short_name}"))
                     self.root.after(0, lambda: self._scanner_slot_labels[idx].config(fg=self.GREEN))
@@ -5891,8 +5940,7 @@ class App:
 
     def _clear_scanner(self, idx: int):
         """Remove scanner source from slot idx."""
-        if idx < len(_scanner_sources):
-            remove_scanner_source(idx)
+        remove_scanner_source(idx)
         self._scanner_slot_vars[idx].set(f"S{idx+1}: ——")
         self._scanner_slot_labels[idx].config(fg="#666")
         self.status.set(f"Scanner S{idx+1} cleared")
@@ -5926,9 +5974,11 @@ class App:
 
     def _refresh_scanner_slots(self):
         """Refresh scanner slot labels from _scanner_sources."""
+        with _scanner_sources_lock:
+            snapshot = list(_scanner_sources)
         for i in range(_MAX_SCANNER_SOURCES):
-            if i < len(_scanner_sources) and _scanner_sources[i].get('wid'):
-                src = _scanner_sources[i]
+            if i < len(snapshot) and snapshot[i].get('wid'):
+                src = snapshot[i]
                 short_name = src['name'][:12] if src['name'] else str(src['wid'])
                 self._scanner_slot_vars[i].set(f"S{i+1}: {short_name}")
                 self._scanner_slot_labels[i].config(fg=self.GREEN)
@@ -5937,7 +5987,8 @@ class App:
                 self._scanner_slot_labels[i].config(fg="#666")
 
     def _save(self):
-        scanner_data = [{'wid': s['wid'], 'name': s['name']} for s in _scanner_sources]
+        with _scanner_sources_lock:
+            scanner_data = [{'wid': s['wid'], 'name': s['name']} for s in _scanner_sources]
         with open(STATE_PATH, 'w') as f:
             json.dump({
                 'freq': self.freq.get(),
@@ -5967,11 +6018,13 @@ class App:
             # Legacy: migrate from old webull_wid format
             if not saved_sources and s.get('webull_wid'):
                 saved_sources = [{'wid': int(s['webull_wid']), 'name': 'Webull'}]
-            _scanner_sources = []
+            verified = []
             for src in saved_sources:
                 wid = int(src.get('wid', 0))
                 if wid and _verify_wid(wid):
-                    _scanner_sources.append({'wid': wid, 'name': src.get('name', '')})
+                    verified.append({'wid': wid, 'name': src.get('name', '')})
+            with _scanner_sources_lock:
+                _scanner_sources = verified
             self._refresh_scanner_slots()
             # Restore font settings
             if 'table_font' in s:
