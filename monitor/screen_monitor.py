@@ -1304,8 +1304,9 @@ _FIB_RATIO_ICON: dict[float, str] = {
 }
 
 
-def _format_fib_text(sym: str, price: float, vwap: float = 0) -> str:
-    """Build fib levels text — 10 above (descending) + 5 below with % distance and ratio icons."""
+def _format_fib_text(sym: str, price: float, vwap: float = 0,
+                     ma_rows: list[dict] | None = None) -> str:
+    """Build fib levels text — 10 above (descending) + 5 below with % distance, ratio icons, and nearby MAs."""
     if price > 0:
         calc_fib_levels(sym, price)
     with _fib_cache_lock:
@@ -1322,6 +1323,27 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0) -> str:
     if not above and not below:
         return ""
 
+    # Build flat list of MA values for proximity matching
+    _TF_SHORT = {'1m': 'M1', '5m': 'M5', '15m': 'M15', '1h': 'H1',
+                 '4h': 'H4', 'D': 'D', 'W': 'W', 'MO': 'MO'}
+    ma_flat: list[tuple[str, float]] = []  # (label, value)
+    if ma_rows:
+        for r in ma_rows:
+            tf_s = _TF_SHORT.get(r['tf'], r['tf'])
+            for ma_type, key in [('S', 'sma'), ('E', 'ema')]:
+                val = r.get(key)
+                if val and val > 0:
+                    ma_flat.append((f"{ma_type}{r['period']} {tf_s}", val))
+
+    def _nearby_mas(lv: float, threshold_pct: float = 3.0) -> str:
+        if not ma_flat:
+            return ""
+        hits = []
+        for label, val in ma_flat:
+            if abs(val - lv) / lv * 100 <= threshold_pct:
+                hits.append(f"{label} {_p(val)}")
+        return f"  ◀ {', '.join(hits)}" if hits else ""
+
     def _icon(lv: float) -> str:
         info = ratio_map.get(round(lv, 4))
         if info:
@@ -1331,13 +1353,9 @@ def _format_fib_text(sym: str, price: float, vwap: float = 0) -> str:
     def _fmt(lv: float) -> str:
         pct_dist = (lv - price) / price * 100
         icon = _icon(lv)
-        if lv >= 1:
-            p = f"${lv:.2f}"
-        elif lv >= 0.1:
-            p = f"${lv:.3f}"
-        else:
-            p = f"${lv:.4f}"
-        return f"{icon} {p}  {pct_dist:+.1f}%"
+        p = _p(lv)
+        ma_str = _nearby_mas(lv)
+        return f"{icon} {p}  {pct_dist:+.1f}%{ma_str}"
 
     def _p(v: float) -> str:
         if v >= 1: return f"${v:.2f}"
@@ -2266,6 +2284,23 @@ def _calc_ma_table(current_price: float,
             sma_val = float(close.rolling(p).mean().iloc[-1]) if len(close) >= p else None
             ema_val = float(close.ewm(span=p, adjust=False).mean().iloc[-1]) if len(close) >= p else None
             rows.append({'tf': tf, 'period': p, 'sma': sma_val, 'ema': ema_val})
+    # Monthly: resample weekly → monthly
+    w_frame = ma_frames.get('W')
+    if w_frame is not None and len(w_frame) >= 5 and 'date' in w_frame.columns:
+        try:
+            mf = w_frame.copy()
+            mf['date'] = pd.to_datetime(mf['date'])
+            monthly = mf.set_index('date')['close'].resample('ME').last().dropna()
+            for p in periods:
+                sma_val = float(monthly.rolling(p).mean().iloc[-1]) if len(monthly) >= p else None
+                ema_val = float(monthly.ewm(span=p, adjust=False).mean().iloc[-1]) if len(monthly) >= p else None
+                rows.append({'tf': 'MO', 'period': p, 'sma': sma_val, 'ema': ema_val})
+        except Exception:
+            for p in periods:
+                rows.append({'tf': 'MO', 'period': p, 'sma': None, 'ema': None})
+    else:
+        for p in periods:
+            rows.append({'tf': 'MO', 'period': p, 'sma': None, 'ema': None})
     return rows
 
 
@@ -2590,7 +2625,7 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         lines.append("✅ אין התנגדויות — מחיר מעל כל הממוצעים")
 
     # 3. Fibonacci levels (text) — always last in text
-    fib_text = _format_fib_text(sym, price, vwap=vwap)
+    fib_text = _format_fib_text(sym, price, vwap=vwap, ma_rows=ma_rows)
     if fib_text:
         lines.append("")
         lines.append(fib_text.lstrip("\n"))
