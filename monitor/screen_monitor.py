@@ -158,6 +158,25 @@ def _get_contract(sym: str) -> Stock | None:
                     _contract_cache[variant] = vc   # also under corrected key
                     return vc
 
+    # Try common OCR letter swaps: K↔X, O↔0, B↔8, S↔5, G↔6
+    _OCR_SWAPS = {'K': 'X', 'X': 'K'}
+    for i, ch in enumerate(sym):
+        replacement = _OCR_SWAPS.get(ch)
+        if replacement:
+            variant = sym[:i] + replacement + sym[i+1:]
+            if variant in _contract_cache:
+                _sym_corrections[sym] = variant
+                _contract_cache[sym] = _contract_cache[variant]
+                return _contract_cache[variant]
+            vc = Stock(variant, 'SMART', 'USD')
+            ib.qualifyContracts(vc)
+            if vc.conId:
+                log.info(f"OCR symbol fix: {sym} → {variant} (swapped {ch}→{replacement})")
+                _sym_corrections[sym] = variant
+                _contract_cache[sym] = vc
+                _contract_cache[variant] = vc
+                return vc
+
     return None  # qualification failed — don't return invalid contract (conId=0)
 
 
@@ -637,14 +656,16 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
 # Symbols accept lowercase (Tesseract reads I→l), uppercased in parser.
 _OCR_RE_5COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'        # symbol (allow lowercase for OCR misreads)
+    r'[^+\d-]*'                   # skip OCR junk (=, —, spaces) before +/- sign
     r'([+-][\d.,]+)%?\S*\s+'      # pct change (+/- prefix, optional %, ignore junk)
     r'([\d.]+)\s+'                # price
     r'([\d.,]+[KMBkmb]?)\s+'     # volume
-    r'([\d.,]+[KMBkmb]?)\s*$',   # float
+    r'[^\d]*([\d.,]+[KMBkmb]?)\S*$',  # float (skip OCR junk like dashes before digits)
     re.MULTILINE,
 )
 _OCR_RE_4COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'
+    r'[^+\d-]*'                   # skip OCR junk before +/- sign
     r'([+-][\d.,]+)%?\S*\s+'
     r'([\d.]+)\s+'
     r'([\d.,]+[KMBkmb]?)\s*$',
@@ -652,6 +673,7 @@ _OCR_RE_4COL = re.compile(
 )
 _OCR_RE_3COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'
+    r'[^+\d-]*'                   # skip OCR junk before +/- sign
     r'([+-][\d.,]+)%?\S*\s+'
     r'([\d.]+)\s*$',
     re.MULTILINE,
