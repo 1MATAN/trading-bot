@@ -2449,26 +2449,38 @@ def check_volume_alert(sym: str, price: float, vwap: float,
 
 
 def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
-    """Alert on Doji candles across 1m/5m/15m/30m/1h timeframes."""
+    """Alert on Doji candles using CACHED bars only (no new IBKR downloads).
+
+    Only checks timeframes that are already in _intraday_cache from other
+    functions (stock reports, GG/MR strategies).  This avoids 95+ IBKR
+    requests per cycle that were causing 60-90s delays.
+    """
     if sym not in _enrichment:
         return None
 
     tf_specs = [
-        ('1 min',   '1m',  '2 D'),
-        ('5 mins',  '5m',  '5 D'),
-        ('15 mins', '15m', '2 W'),
-        ('30 mins', '30m', '1 M'),
-        ('1 hour',  '1h',  '3 M'),
+        ('1 min',   '1m'),
+        ('5 mins',  '5m'),
+        ('15 mins', '15m'),
+        ('30 mins', '30m'),
+        ('1 hour',  '1h'),
     ]
     doji_hits = []
     now = time_mod.time()
 
-    for bar_size, tf_label, duration in tf_specs:
+    for bar_size, tf_label in tf_specs:
         cooldown_key = f"{sym}_{tf_label}"
         if now - _doji_alerted.get(cooldown_key, 0) < _DOJI_COOLDOWN_SEC:
             continue
 
-        df = _download_intraday(sym, bar_size=bar_size, duration=duration)
+        # Cache-only: skip if bars not already cached
+        cache_key = f"{sym}_{bar_size}"
+        entry = _intraday_cache.get(cache_key)
+        if not entry:
+            continue
+        cached_ts, df = entry
+        if time_mod.time() - cached_ts > _INTRADAY_CACHE_TTL:
+            continue
         if df is None or len(df) < 2:
             continue
 
@@ -2612,12 +2624,11 @@ def _calc_ma_table(current_price: float,
                    ma_frames: dict[str, pd.DataFrame | None]) -> list[dict]:
     """Compute SMA & EMA for periods 9/20/50/100/200 across all timeframes.
 
-    ``ma_frames``: {'1m': df, '5m': df, '15m': df, '1h': df,
-                    '4h': df, 'D': df, 'W': df}
+    ``ma_frames``: {'1m': df, '5m': df, '15m': df, '30m': df, '1h': df, 'D': df}
     Returns list of dicts: {tf, period, sma, ema} with None for unavailable.
     """
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', 'D', 'W']
+    tf_order = ['1m', '5m', '15m', '30m', '1h', 'D']
     rows = []
     for tf in tf_order:
         frame = ma_frames.get(tf)
@@ -2658,8 +2669,7 @@ def _get_fresh_ma_rows(sym: str, price: float) -> list[dict] | None:
     """
     _tf_specs = [
         ('1m',  '1 min'),  ('5m',  '5 mins'), ('15m', '15 mins'),
-        ('30m', '30 mins'), ('1h',  '1 hour'), ('2h',  '2 hours'),
-        ('4h',  '4 hours'), ('W',   '1 week'),
+        ('30m', '30 mins'), ('1h',  '1 hour'),
     ]
     ma_frames: dict[str, pd.DataFrame | None] = {}
     any_found = False
@@ -2687,7 +2697,7 @@ def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
     """
     green, red, grey = '#26a69a', '#ef5350', '#555'
     periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '30m', '1h', '2h', '4h', 'D', 'W']
+    tf_order = ['1m', '5m', '15m', '30m', '1h', 'D']
 
     ma_lookup = {}
     for r in ma_rows:
@@ -2920,6 +2930,7 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     price = stock['price']
 
     # ── Download MA timeframes first (needed for resist line) ──
+    # Reduced from 8 to 5 timeframes to cut IBKR requests per stock report
     ma_frames: dict[str, pd.DataFrame | None] = {}
     _tf_specs = [
         ('1m',  '1 min',   '2 D'),
@@ -2927,9 +2938,6 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         ('15m', '15 mins', '2 W'),
         ('30m', '30 mins', '1 M'),
         ('1h',  '1 hour',  '3 M'),
-        ('2h',  '2 hours', '6 M'),
-        ('4h',  '4 hours', '1 Y'),
-        ('W',   '1 week',  '5 Y'),
     ]
     for tf_key, bar_size, duration in _tf_specs:
         ma_frames[tf_key] = _download_intraday(sym, bar_size=bar_size, duration=duration)
