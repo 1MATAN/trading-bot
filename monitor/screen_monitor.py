@@ -535,8 +535,9 @@ _avg_vol_cache: dict[str, float] = {}
 
 def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
                            price_max: float = MONITOR_PRICE_MAX) -> list[tuple[str, object]]:
-    """Fast IBKR scanner: only get symbol list + contracts (no enrichment).
+    """Fast IBKR scanner: only TOP_PERC_GAIN for relevant penny stock gainers.
 
+    Uses only TOP_PERC_GAIN (not HOT_BY_VOLUME/MOST_ACTIVE which add noise).
     Returns list of (symbol, contract) tuples.
     """
     ib = _get_ibkr()
@@ -546,34 +547,35 @@ def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
     valid_items: list[tuple[str, object]] = []
     seen_syms: set[str] = set()
 
-    for scan_code in MONITOR_SCAN_CODES:
-        sub = ScannerSubscription(
-            instrument="STK",
-            locationCode="STK.US.MAJOR",
-            scanCode=scan_code,
-            numberOfRows=MONITOR_SCAN_MAX_RESULTS,
-            abovePrice=price_min,
-            belowPrice=price_max,
-        )
-        try:
-            results = ib.reqScannerData(sub)
-        except Exception as e:
-            log.error(f"reqScannerData ({scan_code}) failed: {e}")
-            continue
+    # Only TOP_PERC_GAIN for the fast list — other scan codes add irrelevant stocks
+    sub = ScannerSubscription(
+        instrument="STK",
+        locationCode="STK.US.MAJOR",
+        scanCode="TOP_PERC_GAIN",
+        numberOfRows=MONITOR_SCAN_MAX_RESULTS,
+        abovePrice=price_min,
+        belowPrice=price_max,
+    )
+    try:
+        results = ib.reqScannerData(sub)
+    except Exception as e:
+        log.error(f"reqScannerData (TOP_PERC_GAIN) failed: {e}")
+        return []
 
-        added = 0
-        for item in results:
-            contract = item.contractDetails.contract
-            sym = contract.symbol
-            if not sym or not sym.isalpha() or len(sym) > 5:
-                continue
-            if sym not in seen_syms:
-                seen_syms.add(sym)
-                valid_items.append((sym, contract))
-                if contract.conId and sym not in _contract_cache:
-                    _contract_cache[sym] = contract
-                added += 1
-        log.debug(f"Scan [{scan_code}]: {len(results)} raw → {added} new unique")
+    for item in results:
+        contract = item.contractDetails.contract
+        sym = contract.symbol
+        if not sym or not sym.isalpha() or len(sym) > 5:
+            continue
+        # Skip rights (R), warrants (W), units (U) — 5-char symbols ending with suffix
+        if len(sym) == 5 and sym[-1] in ('R', 'W', 'U'):
+            continue
+        if sym not in seen_syms:
+            seen_syms.add(sym)
+            valid_items.append((sym, contract))
+            if contract.conId and sym not in _contract_cache:
+                _contract_cache[sym] = contract
+    log.debug(f"Scan [TOP_PERC_GAIN]: {len(results)} raw → {len(valid_items)} unique")
 
     return valid_items
 
@@ -811,7 +813,9 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
     return (raw, _format_volume(raw))
 
 
-# Generic OCR patterns — Webull format: SYM PRICE +PCT% VOL FLOAT
+# Generic OCR patterns — two Webull column orders:
+#   Format A: SYM PRICE +PCT% VOL FLOAT  (some Webull views)
+#   Format B: SYM +PCT% PRICE VOL FLOAT  (Top Gainers / % Change first)
 # PRICE is plain digits, PCT always starts with +/- — used to distinguish columns.
 # Symbols accept lowercase (Tesseract reads I→l), uppercased in parser.
 # IBKR TWS Scanner format: [icons/junk] SYMBOL [@ = + 8] PRICE VOLUME [FLOAT] [RANGE%] CHANGE% ...
@@ -824,7 +828,30 @@ _OCR_RE_TWS = re.compile(
     r'([+-][\d]+[.,][\d]+)%',            # change% with +/- prefix
 )
 
-# Webull formats (existing)
+# ── Format B: SYM +PCT% PRICE VOL FLOAT (Webull "% Change" column first) ──
+_OCR_RE_5COL_B = re.compile(
+    r'^([A-Za-z]{1,5})\s+'        # symbol
+    r'([+-][\d.,]+)%?\S*\s+'     # pct change (+/- prefix)
+    r'([\d.]+)\s+'                # price (plain digits)
+    r'([\d.,]+[KMBkmb]?)\s+'     # volume
+    r'[^\d]*([\d.,]+[KMBkmb]?)\S*$',  # float
+    re.MULTILINE,
+)
+_OCR_RE_4COL_B = re.compile(
+    r'^([A-Za-z]{1,5})\s+'
+    r'([+-][\d.,]+)%?\S*\s+'     # pct change
+    r'([\d.]+)\s+'                # price
+    r'([\d.,]+[KMBkmb]?)\s*$',
+    re.MULTILINE,
+)
+_OCR_RE_3COL_B = re.compile(
+    r'^([A-Za-z]{1,5})\s+'
+    r'([+-][\d.,]+)%?\S*\s+'     # pct change
+    r'([\d.]+)\s*$',              # price
+    re.MULTILINE,
+)
+
+# ── Format A: SYM PRICE +PCT% VOL FLOAT (Webull price column first) ──
 _OCR_RE_5COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'        # symbol (allow lowercase for OCR misreads)
     r'([\d.]+)\s+'                # price (plain digits before +/- pct)
@@ -946,7 +973,59 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         })
         seen.add(sym)
 
-    # Try 5-column first (most data) — Webull format
+    # ── Format B: SYM +PCT% PRICE VOL FLOAT (Webull "% Change" first) ──
+    for m in _OCR_RE_5COL_B.finditer(text):
+        sym = _fix_ocr_sym(m.group(1))
+        if sym in seen:
+            continue
+        try:
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
+            price = float(m.group(3))
+        except ValueError:
+            continue
+        vol_raw, vol_display = _parse_ocr_volume(m.group(4))
+        flt_raw, flt_display = _parse_ocr_volume(m.group(5))
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': vol_raw, 'volume': vol_display,
+            'float_raw': flt_raw, 'float_display': flt_display,
+        })
+        seen.add(sym)
+
+    for m in _OCR_RE_4COL_B.finditer(text):
+        sym = _fix_ocr_sym(m.group(1))
+        if sym in seen:
+            continue
+        try:
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
+            price = float(m.group(3))
+        except ValueError:
+            continue
+        vol_raw, vol_display = _parse_ocr_volume(m.group(4))
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': vol_raw, 'volume': vol_display,
+            'float_raw': 0, 'float_display': '',
+        })
+        seen.add(sym)
+
+    for m in _OCR_RE_3COL_B.finditer(text):
+        sym = _fix_ocr_sym(m.group(1))
+        if sym in seen:
+            continue
+        try:
+            pct = float(m.group(2).replace(',', '').rstrip('.'))
+            price = float(m.group(3))
+        except ValueError:
+            continue
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': 0, 'volume': '',
+            'float_raw': 0, 'float_display': '',
+        })
+        seen.add(sym)
+
+    # ── Format A: SYM PRICE +PCT% VOL FLOAT (Webull price first) ──
     for m in _OCR_RE_5COL.finditer(text):
         sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
@@ -965,7 +1044,6 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         })
         seen.add(sym)
 
-    # Try 4-column for remaining
     for m in _OCR_RE_4COL.finditer(text):
         sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
@@ -983,7 +1061,6 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         })
         seen.add(sym)
 
-    # Try 3-column for remaining
     for m in _OCR_RE_3COL.finditer(text):
         sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
@@ -1220,6 +1297,11 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             d['prev_close'] = round(prev_close, 4)
             d['day_high'] = day_high
             d['day_low'] = day_low
+            # Fill price/pct for IBKR-only stocks (OCR didn't provide them)
+            if d.get('price', 0) <= 0 and price > 0:
+                d['price'] = round(price, 4)
+            if d.get('pct', 0) == 0 and prev_close > 0 and price > 0:
+                d['pct'] = round((price - prev_close) / prev_close * 100, 1)
             d['contract'] = contract
             # Seed running alert trackers with IBKR accurate data
             if day_high > _running_high.get(sym, 0):
@@ -6000,6 +6082,8 @@ class ScannerThread(threading.Thread):
         _phase('ibkr_list_done')
 
         # Merge: OCR provides real-time prices, IBKR adds missing stocks + contracts
+        # Limit IBKR-only additions to avoid slow enrichment cycles (each needs reqHistoricalData)
+        _MAX_IBKR_ONLY = 10
         current = dict(ocr_data) if ocr_data else {}
         ibkr_added = 0
         for sym, contract in ibkr_list:
@@ -6007,13 +6091,17 @@ class ScannerThread(threading.Thread):
                 # OCR already has this stock — just add the contract if missing
                 if not current[sym].get('contract'):
                     current[sym]['contract'] = contract
-            else:
+            elif ibkr_added < _MAX_IBKR_ONLY:
                 # IBKR-only stock — add with minimal data (enrichment will fill price/pct)
                 current[sym] = {
                     'sym': sym, 'price': 0, 'pct': 0, 'volume': '',
                     'volume_raw': 0, 'contract': contract,
                 }
                 ibkr_added += 1
+            else:
+                # Just cache the contract for later use (no enrichment this cycle)
+                if contract.conId and sym not in _contract_cache:
+                    _contract_cache[sym] = contract
 
         ocr_count = len(ocr_data) if ocr_data else 0
         scan_source = "OCR+IBKR" if ocr_count > 0 else "IBKR"
