@@ -188,14 +188,13 @@ class OrderThread(threading.Thread):
                              timeout=_CONNECT_TIMEOUT)
             log.info(f"OrderThread: IBKR connected (clientId={MONITOR_ORDER_CLIENT_ID})")
 
-            # Subscribe to account updates so IBKR pushes data to this clientId.
-            # Without this, accountValues()/portfolio() may return empty.
+            # ib_insync auto-subscribes to account updates on connect.
+            # Pump event loop to receive the initial account snapshot.
             try:
-                self._ib.reqAccountUpdates(subscribe=True, account="")
-                self._ib.sleep(1)  # give TWS a moment to send initial snapshot
-                log.info("OrderThread: subscribed to account updates")
-            except Exception as e:
-                log.warning(f"OrderThread: reqAccountUpdates failed: {e}")
+                self._ib.sleep(2)
+                log.info("OrderThread: account data ready")
+            except Exception:
+                pass
 
             return True
         except Exception as e:
@@ -284,13 +283,11 @@ class OrderThread(threading.Thread):
                     round(item.unrealizedPNL, 2),
                 )
 
-            # If NetLiq is 0, subscription may not be active — re-subscribe
+            # If NetLiq is 0, pump event loop more to let data arrive
             if net_liq <= 0 and ib.isConnected():
-                log.warning("OrderThread: NetLiq=0, re-subscribing to account updates")
+                log.warning("OrderThread: NetLiq=0, pumping event loop for account data")
                 try:
-                    ib.reqAccountUpdates(subscribe=True, account="")
-                    ib.sleep(1)
-                    # Retry
+                    ib.sleep(2)
                     acct_vals = ib.accountValues()
                     for av in acct_vals:
                         if av.tag == 'NetLiquidation' and av.currency == 'USD':
@@ -298,7 +295,7 @@ class OrderThread(threading.Thread):
                         elif av.tag == 'BuyingPower' and av.currency == 'USD':
                             buying_power = float(av.value)
                 except Exception as e:
-                    log.warning(f"OrderThread: re-subscribe failed: {e}")
+                    log.warning(f"OrderThread: retry account fetch failed: {e}")
 
             self.net_liq = net_liq
             self.buying_power = buying_power
