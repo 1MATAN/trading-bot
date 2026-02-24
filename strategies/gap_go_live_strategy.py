@@ -146,6 +146,7 @@ class GapGoLiveStrategy:
         """
         self._ib_getter = ib_getter
         self._states: dict[str, _GGSymbolState] = {}
+        self._last_raw_bars: dict[str, list] = {}  # sym -> raw ib bars from last cycle
 
     def _get_state(self, symbol: str) -> _GGSymbolState:
         today = datetime.now(_ET).strftime("%Y-%m-%d")
@@ -178,6 +179,7 @@ class GapGoLiveStrategy:
         """
         entries: list[GGEntrySignal] = []
         exits: list[GGExitSignal] = []
+        self._last_raw_bars.clear()
 
         ib = self._ib_getter()
         if ib is None or not ib.isConnected():
@@ -221,6 +223,9 @@ class GapGoLiveStrategy:
         )
         if not bars or len(bars) < 10:
             return None, None
+
+        # Expose raw bars for external caching (e.g. Doji alert)
+        self._last_raw_bars[sym] = bars
 
         # Convert to list of dicts
         bars_1m = []

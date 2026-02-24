@@ -2557,10 +2557,11 @@ def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
         cached_ts, df = entry
         if time_mod.time() - cached_ts > _INTRADAY_CACHE_TTL:
             continue
-        if df is None or len(df) < 2:
+        if df is None or len(df) < 3:
             continue
 
-        last = df.iloc[-1]
+        # Use second-to-last bar (completed), not last (still forming)
+        last = df.iloc[-2]
         o, h, l, c = last['open'], last['high'], last['low'], last['close']
         total_range = h - l
         if total_range <= 0 or h <= 0:
@@ -3189,7 +3190,7 @@ def _download_daily(symbol: str) -> pd.DataFrame | None:
 
 
 _intraday_cache: dict[str, tuple[float, pd.DataFrame]] = {}  # key → (timestamp, df)
-_INTRADAY_CACHE_TTL = 120  # 2 minutes
+_INTRADAY_CACHE_TTL = 300  # 5 minutes
 
 
 def _download_intraday(symbol: str, bar_size: str = '5 mins',
@@ -5012,6 +5013,15 @@ class ScannerThread(threading.Thread):
                     log.warning(f"GG: Insufficient virtual cash for {entry.symbol} "
                                 f"(cash=${self._gg_portfolio.cash:.0f}, price=${entry_price:.4f})")
 
+            # Cache 1-min bars from GG strategy for Doji/MA alerts
+            for sym, raw_bars in self._gg_strategy._last_raw_bars.items():
+                if raw_bars and len(raw_bars) >= 5:
+                    try:
+                        df = ib_util.df(raw_bars)
+                        _intraday_cache[f"{sym}_1 min"] = (time_mod.time(), df)
+                    except Exception:
+                        pass
+
         except Exception as e:
             log.error(f"GG cycle error: {e}")
 
@@ -5087,6 +5097,15 @@ class ScannerThread(threading.Thread):
                     self._mr_strategy.mark_position_closed(entry.symbol)
                     log.warning(f"MR: Insufficient virtual cash for {entry.symbol} "
                                 f"(cash=${self._mr_portfolio.cash:.0f}, price=${entry_price:.4f})")
+
+            # Cache 1-min bars from MR strategy for Doji/MA alerts
+            for sym, raw_bars in self._mr_strategy._last_raw_bars.items():
+                if raw_bars and len(raw_bars) >= 5:
+                    try:
+                        df = ib_util.df(raw_bars)
+                        _intraday_cache[f"{sym}_1 min"] = (time_mod.time(), df)
+                    except Exception:
+                        pass
 
         except Exception as e:
             log.error(f"MR cycle error: {e}")

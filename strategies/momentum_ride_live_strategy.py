@@ -124,6 +124,7 @@ class MomentumRideLiveStrategy:
     def __init__(self, ib_getter):
         self._ib_getter = ib_getter
         self._states: dict[str, _MRSymbolState] = {}
+        self._last_raw_bars: dict[str, list] = {}  # sym -> raw ib bars from last cycle
 
     def _get_state(self, symbol: str) -> _MRSymbolState:
         today = datetime.now(_ET).strftime("%Y-%m-%d")
@@ -165,6 +166,7 @@ class MomentumRideLiveStrategy:
         """
         entries: list[MREntrySignal] = []
         exits: list[MRExitSignal] = []
+        self._last_raw_bars.clear()
 
         ib = self._ib_getter()
         if ib is None or not ib.isConnected():
@@ -223,6 +225,9 @@ class MomentumRideLiveStrategy:
         )
         if not bars or len(bars) < 10:
             return None, None
+
+        # Expose raw bars for external caching (e.g. Doji alert)
+        self._last_raw_bars[sym] = bars
 
         # Convert to list of dicts
         bars_1m = []
