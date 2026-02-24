@@ -388,13 +388,51 @@ class OrderThread(threading.Thread):
 
             # Place stop-loss for BUY orders (STP LMT — triggers outside RTH)
             stop_msg = ""
-            if action == 'BUY' and stop_price > 0:
+            trailing_pct = req.get('trailing_pct', 0)
+            target_price = req.get('target_price', 0)
+            trail_msg = ""
+
+            if action == 'BUY' and stop_price > 0 and target_price > 0:
+                # ── OCA bracket: Stop + TP cancel each other ──
+                oca_group = f"Bracket_{sym}_{int(time_mod.time())}"
+
+                stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
+                stop_order.ocaGroup = oca_group
+                stop_order.ocaType = 1  # cancel remaining on fill
+                stop_trade = ib.placeOrder(contract, stop_order)
+                ib.sleep(1)
+                stop_status = stop_trade.orderStatus.status
+                stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
+                log.info(f"OCA Stop placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+
+                tp_order = LimitOrder('SELL', qty, target_price)
+                tp_order.outsideRth = True
+                tp_order.tif = 'GTC'
+                tp_order.ocaGroup = oca_group
+                tp_order.ocaType = 1
+                tp_trade = ib.placeOrder(contract, tp_order)
+                ib.sleep(1)
+                tp_status = tp_trade.orderStatus.status
+                trail_msg = f" | TP ${target_price:.2f} ({tp_status})"
+                log.info(f"OCA TP placed: SELL {qty} {sym} @ ${target_price:.2f} (LMT GTC) — {tp_status} [OCA={oca_group}]")
+
+            elif action == 'BUY' and stop_price > 0:
+                # Stop-loss only (no manual TP)
                 stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
                 stop_trade = ib.placeOrder(contract, stop_order)
                 ib.sleep(1)
                 stop_status = stop_trade.orderStatus.status
                 stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
                 log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+
+                # Trailing stop (only when no manual TP)
+                if trailing_pct > 0:
+                    trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
+                    trail_trade = ib.placeOrder(contract, trail_order)
+                    ib.sleep(1)
+                    trail_status = trail_trade.orderStatus.status
+                    trail_msg = f" | Trail {trailing_pct}% ({trail_status})"
+                    log.info(f"Trailing take-profit placed: SELL {qty} {sym} trail {trailing_pct}% — {trail_status}")
 
             # Place stop-loss on remaining shares for partial SELL orders
             stop_remaining_qty = req.get('stop_remaining_qty', 0)
@@ -405,28 +443,6 @@ class OrderThread(threading.Thread):
                 stop_status = stop_trade.orderStatus.status
                 stop_msg = f" | Stop {stop_remaining_qty}sh ${stop_price:.2f} ({stop_status})"
                 log.info(f"Stop-loss on remaining: SELL {stop_remaining_qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
-
-            # Place take-profit: manual LMT SELL or trailing stop
-            trailing_pct = req.get('trailing_pct', 0)
-            target_price = req.get('target_price', 0)
-            trail_msg = ""
-            if action == 'BUY' and target_price > 0:
-                # Manual take-profit — LMT SELL GTC
-                tp_order = LimitOrder('SELL', qty, target_price)
-                tp_order.outsideRth = True
-                tp_order.tif = 'GTC'
-                tp_trade = ib.placeOrder(contract, tp_order)
-                ib.sleep(1)
-                tp_status = tp_trade.orderStatus.status
-                trail_msg = f" | TP ${target_price:.2f} ({tp_status})"
-                log.info(f"Take-profit placed: SELL {qty} {sym} @ ${target_price:.2f} (LMT GTC) — {tp_status}")
-            elif action == 'BUY' and trailing_pct > 0:
-                trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
-                trail_trade = ib.placeOrder(contract, trail_order)
-                ib.sleep(1)
-                trail_status = trail_trade.orderStatus.status
-                trail_msg = f" | Trail {trailing_pct}% ({trail_status})"
-                log.info(f"Trailing take-profit placed: SELL {qty} {sym} trail {trailing_pct}% — {trail_status}")
 
             msg = f"{action} {qty} {sym} @ ${price:.2f} — {status}{stop_msg}{trail_msg}"
             log.info(f"Order placed: {msg}")
@@ -441,6 +457,7 @@ class OrderThread(threading.Thread):
                 ]
                 if target_price > 0:
                     tg_lines.append(f"  🎯 TP: ${target_price:.2f} [LMT SELL GTC]")
+                    tg_lines.append(f"  🔗 OCA: Stop ↔ TP (אחד מבטל את השני)")
                 elif trailing_pct > 0:
                     tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
                 tg_lines.append(f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop/trail)")
