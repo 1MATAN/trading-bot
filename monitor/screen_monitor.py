@@ -1092,6 +1092,12 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             d['day_high'] = day_high
             d['day_low'] = day_low
             d['contract'] = contract
+            # Seed running alert trackers with IBKR accurate data
+            if day_high > _running_high.get(sym, 0):
+                _running_high[sym] = day_high
+            cur_rl = _running_low.get(sym, 0)
+            if day_low > 0 and (cur_rl <= 0 or day_low < cur_rl):
+                _running_low[sym] = day_low
             if not d.get('volume_raw'):
                 # Only set volume if OCR didn't provide one
                 d['volume'] = _format_volume(volume)
@@ -2216,6 +2222,8 @@ _fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touc
 _lod_touch_tracker: dict[str, int] = {}                 # sym -> touch count at day_low
 _lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD last cycle
 _vwap_side: dict[str, str] = {}                         # sym -> 'above' | 'below'
+_running_high: dict[str, float] = {}                      # sym -> highest price seen today
+_running_low: dict[str, float] = {}                       # sym -> lowest price seen today
 _price_history: dict[str, list[tuple[float, float]]] = {}  # sym -> [(timestamp, price)]
 _spike_alerted: dict[str, float] = {}                   # sym -> timestamp (cooldown)
 
@@ -2242,6 +2250,8 @@ def _reset_alerts_if_new_day():
         _lod_was_near.clear()
         _vwap_side.clear()
         _vwap_last_alert.clear()
+        _running_high.clear()
+        _running_low.clear()
         _price_history.clear()
         _spike_alerted.clear()
         _vol_alert_sent.clear()
@@ -2260,26 +2270,45 @@ def _reset_alerts_if_new_day():
 
 
 def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
-    """Alert when price breaks today's high of day (≥20% only)."""
+    """Alert when price breaks today's high of day (≥20% only).
+
+    Uses _running_high tracker (updated every cycle including quick OCR
+    updates) instead of comparing stale IBKR day_high values.
+    """
     if current.get('pct', 0) < ALERT_MIN_PCT:
         return None
-    cur_high = current.get('day_high', 0)
-    prev_high = previous.get('day_high', 0)
     price = current.get('price', 0)
-    if cur_high <= 0 or prev_high <= 0:
+    if price <= 0:
         return None
-    if cur_high > prev_high and price >= cur_high * 0.998:
+
+    # Merge IBKR day_high with running tracker for best accuracy
+    ibkr_high = current.get('day_high', 0)
+    prev_running = _running_high.get(sym, 0)
+    known_high = max(ibkr_high, prev_running) if ibkr_high > 0 else prev_running
+
+    if known_high <= 0:
+        # First observation — seed tracker, no alert
+        _running_high[sym] = max(price, ibkr_high)
+        return None
+
+    if price > known_high:
+        # New high of day
+        _running_high[sym] = price
         last_alerted = _hod_break_alerted.get(sym, 0)
-        if cur_high <= last_alerted:
+        if price <= last_alerted:
             return None
-        _hod_break_alerted[sym] = cur_high
+        _hod_break_alerted[sym] = price
         pct = current.get('pct', 0)
         return (
             f"🟢 🔺 <b>HOD BREAK — {sym}</b>\n"
             f"💰 ${price:.2f} → שיא יומי חדש!\n"
-            f"📊 קודם: ${prev_high:.2f} | שינוי: {pct:+.1f}%"
+            f"📊 קודם: ${known_high:.2f} | שינוי: {pct:+.1f}%"
         )
-    return None
+    else:
+        # Not a new high — keep tracker up to date with IBKR data
+        if ibkr_high > prev_running:
+            _running_high[sym] = ibkr_high
+        return None
 
 
 def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
@@ -2319,12 +2348,32 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
 
 
 def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str | None:
-    """Alert on 2nd touch of day's low (≥20% only, 0.5% proximity)."""
-    if pct < ALERT_MIN_PCT or price <= 0 or day_low <= 0:
+    """Alert on 2nd touch of day's low (≥20% only, 0.5% proximity).
+
+    Uses _running_low tracker for accurate day low instead of stale
+    IBKR day_low that may be minutes old.
+    """
+    if pct < ALERT_MIN_PCT or price <= 0:
         return None
 
-    threshold = day_low * 0.005  # 0.5%
-    near_lod = abs(price - day_low) <= threshold
+    # Merge IBKR day_low with running tracker
+    prev_running = _running_low.get(sym, 0)
+    if day_low > 0 and prev_running > 0:
+        effective_low = min(day_low, prev_running)
+    elif day_low > 0:
+        effective_low = day_low
+    elif prev_running > 0:
+        effective_low = prev_running
+    else:
+        return None
+
+    # Update running tracker
+    if price < effective_low:
+        effective_low = price
+    _running_low[sym] = effective_low
+
+    threshold = effective_low * 0.005  # 0.5%
+    near_lod = abs(price - effective_low) <= threshold
 
     was_near = _lod_was_near.get(sym, False)
     _lod_was_near[sym] = near_lod
@@ -2335,7 +2384,7 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
         if count == 2:
             return (
                 f"🔴 🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
-                f"📍 נמוך יומי: ${day_low:.2f}\n"
+                f"📍 נמוך יומי: ${effective_low:.2f}\n"
                 f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                 f"⚠️ נגיעה שנייה — תמיכה/שבירה?"
             )
@@ -2343,21 +2392,33 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
 
 
 def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | None:
-    """Alert when price crosses VWAP (10-min cooldown per symbol)."""
+    """Alert when price crosses VWAP (10-min cooldown per symbol).
+
+    State update is deferred until after cooldown check to prevent
+    state corruption when crosses happen during cooldown window.
+    """
     if price <= 0 or vwap <= 0:
         return None
 
     current_side = 'above' if price > vwap else 'below'
     prev_side = _vwap_side.get(sym)
-    _vwap_side[sym] = current_side
 
-    if prev_side is None or prev_side == current_side:
+    if prev_side is None:
+        # First observation — seed state, no alert
+        _vwap_side[sym] = current_side
         return None
 
+    if prev_side == current_side:
+        return None
+
+    # Cross detected — check cooldown BEFORE updating state
     last = _vwap_last_alert.get(sym, 0)
     if time_mod.time() - last < _VWAP_COOLDOWN_SEC:
+        # Don't update _vwap_side — cross will be re-detected next cycle
         return None
 
+    # Cooldown passed — commit state change and alert
+    _vwap_side[sym] = current_side
     _vwap_last_alert[sym] = time_mod.time()
 
     if prev_side == 'below':
@@ -4505,6 +4566,20 @@ class ScannerThread(threading.Thread):
                     (new_price - prev_close) / prev_close * 100, 1)
             else:
                 self.previous[sym]['pct'] = d['pct']
+            # Update day_high / day_low with real-time price
+            cur_high = self.previous[sym].get('day_high', 0)
+            cur_low = self.previous[sym].get('day_low', 0)
+            if cur_high > 0 and new_price > cur_high:
+                self.previous[sym]['day_high'] = round(new_price, 4)
+            if cur_low > 0 and new_price < cur_low:
+                self.previous[sym]['day_low'] = round(new_price, 4)
+            # Update running alert trackers
+            prev_rh = _running_high.get(sym, 0)
+            if new_price > prev_rh:
+                _running_high[sym] = new_price
+            prev_rl = _running_low.get(sym, 0)
+            if prev_rl <= 0 or new_price < prev_rl:
+                _running_low[sym] = new_price
             updated = True
         if updated:
             self._refresh_enrichment_fibs(self.previous)
