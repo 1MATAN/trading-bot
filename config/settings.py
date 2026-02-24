@@ -299,6 +299,12 @@ MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
 MR_LIVE_SAFETY_STOP_PCT = MR_SAFETY_STOP_PCT
 MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
 
+# ── Float Turnover (FT) Robot ──────────────────────────
+FT_LIVE_INITIAL_CASH = 3000.0
+FT_LIVE_POSITION_SIZE_PCT = 0.95
+FT_LIVE_MAX_TRACKED_SYMBOLS = 50       # no practical limit — track all ≥15% turnover
+FT_MIN_FLOAT_TURNOVER_PCT = 15.0     # minimum % of float traded
+
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20
 MONITOR_ORDER_CLIENT_ID = 21   # separate IBKR connection for order execution
@@ -309,6 +315,7 @@ MONITOR_PRICE_MIN = 0.01
 MONITOR_PRICE_MAX = 20.00
 MONITOR_DEFAULT_FREQ = 5
 MONITOR_DEFAULT_ALERT_PCT = 7.0
+ALERT_VWAP_MAX_BELOW_PCT = 5.0     # skip alerts if price > 5% below VWAP
 
 # ── Logging ────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

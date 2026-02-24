@@ -63,17 +63,21 @@ from strategies.gap_go_live_strategy import (
 from strategies.momentum_ride_live_strategy import (
     MomentumRideLiveStrategy, MRCandidate, MREntrySignal, MRExitSignal,
 )
+from strategies.float_turnover_live_strategy import (
+    FloatTurnoverLiveStrategy, FTCandidate, FTEntrySignal, FTExitSignal,
+)
 from monitor.order_thread import OrderThread
 from config.settings import (
     FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
     MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_CODES, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
-    MONITOR_DEFAULT_ALERT_PCT,
+    MONITOR_DEFAULT_ALERT_PCT, ALERT_VWAP_MAX_BELOW_PCT,
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
     BRACKET_FIB_STOP_PCT, BRACKET_TRAILING_PROFIT_PCT, STOP_LIMIT_OFFSET_PCT,
     STARTING_CAPITAL,
     GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_PCT,
     MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_PCT,
+    FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_PCT, FT_MIN_FLOAT_TURNOVER_PCT,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -444,10 +448,10 @@ def _calc_vwap_from_bars(trade_bars: list) -> float | None:
 
 
 def _fetch_extended_hours_price(ib: IB, contract, session: str,
-                                bars: list) -> tuple[float, float, float | None, float | None, float | None]:
-    """Fetch price, prev_close, and extended-hours high/low/vwap.
+                                bars: list) -> tuple[float, float, float | None, float | None, float | None, int | None]:
+    """Fetch price, prev_close, and extended-hours high/low/vwap/volume.
 
-    Returns (price, prev_close, ext_high, ext_low, ext_vwap).
+    Returns (price, prev_close, ext_high, ext_low, ext_vwap, ext_volume).
     ext_* are None when no extended-hours data is available.
     """
     last_bar = bars[-1]
@@ -455,6 +459,7 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
     ext_high = None
     ext_low = None
     ext_vwap = None
+    ext_volume = None
 
     if session == 'pre_market':
         # Pre-market: last RTH bar is yesterday → it IS prev_close
@@ -471,6 +476,7 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
                 ext_high = max(b.high for b in trade_bars)
                 ext_low = min(b.low for b in trade_bars)
                 ext_vwap = _calc_vwap_from_bars(trade_bars)
+                ext_volume = int(sum(b.volume for b in trade_bars))
         except Exception:
             pass
     elif session == 'after_hours':
@@ -488,13 +494,26 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
                 ext_high = max(b.high for b in trade_bars)
                 ext_low = min(b.low for b in trade_bars)
                 ext_vwap = _calc_vwap_from_bars(trade_bars)
+                ext_volume = int(sum(b.volume for b in trade_bars))
         except Exception:
             pass
     else:
         # Market hours (or closed): normal calculation
         prev_close = bars[-2].close if len(bars) >= 2 else 0.0
+        # Fetch total volume including pre-market (RTH daily bar misses pre/after)
+        try:
+            trade_bars = ib.reqHistoricalData(
+                contract, endDateTime='',
+                durationStr='1 D', barSizeSetting='1 min',
+                whatToShow='TRADES', useRTH=False,
+                timeout=15,
+            )
+            if trade_bars:
+                ext_volume = int(sum(b.volume for b in trade_bars))
+        except Exception:
+            pass
 
-    return price, prev_close, ext_high, ext_low, ext_vwap
+    return price, prev_close, ext_high, ext_low, ext_vwap, ext_volume
 
 
 def _format_volume(volume: float) -> str:
@@ -1046,8 +1065,12 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             last_bar = bars[-1]
             volume = last_bar.volume
 
-            price, prev_close, ext_high, ext_low, ext_vwap = \
+            price, prev_close, ext_high, ext_low, ext_vwap, ext_volume = \
                 _fetch_extended_hours_price(ib, contract, session, bars)
+
+            # Use extended-hours volume when available (more accurate in pre/after)
+            if ext_volume is not None and ext_volume > 0:
+                volume = ext_volume
 
             # RVOL
             if has_cached_avg:
@@ -1098,10 +1121,12 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             cur_rl = _running_low.get(sym, 0)
             if day_low > 0 and (cur_rl <= 0 or day_low < cur_rl):
                 _running_low[sym] = day_low
-            if not d.get('volume_raw'):
-                # Only set volume if OCR didn't provide one
-                d['volume'] = _format_volume(volume)
-                d['volume_raw'] = int(volume)
+            # Always use the higher volume between OCR and IBKR
+            ibkr_vol = int(volume)
+            ocr_vol = d.get('volume_raw', 0)
+            if ibkr_vol >= ocr_vol:
+                d['volume'] = _format_volume(ibkr_vol)
+                d['volume_raw'] = ibkr_vol
             enriched += 1
 
         except Exception as e:
@@ -1723,6 +1748,8 @@ _daily_top_movers: dict[str, dict] = {}  # sym → {peak_pct, peak_price}
 _daily_new_stocks: int = 0
 _daily_events: list[dict] = []           # {time, type, symbol, detail}
 _daily_alert_counts: dict[str, int] = {}  # alert_type → count
+_alerts_per_stock: dict[str, dict[str, int]] = {}  # sym → {alert_type → count}
+_last_alert_summary_time: float = 0.0
 _daily_reports_sent: int = 0             # full stock reports sent to group
 
 
@@ -1749,7 +1776,8 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
                          fib_dt_sym: str | None = None, cycle_count: int = 0,
                          virtual_portfolio_summary: str = '',
                          gg_portfolio_summary: str = '',
-                         mr_portfolio_summary: str = ''):
+                         mr_portfolio_summary: str = '',
+                         ft_portfolio_summary: str = ''):
     """Send comprehensive end-of-day report at ~16:05 ET. Only once per day."""
     global _daily_summary_sent, _daily_new_stocks, _daily_reports_sent
     now_et = datetime.now(ZoneInfo('US/Eastern'))
@@ -1832,6 +1860,23 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
         lines.append("")
         lines.append(mr_portfolio_summary)
 
+    # ── Float Turnover Section ──
+    ft_entries = [e for e in _daily_events if e['type'] == 'ft_entry']
+    ft_exits = [e for e in _daily_events if e['type'] == 'ft_exit']
+
+    lines.append("")
+    lines.append("🔄 <b>אסטרטגיית Float Turnover:</b>")
+    lines.append(f"  • כניסות: {len(ft_entries)}")
+    for e in ft_entries:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+    lines.append(f"  • יציאות: {len(ft_exits)}")
+    for e in ft_exits:
+        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
+
+    if ft_portfolio_summary:
+        lines.append("")
+        lines.append(ft_portfolio_summary)
+
     # ── Open Positions ──
     if positions:
         total_pnl = sum(pos[3] for pos in positions.values() if len(pos) >= 4)
@@ -1899,6 +1944,7 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
     _daily_new_stocks = 0
     _daily_events.clear()
     _daily_alert_counts.clear()
+    _alerts_per_stock.clear()
     _daily_reports_sent = 0
 
 
@@ -1940,8 +1986,8 @@ def _week_key() -> str:
     return f"{now.year}-W{now.isocalendar()[1]:02d}"
 
 
-def _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict) -> str:
-    """Build a comprehensive weekly performance report for all 3 portfolios."""
+def _build_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict) -> str:
+    """Build a comprehensive weekly performance report for all 4 portfolios."""
     lines = [
         f"📊 <b>דוח שבועי — שבוע {_week_key()}</b>",
         "━━━━━━━━━━━━━━━━━━",
@@ -1951,6 +1997,7 @@ def _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict) -> str:
         ("📐 FIB DT [SIM]", fib_vp, VirtualPortfolio.JOURNAL_PATH),
         ("🚀 Gap&Go [GG-SIM]", gg_vp, GGVirtualPortfolio.JOURNAL_PATH),
         ("📈 Momentum Ride [MR-SIM]", mr_vp, MRVirtualPortfolio.JOURNAL_PATH),
+        ("🔄 Float Turnover [FT-SIM]", ft_vp, FTVirtualPortfolio.JOURNAL_PATH),
     ]:
         nlv = vp.net_liq(current_prices)
         total_pnl = nlv - vp.INITIAL_CASH
@@ -2002,14 +2049,14 @@ def _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict) -> str:
                 lines.append(f"    • {sym}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
 
     # Combined totals
-    combined_nlv = sum(vp.net_liq(current_prices) for vp in [fib_vp, gg_vp, mr_vp])
-    combined_initial = fib_vp.INITIAL_CASH + gg_vp.INITIAL_CASH + mr_vp.INITIAL_CASH
+    combined_nlv = sum(vp.net_liq(current_prices) for vp in [fib_vp, gg_vp, mr_vp, ft_vp])
+    combined_initial = fib_vp.INITIAL_CASH + gg_vp.INITIAL_CASH + mr_vp.INITIAL_CASH + ft_vp.INITIAL_CASH
     combined_pnl = combined_nlv - combined_initial
     combined_pct = (combined_nlv / combined_initial - 1) * 100
 
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<b>סה\"כ משולב (3 אסטרטגיות):</b>")
+    lines.append(f"<b>סה\"כ משולב (4 אסטרטגיות):</b>")
     lines.append(f"  💰 השקעה: ${combined_initial:,.0f}")
     lines.append(f"  📊 Net Liq: ${combined_nlv:,.0f} ({combined_pct:+.1f}%)")
     lines.append(f"  {'💚' if combined_pnl >= 0 else '❤️'} P&L: ${combined_pnl:+,.2f}")
@@ -2019,7 +2066,7 @@ def _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict) -> str:
     return "\n".join(lines)
 
 
-def _check_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict):
+def _check_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict):
     """Send weekly performance report on Friday 16:03-16:10 ET."""
     global _weekly_report_sent
     now_et = datetime.now(_ET)
@@ -2037,13 +2084,13 @@ def _check_weekly_report(fib_vp, gg_vp, mr_vp, current_prices: dict):
     _weekly_report_sent = wk
     _save_weekly_state()
 
-    report = _build_weekly_report(fib_vp, gg_vp, mr_vp, current_prices)
+    report = _build_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices)
     send_telegram(report)
     log.info(f"Weekly report sent for {wk}")
 
 
-def _check_weekly_reset(fib_vp, gg_vp, mr_vp):
-    """Reset all 3 portfolios on Monday 03:30-04:00 ET."""
+def _check_weekly_reset(fib_vp, gg_vp, mr_vp, ft_vp):
+    """Reset all 4 portfolios on Monday 03:30-04:00 ET."""
     global _weekly_reset_done
     now_et = datetime.now(_ET)
 
@@ -2063,15 +2110,231 @@ def _check_weekly_reset(fib_vp, gg_vp, mr_vp):
     fib_vp.reset()
     gg_vp.reset()
     mr_vp.reset()
+    ft_vp.reset()
 
     send_telegram(
         f"🔄 <b>איפוס שבועי — {wk}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"כל 3 הפורטפוליו אופסו ל-$3,000.\n"
-        f"📐 FIB DT | 🚀 Gap&Go | 📈 Momentum Ride\n"
+        f"כל 4 הפורטפוליו אופסו ל-$3,000.\n"
+        f"📐 FIB DT | 🚀 Gap&Go | 📈 Momentum Ride | 🔄 Float Turnover\n"
         f"שבוע חדש מתחיל! 🚀"
     )
     log.info(f"Weekly reset done for {wk}")
+
+
+# ══════════════════════════════════════════════════════════
+#  Float Coverage Report — clock-aligned every 16 minutes via Telegram
+# ══════════════════════════════════════════════════════════
+
+_last_float_report_time: float = 0.0  # time.time() of last report (debounce)
+# Clock-aligned windows: fire when minute is in [target, target+2)
+_FLOAT_REPORT_TARGETS = [3, 16, 32, 48]
+
+
+def _format_money(val: float) -> str:
+    """Format dollar amount compactly: $6.8K, $3.6M, etc."""
+    if val >= 1_000_000_000:
+        return f"${val/1e9:.1f}B"
+    if val >= 1_000_000:
+        return f"${val/1e6:.1f}M"
+    if val >= 1_000:
+        return f"${val/1e3:.1f}K"
+    return f"${val:,.0f}"
+
+
+_FORCE_FLOAT_FLAG = DATA_DIR / "_force_float_report.flag"
+
+
+def _check_float_report(current: dict):
+    """Send float coverage report at clock-aligned times or on force flag."""
+    global _last_float_report_time
+
+    now = time_mod.time()
+    now_et = datetime.now(_ET)
+    forced = _FORCE_FLOAT_FLAG.exists()
+
+    if not forced:
+        # Debounce: at least 10 minutes since last report
+        if now - _last_float_report_time < 600:
+            return
+
+        # Clock-aligned: fire when minute is in [target, target+2)
+        m = now_et.minute
+        if not any(t <= m < t + 2 for t in _FLOAT_REPORT_TARGETS):
+            return
+
+    session = _get_market_session()
+    if session == 'closed' and not forced:
+        return
+
+    # Collect data for all stocks with enrichment data
+    rows = []
+    for sym, d in current.items():
+        price = d.get('price', 0)
+        if price <= 0:
+            continue
+
+        enrich = _enrichment.get(sym, {})
+        if not enrich:
+            continue
+
+        float_shares = _parse_float_to_shares(enrich.get('float', '-'))
+        if float_shares <= 0:
+            continue
+
+        vol_raw = d.get('volume_raw', 0)
+        turnover = (vol_raw / float_shares * 100) if vol_raw > 0 else 0
+
+        # No turnover filter — we take top 6 by volume below
+
+        pct = d.get('pct', 0)
+        float_cost = float_shares * price
+        vol_money = vol_raw * price if vol_raw > 0 else 0
+
+        # News headlines (first 2)
+        news_items = enrich.get('news', [])
+        news_str = ""
+        if news_items:
+            headlines = [n.get('title_he', n.get('title_en', ''))[:60] for n in news_items[:2]]
+            news_str = " | ".join(headlines)
+
+        rows.append({
+            'sym': sym,
+            'pct': pct,
+            'price': price,
+            'vwap': enrich.get('vwap', 0),
+            'float_str': enrich.get('float', '-'),
+            'float_shares': float_shares,
+            'float_cost': float_cost,
+            'vol_raw': vol_raw,
+            'vol_money': vol_money,
+            'turnover': turnover,
+            'short': enrich.get('short', '-'),
+            'news': news_str,
+        })
+
+    if not rows:
+        return
+
+    _last_float_report_time = now
+
+    # Delete force flag only after successful send
+    if forced:
+        try:
+            _FORCE_FLOAT_FLAG.unlink()
+        except Exception:
+            pass
+
+    # Top 6 stocks by float turnover % (most relevant for day trading)
+    rows.sort(key=lambda r: r['turnover'], reverse=True)
+    rows = rows[:6]
+
+    session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
+                     'after_hours': 'After-Hours'}.get(session, session)
+    lines = [f"🔥 <b>Momentum Float Report</b> [{session_label} {now_et.strftime('%H:%M')}]"]
+    lines.append("")
+
+    for i, r in enumerate(rows, 1):
+        vm = _format_money(r['vol_money']) if r['vol_money'] > 0 else '-'
+
+        # VWAP indicator
+        vwap = r['vwap']
+        if vwap > 0:
+            if r['price'] > vwap:
+                vwap_icon = "🟢"
+                vwap_label = "above"
+            else:
+                vwap_icon = "🔴"
+                vwap_label = "below"
+            vwap_str = f"{vwap_icon} VWAP ${vwap:.2f} ({vwap_label})"
+        else:
+            vwap_str = ""
+
+        # Short squeeze indicator
+        short_str = r['short']
+        try:
+            short_val = float(str(short_str).replace('%', ''))
+            if short_val >= 20:
+                short_display = f"🩳 <b>Short {short_str}!</b>"
+            else:
+                short_display = f"Short: {short_str}"
+        except (ValueError, TypeError):
+            short_display = f"Short: {short_str}"
+
+        # Header line: rank + symbol + price + gap
+        lines.append(
+            f"<b>{i}. {r['sym']}</b>  ${r['price']:.2f}  "
+            f"<b>Gap {r['pct']:+.0f}%</b>  |  "
+            f"🔄 <b>{r['turnover']:.0f}%</b> float traded"
+        )
+        # Details line
+        lines.append(
+            f"   {vwap_str}  |  Float: {r['float_str']}  |  Vol: {vm}"
+        )
+        lines.append(f"   {short_display}")
+        if r['news']:
+            lines.append(f"   📰 {r['news']}")
+        lines.append("")
+
+    send_telegram("\n".join(lines))
+    log.info(f"Float report sent: {len(rows)} stocks")
+
+
+# ── Alert Summary every 30 minutes ──────────────────────
+
+_ALERT_SUMMARY_TARGETS = [0, 30]  # fire at :00 and :30
+
+
+def _check_alert_summary(current: dict):
+    """Send a summary of alerts per stock every 30 minutes."""
+    global _last_alert_summary_time
+
+    now = time_mod.time()
+    # Debounce: at least 25 minutes since last summary
+    if now - _last_alert_summary_time < 1500:
+        return
+
+    now_et = datetime.now(_ET)
+    m = now_et.minute
+    if not any(t <= m < t + 2 for t in _ALERT_SUMMARY_TARGETS):
+        return
+
+    session = _get_market_session()
+    if session == 'closed':
+        return
+
+    if not _alerts_per_stock:
+        return
+
+    _last_alert_summary_time = now
+
+    # Sort stocks by total alert count descending
+    stock_totals = []
+    for sym, counts in _alerts_per_stock.items():
+        total = sum(counts.values())
+        stock_totals.append((sym, total, counts))
+    stock_totals.sort(key=lambda x: x[1], reverse=True)
+
+    # Top stock by alert count
+    top_sym, top_total, top_counts = stock_totals[0]
+    d = current.get(top_sym, {})
+    price = d.get('price', 0)
+    pct = d.get('pct', 0)
+    parts = [f"{k} ×{v}" for k, v in sorted(top_counts.items(), key=lambda x: -x[1])]
+
+    total_all = sum(t[1] for t in stock_totals)
+    session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
+                     'after_hours': 'After-Hours'}.get(session, session)
+
+    lines = [
+        f"🔔 <b>Most Active</b> [{session_label} {now_et.strftime('%H:%M')}]",
+        f"<b>{top_sym}</b> ${price:.2f} ({pct:+.0f}%) — <b>{top_total} alerts</b>",
+        f"{' | '.join(parts)}",
+        f"({total_all} total alerts / {len(stock_totals)} stocks)",
+    ]
+
+    send_telegram("\n".join(lines))
+    log.info(f"Alert summary sent: {len(stock_totals)} stocks, {total_all} total alerts")
 
 
 # ══════════════════════════════════════════════════════════
@@ -2218,6 +2481,9 @@ ALERT_MIN_PCT = 20.0  # only send alerts for stocks ≥20%
 # ── Alert tracking state ──
 _alerts_date: str = ""
 _hod_break_alerted: dict[str, float] = {}              # sym -> last HOD value alerted
+_hod_last_alert_time: dict[str, float] = {}            # sym -> timestamp of last HOD alert
+_HOD_COOLDOWN_SEC = 300          # 5 min cooldown per symbol
+_HOD_MIN_JUMP_PCT = 0.02         # require 2% above last alerted high
 _fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touch_count}
 _lod_touch_tracker: dict[str, int] = {}                 # sym -> touch count at day_low
 _lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD last cycle
@@ -2246,6 +2512,7 @@ def _reset_alerts_if_new_day():
     if today != _alerts_date:
         _alerts_date = today
         _hod_break_alerted.clear()
+        _hod_last_alert_time.clear()
         _fib_touch_tracker.clear()
         _lod_touch_tracker.clear()
         _lod_was_near.clear()
@@ -2299,7 +2566,15 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> tuple[str, str] 
         last_alerted = _hod_break_alerted.get(sym, 0)
         if price <= last_alerted:
             return None
+        # Require minimum 2% jump above last alerted high
+        if last_alerted > 0 and (price - last_alerted) / last_alerted < _HOD_MIN_JUMP_PCT:
+            return None
+        # 5-min cooldown
+        now = time_mod.time()
+        if now - _hod_last_alert_time.get(sym, 0) < _HOD_COOLDOWN_SEC:
+            return None
         _hod_break_alerted[sym] = price
+        _hod_last_alert_time[sym] = now
         pct = current.get('pct', 0)
         full = (
             f"🟢 🔺 <b>HOD BREAK — {sym}</b>\n"
@@ -2425,11 +2700,12 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> tuple[s
         # Don't update _vwap_side — cross will be re-detected next cycle
         return None
 
-    # Cooldown passed — commit state change and alert
+    # Cooldown passed — commit state change
     _vwap_side[sym] = current_side
-    _vwap_last_alert[sym] = time_mod.time()
 
+    # Only alert on cross ABOVE VWAP (bullish signal)
     if prev_side == 'below':
+        _vwap_last_alert[sym] = time_mod.time()
         full = (
             f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"🟢 חצה מעל VWAP!\n"
@@ -2438,13 +2714,8 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> tuple[s
         compact = f"⚡ VWAP ↑ חצה מעל ${vwap:.2f}"
         return full, compact
     else:
-        full = (
-            f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
-            f"🔴 חצה מתחת VWAP!\n"
-            f"💰 ${price:.2f} < VWAP ${vwap:.2f} | {pct:+.1f}%"
-        )
-        compact = f"⚡ VWAP ↓ חצה מתחת ${vwap:.2f}"
-        return full, compact
+        # Cross below — update state silently, no alert
+        return None
 
 
 def check_spike(sym: str, price: float, pct: float) -> tuple[str, str] | None:
@@ -2582,9 +2853,8 @@ def check_doji_candle(sym: str, price: float, pct: float) -> tuple[str, str] | N
         return full, compact
 
     # ── Phase 1: Detect new completed Doji candles → store pending ──
+    # Only 15m+ timeframes (1m/5m too noisy — 91 detections, 0 breakouts)
     tf_specs = [
-        ('1 min',   '1m'),
-        ('5 mins',  '5m'),
         ('15 mins', '15m'),
         ('30 mins', '30m'),
         ('1 hour',  '1h'),
@@ -3085,6 +3355,12 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume', '-')}",
     ]
 
+    # Warn if stock is NOT tradeable on IBKR
+    contract = stock.get('contract')
+    if not contract or not getattr(contract, 'conId', 0):
+        lines.append("")
+        lines.append("⛔ <b>לא נסחרת באינטראקטיב ברוקרס!</b>")
+
     # 1. News (Hebrew) — first
     if enriched['news']:
         lines.append("")
@@ -3111,10 +3387,12 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     # VWAP line
     vwap = stock.get('vwap', 0)
     if vwap > 0:
-        above = price > vwap
-        vwap_icon = "🟢" if above else "🔴"
-        vwap_label = "מעל" if above else "מתחת"
-        lines.append(f"{vwap_icon} VWAP: ${vwap:.2f} — מחיר {vwap_label} ל-VWAP")
+        above = price >= vwap
+        if above:
+            lines.append(f"🟢 VWAP: ${vwap:.2f} — מחיר מעל ל-VWAP")
+        else:
+            vwap_dist = (vwap - price) / price * 100
+            lines.append(f"🔴 VWAP: ${vwap:.2f} — מחיר מתחת ל-VWAP ({vwap_dist:.1f}% מתחת)")
 
     # Unfilled gap detection from daily data (threshold: $0.05)
     df_daily = ma_frames.get('D')
@@ -4529,6 +4807,214 @@ class MRVirtualPortfolio:
         log.info("MR portfolio reset to $3,000")
 
 
+# ──────────────────────────────────────────────────────────
+#  FT Virtual Portfolio (Float Turnover paper simulation)
+# ──────────────────────────────────────────────────────────
+
+class FTVirtualPortfolio:
+    """Virtual portfolio for Float Turnover paper simulation.
+
+    Entry and exit are fully driven by the strategy (1-min bar high/low).
+    """
+
+    INITIAL_CASH = FT_LIVE_INITIAL_CASH
+    JOURNAL_PATH = DATA_DIR / "ft_virtual_trades.csv"
+    _STATE_PATH = DATA_DIR / "ft_state.json"
+
+    def __init__(self):
+        self.cash: float = self.INITIAL_CASH
+        self.positions: dict[str, dict] = {}
+        # sym -> {qty, entry_price, turnover_at_entry}
+        self.trades: list[dict] = []
+        self._init_journal()
+        self._load_state()
+
+    def _save_state(self):
+        """Persist portfolio state to disk (survives restarts)."""
+        try:
+            state = {
+                'cash': self.cash,
+                'positions': self.positions,
+                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
+            }
+            with open(self._STATE_PATH, 'w') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"FT state save error: {e}")
+
+    def _load_state(self):
+        """Load portfolio state from disk (persists across days within the week)."""
+        try:
+            if not self._STATE_PATH.exists():
+                return
+            with open(self._STATE_PATH) as f:
+                state = json.load(f)
+            self.cash = state.get('cash', self.INITIAL_CASH)
+            self.positions = state.get('positions', {})
+            if self.positions:
+                log.info(f"FT state restored: cash=${self.cash:.0f}, "
+                         f"{len(self.positions)} positions: "
+                         + ", ".join(self.positions.keys()))
+        except Exception as e:
+            log.warning(f"FT state load error: {e}")
+
+    def _init_journal(self):
+        if not self.JOURNAL_PATH.exists():
+            with open(self.JOURNAL_PATH, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'date', 'time_et', 'symbol', 'side', 'reason',
+                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
+                    'cash_after', 'net_liq', 'positions_open',
+                ])
+
+    def _log_journal(self, sym: str, side: str, reason: str,
+                     qty: int, price: float, entry_price: float,
+                     pnl: float, net_liq_val: float):
+        now = datetime.now(_ET)
+        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
+        try:
+            with open(self.JOURNAL_PATH, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    now.strftime('%Y-%m-%d'),
+                    now.strftime('%H:%M:%S'),
+                    sym, side, reason,
+                    qty, f'{price:.4f}', f'{entry_price:.4f}',
+                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
+                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
+                    len(self.positions),
+                ])
+        except Exception as e:
+            log.warning(f"FT journal write error: {e}")
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
+
+    def buy(self, sym: str, qty: int, price: float, turnover_pct: float) -> str | None:
+        """Open an FT virtual position. Returns Telegram alert text or None."""
+        if qty < 1 or sym in self.positions:
+            return None
+        cost = qty * price
+        if cost > self.cash:
+            return None
+
+        old_cash = self.cash
+        self.cash -= cost
+
+        self.positions[sym] = {
+            'qty': qty,
+            'entry_price': price,
+            'turnover_at_entry': turnover_pct,
+        }
+
+        self.trades.append({
+            'sym': sym, 'side': 'BUY', 'qty': qty,
+            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
+        })
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
+        self._save_state()
+
+        msg = (
+            f"🔄 <b>Float Turnover [FT-SIM] — BUY {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  💰 {qty}sh @ ${price:.4f} | Turnover: {turnover_pct:.0f}%\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f}"
+        )
+        log.info(f"FT VIRTUAL BUY: {sym} {qty}sh @ ${price:.4f} turnover={turnover_pct:.0f}%")
+        return msg
+
+    def sell(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell entire FT position. Returns Telegram alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos:
+            return None
+
+        qty = pos['qty']
+        entry_price = pos['entry_price']
+        pnl = (price - entry_price) * qty
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+
+        old_cash = self.cash
+        self.cash += qty * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': qty,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        del self.positions[sym]
+        self._save_state()
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
+
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        msg = (
+            f"🔄 <b>Float Turnover [FT-SIM] — SELL {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  {pnl_icon} {qty}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f}\n"
+            f"  📝 Reason: {reason}"
+        )
+        log.info(f"FT VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
+        return msg
+
+    def net_liq(self, current_prices: dict) -> float:
+        val = self.cash
+        for sym, pos in self.positions.items():
+            px = current_prices.get(sym, pos['entry_price'])
+            val += pos['qty'] * px
+        return val
+
+    def summary_text(self, current_prices: dict) -> str:
+        nlv = self.net_liq(current_prices)
+        total_pnl = nlv - self.INITIAL_CASH
+        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
+
+        lines = [
+            f"🔄 <b>Float Turnover [FT-SIM] Portfolio</b>",
+            f"  💵 Cash: ${self.cash:,.0f}",
+            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
+        ]
+        if self.positions:
+            lines.append(f"  📋 Open positions: {len(self.positions)}")
+            for sym, pos in self.positions.items():
+                px = current_prices.get(sym, pos['entry_price'])
+                sym_pnl = (px - pos['entry_price']) * pos['qty']
+                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+        if self.trades:
+            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
+            lines.append(f"  📝 Trades today: {len(today_trades)}")
+            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
+            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
+
+        return "\n".join(lines)
+
+    def reset(self):
+        """Reset portfolio for new week. Archive old journal, start fresh."""
+        if self.JOURNAL_PATH.exists():
+            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
+            archive = self.JOURNAL_PATH.with_name(f"ft_virtual_trades_week_{week_label}.csv")
+            try:
+                self.JOURNAL_PATH.rename(archive)
+                log.info(f"FT journal archived → {archive.name}")
+            except Exception as e:
+                log.warning(f"FT journal archive error: {e}")
+        self.cash = self.INITIAL_CASH
+        self.positions = {}
+        self.trades = []
+        self._init_journal()
+        self._save_state()
+        log.info("FT portfolio reset to $3,000")
+
+
 # ══════════════════════════════════════════════════════════
 #  Scanner Thread (replaces MonitorThread)
 # ══════════════════════════════════════════════════════════
@@ -4572,6 +5058,12 @@ class ScannerThread(threading.Thread):
         # Sync strategy state from restored portfolio
         if self._mr_portfolio.positions:
             self._mr_strategy.sync_from_portfolio(self._mr_portfolio.positions)
+        # ── Float Turnover Auto-Strategy ──
+        self._ft_strategy = FloatTurnoverLiveStrategy(ib_getter=_get_ibkr)
+        self._ft_portfolio = FTVirtualPortfolio()
+        # Sync strategy state from restored portfolio
+        if self._ft_portfolio.positions:
+            self._ft_strategy.sync_from_portfolio(self._ft_portfolio.positions)
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
@@ -4740,9 +5232,11 @@ class ScannerThread(threading.Thread):
             volume = last_bar.volume
             session = _get_market_session()
 
-            price, prev_close, ext_high, ext_low, ext_vwap = \
+            price, prev_close, ext_high, ext_low, ext_vwap, ext_volume = \
                 _fetch_extended_hours_price(ib, contract, session, bars)
 
+            if ext_volume is not None and ext_volume > 0:
+                volume = ext_volume
             pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
             vol_str = _format_volume(volume)
             vwap = round(last_bar.average, 4) if last_bar.average else 0.0
@@ -5073,7 +5567,7 @@ class ScannerThread(threading.Thread):
     def _run_momentum_ride_cycle(self, current: dict):
         """Run Momentum Ride auto-strategy: VWAP cross/pullback + SMA9 hourly, 5% trailing stop."""
         try:
-            # ── 1. Build candidate list (20-50% gap, has contract) ──
+            # ── 1. Build candidate list (20-50% gap, has contract, near/above VWAP) ──
             candidates = []
             for sym, d in current.items():
                 pct = d.get('pct', 0)
@@ -5085,6 +5579,11 @@ class ScannerThread(threading.Thread):
                     continue
                 if prev_close <= 0:
                     continue
+                # Skip if too far below VWAP
+                vwap = d.get('vwap', 0)
+                if vwap > 0 and price < vwap:
+                    if round((vwap - price) / price * 100, 1) > ALERT_VWAP_MAX_BELOW_PCT:
+                        continue
 
                 candidates.append(MRCandidate(
                     symbol=sym,
@@ -5154,6 +5653,97 @@ class ScannerThread(threading.Thread):
 
         except Exception as e:
             log.error(f"MR cycle error: {e}")
+
+    def _run_float_turnover_cycle(self, current: dict):
+        """Run Float Turnover auto-strategy: 1-min bar high/low logic on high-turnover stocks."""
+        try:
+            # ── 1. Build candidate list (≥15% float turnover, has contract, near/above VWAP) ──
+            candidates = []
+            for sym, d in current.items():
+                price = d.get('price', 0)
+                contract = d.get('contract')
+                if price <= 0 or not contract:
+                    continue
+
+                # Skip if too far below VWAP
+                vwap = d.get('vwap', 0)
+                if vwap > 0 and price < vwap:
+                    if round((vwap - price) / price * 100, 1) > ALERT_VWAP_MAX_BELOW_PCT:
+                        continue
+
+                enrich = _enrichment.get(sym, {})
+                if not enrich:
+                    continue
+
+                float_shares = _parse_float_to_shares(enrich.get('float', '-'))
+                if float_shares <= 0:
+                    continue
+
+                vol_raw = d.get('volume_raw', 0)
+                if vol_raw <= 0:
+                    continue
+
+                turnover = vol_raw / float_shares * 100
+                if turnover < FT_MIN_FLOAT_TURNOVER_PCT:
+                    continue
+
+                candidates.append(FTCandidate(
+                    symbol=sym,
+                    contract=contract,
+                    price=price,
+                    float_shares=float_shares,
+                    turnover_pct=turnover,
+                ))
+
+            if not candidates:
+                return
+
+            # Sort by turnover descending
+            candidates.sort(key=lambda c: c.turnover_pct, reverse=True)
+
+            log.info(f"FT candidates ({len(candidates)}): "
+                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}%" for c in candidates[:5]))
+
+            # ── 2. Run strategy cycle ──
+            entries, exits = self._ft_strategy.process_cycle(candidates)
+
+            # ── 3. Execute exits first ──
+            for exit_sig in exits:
+                price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
+                alert = self._ft_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
+                if alert:
+                    send_telegram(alert)
+                    self._ft_strategy.mark_position_closed(exit_sig.symbol)
+                    _log_daily_event('ft_exit', exit_sig.symbol,
+                                     f"[FT-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
+
+            # ── 4. Execute entries ──
+            for entry in entries:
+                scan_price = current.get(entry.symbol, {}).get('price', entry.price)
+                entry_price = scan_price if scan_price > 0 else entry.price
+
+                qty = int(self._ft_portfolio.cash * FT_LIVE_POSITION_SIZE_PCT / entry_price) if entry_price > 0 else 0
+                if qty >= 1:
+                    alert = self._ft_portfolio.buy(
+                        entry.symbol, qty, entry_price, entry.turnover_pct,
+                    )
+                    if alert:
+                        send_telegram(alert)
+                        _log_daily_event('ft_entry', entry.symbol,
+                                         f"[FT-SIM] BUY {qty}sh @ ${entry_price:.4f} "
+                                         f"turnover={entry.turnover_pct:.0f}%")
+                    else:
+                        # Buy failed — rollback strategy state
+                        self._ft_strategy.mark_position_closed(entry.symbol)
+                        log.warning(f"FT: Virtual buy failed for {entry.symbol}")
+                else:
+                    # Insufficient cash — rollback strategy state
+                    self._ft_strategy.mark_position_closed(entry.symbol)
+                    log.warning(f"FT: Insufficient virtual cash for {entry.symbol} "
+                                f"(cash=${self._ft_portfolio.cash:.0f}, price=${entry_price:.4f})")
+
+        except Exception as e:
+            log.error(f"FT cycle error: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -5337,32 +5927,7 @@ class ScannerThread(threading.Thread):
         if enriched_count:
             status += f"  +{enriched_count} enriched"
 
-        # ── Baseline: send single summary to Telegram ──
-        if is_baseline and current:
-            # Show only momentum stocks (≥20%) with enrichment data
-            MIN_TELEGRAM_PCT = 20.0
-            momentum = [(s, d) for s, d in current.items()
-                        if d.get('pct', 0) >= MIN_TELEGRAM_PCT and s in _enrichment]
-            momentum.sort(key=lambda x: x[1]['pct'], reverse=True)
-            session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
-                             'after_hours': 'After-Hours', 'closed': 'Closed'}
-            sess = session_label.get(_get_market_session(), 'Unknown')
-            total = len(current)
-            mom_count = len(momentum)
-            summary_lines = [f"📡 <b>Scanner started</b> [{sess}] — {mom_count} momentum / {total} total"]
-            for sym, d in momentum[:5]:
-                e = _enrichment.get(sym, {})
-                flt = e.get('float', '-')
-                short = e.get('short', '-')
-                news_flag = "📰" if e.get('news') else ""
-                summary_lines.append(
-                    f"  {sym} ${d['price']:.2f} {d['pct']:+.1f}%  Float:{flt}  Short:{short} {news_flag}"
-                )
-            if mom_count > 5:
-                summary_lines.append(f"  ... +{mom_count-5} more")
-            elif mom_count == 0:
-                summary_lines.append("  אין מניות מעל 20% כרגע")
-            send_telegram("\n".join(summary_lines))
+        # ── Baseline: no summary needed (individual reports are sent) ──
 
         # ── Real-time alerts (enriched ≥20% stocks) ──
         if not is_baseline and current and not self._warmup:
@@ -5379,6 +5944,8 @@ class ScannerThread(threading.Thread):
                 batch_by_sym.setdefault(sym, []).append(compact)
                 play_alert_sound(sound_type)
                 _daily_alert_counts[counter_name] = _daily_alert_counts.get(counter_name, 0) + 1
+                _alerts_per_stock.setdefault(sym, {})
+                _alerts_per_stock[sym][counter_name] = _alerts_per_stock[sym].get(counter_name, 0) + 1
                 if sym not in batch_syms:
                     batch_syms.append(sym)
 
@@ -5387,13 +5954,21 @@ class ScannerThread(threading.Thread):
                     continue
                 price = d.get('price', 0)
                 pct = d.get('pct', 0)
+                vwap = d.get('vwap', 0)
+
+                # Skip alerts if price is below VWAP by more than 5%
+                # (above VWAP or within 5% below → OK)
+                if vwap > 0 and price > 0 and price < vwap:
+                    below_pct = round((vwap - price) / price * 100, 1)
+                    if below_pct > ALERT_VWAP_MAX_BELOW_PCT:
+                        continue
+
                 prev_d = self.previous.get(sym, {}) if self.previous else {}
 
                 _collect(sym, check_hod_break(sym, d, prev_d), 'hod', 'HOD Break')
                 _collect(sym, check_fib_second_touch(sym, price, pct), 'fib', 'FIB Touch')
                 day_low = d.get('day_low', 0)
                 _collect(sym, check_lod_touch(sym, price, day_low, pct), 'lod', 'LOD Touch')
-                vwap = d.get('vwap', 0)
                 _collect(sym, check_vwap_cross(sym, price, vwap, pct), 'vwap', 'VWAP Cross')
                 _collect(sym, check_spike(sym, price, pct), 'spike', 'Spike')
                 rvol = d.get('rvol', 0)
@@ -5482,6 +6057,10 @@ class ScannerThread(threading.Thread):
         self._run_momentum_ride_cycle(current)
         _phase('mr_done')
 
+        # ── Float Turnover Auto-Strategy ──
+        self._run_float_turnover_cycle(current)
+        _phase('ft_done')
+
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)
 
@@ -5497,6 +6076,7 @@ class ScannerThread(threading.Thread):
             vp_summary = self._virtual_portfolio.summary_text(vp_prices) if self._virtual_portfolio else ''
             gg_summary = self._gg_portfolio.summary_text(vp_prices) if self._gg_portfolio else ''
             mr_summary = self._mr_portfolio.summary_text(vp_prices) if self._mr_portfolio else ''
+            ft_summary = self._ft_portfolio.summary_text(vp_prices) if self._ft_portfolio else ''
             _check_daily_summary(
                 positions=self._cached_positions,
                 net_liq=self._cached_net_liq,
@@ -5506,9 +6086,17 @@ class ScannerThread(threading.Thread):
                 virtual_portfolio_summary=vp_summary,
                 gg_portfolio_summary=gg_summary,
                 mr_portfolio_summary=mr_summary,
+                ft_portfolio_summary=ft_summary,
             )
-            _check_weekly_report(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, vp_prices)
-            _check_weekly_reset(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio)
+            _check_weekly_report(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, self._ft_portfolio, vp_prices)
+            _check_weekly_reset(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, self._ft_portfolio)
+
+        # Float report runs even during warmup (for force-flag support)
+        _check_float_report(current)
+
+        # Alert summary every 30 minutes
+        if not self._warmup:
+            _check_alert_summary(current)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
@@ -6246,6 +6834,19 @@ class App:
                       command=lambda p=pct: self._place_order('SELL', p / 100)
                       ).pack(side='left', padx=1)
 
+        # Row 3: Manual Stop / Take-Profit
+        row3 = tk.Frame(panel, bg=self.BG)
+        row3.pack(fill='x', pady=2)
+        tk.Label(row3, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
+        self._stop_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
+                                    insertbackground="white", relief='flat')
+        self._stop_entry.pack(side='left', padx=2)
+        tk.Label(row3, text="TP:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(12, 2))
+        self._tp_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
+                                  insertbackground="white", relief='flat')
+        self._tp_entry.pack(side='left', padx=2)
+        tk.Label(row3, text="(empty = auto)", font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
+
         # Order status
         self._order_status_var = tk.StringVar(value="")
         self._order_status_label = tk.Label(
@@ -6504,6 +7105,9 @@ class App:
             return
 
         if action == 'BUY':
+            # Buy at 1% above current price for fast fill
+            buy_price = round(price * 1.01, 2)
+            bp = self._cached_buying_power
             nl = self._cached_net_liq
             if nl <= 0:
                 messagebox.showwarning(
@@ -6513,7 +7117,10 @@ class App:
                     parent=self.root,
                 )
                 return
-            qty = int(nl * 0.95 * pct / price)
+            # Use buying power (not NetLiq) to respect existing positions
+            # 80% margin buffer for penny stock requirements (IBKR can need >100%)
+            avail = bp if bp > 0 else nl
+            qty = int(avail * 0.80 * pct / buy_price)
             if qty <= 0:
                 messagebox.showwarning("Qty Too Low",
                                        f"Not enough buying power for {pct*100:.0f}%.",
@@ -6529,46 +7136,92 @@ class App:
             remaining = total_qty - qty
             log.info(f"SELL: {sym} total={total_qty} sell={qty} remaining={remaining}")
 
+        # ── Read manual Stop / TP from GUI ──
+        manual_stop = 0.0
+        manual_tp = 0.0
+        try:
+            _s = self._stop_entry.get().strip()
+            if _s:
+                manual_stop = float(_s)
+                if manual_stop <= 0:
+                    manual_stop = 0.0
+        except ValueError:
+            pass
+        try:
+            _t = self._tp_entry.get().strip()
+            if _t:
+                manual_tp = float(_t)
+                if manual_tp <= 0:
+                    manual_tp = 0.0
+        except ValueError:
+            pass
+
         # ── Stop-loss calculation (for both BUY and partial SELL) ──
         stop_price = 0.0
         limit_price = 0.0
         trailing_pct = 0.0
+        target_price = 0.0
         stop_desc = ""
         stop_remaining_qty = 0  # for partial SELL: stop on remaining shares
 
-        # Find nearest fib support for smart stop-loss
-        with _fib_cache_lock:
-            cached = _fib_cache.get(sym)
-        if cached:
-            _al, _ah, all_levels, _rm, *_ = cached
-            supports = [lv for lv in all_levels if lv <= price]
-            if supports:
-                nearest_support = supports[-1]
-                stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
-                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
+        if manual_stop > 0:
+            # Manual stop override
+            stop_price = round(manual_stop, 2)
+            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+            stop_desc = f"${stop_price:.2f} (manual)"
+        else:
+            # Find nearest fib support for smart stop-loss
+            with _fib_cache_lock:
+                cached = _fib_cache.get(sym)
+            if cached:
+                _al, _ah, all_levels, _rm, *_ = cached
+                supports = [lv for lv in all_levels if lv <= price]
+                if supports:
+                    nearest_support = supports[-1]
+                    stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
+                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
+                else:
+                    stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
+                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
             else:
                 stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
-        else:
-            stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-            stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
-        limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
+            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+
+        if manual_tp > 0:
+            target_price = round(manual_tp, 2)
 
         if action == 'BUY':
-            trailing_pct = BRACKET_TRAILING_PROFIT_PCT
+            if target_price > 0:
+                trailing_pct = 0  # manual TP replaces trailing stop
+            else:
+                trailing_pct = BRACKET_TRAILING_PROFIT_PCT
         elif action == 'SELL' and remaining > 0:
             # Partial sell — set stop-loss on remaining shares
             stop_remaining_qty = remaining
 
+        # VWAP distance warning (only when price is BELOW VWAP)
+        vwap_warning = ""
+        stock_data = self._stocks.get(sym, {})
+        vwap_val = stock_data.get('vwap', 0)
+        if action == 'BUY' and vwap_val > 0 and price < vwap_val:
+            vwap_dist_pct = (vwap_val - price) / price * 100
+            vwap_warning = f"\n⚠️ מתחת ל-VWAP! מחיר ${price:.2f} < VWAP ${vwap_val:.2f} (מרחק {vwap_dist_pct:.1f}%)\n"
+
         # Confirmation dialog
         if action == 'BUY':
+            if target_price > 0:
+                tp_line = f"🎯 Take-Profit: ${target_price:.2f} (manual) [LMT SELL GTC]"
+            else:
+                tp_line = f"📈 Trailing: {trailing_pct}% trailing stop [GTC]"
             confirm = messagebox.askokcancel(
                 "Confirm Order",
-                f"BUY {qty} {sym} @ ${price:.2f}\n"
-                f"Total: ${qty * price:,.2f}\n\n"
+                f"BUY {qty} {sym} @ ${buy_price:.2f} (מחיר נוכחי ${price:.2f} +1%)\n"
+                f"Total: ${qty * buy_price:,.2f}\n\n"
                 f"🛑 Stop: {stop_desc}\n"
                 f"   → Limit ${limit_price:.2f} [STP LMT GTC]\n"
-                f"📈 Trailing: {trailing_pct}% trailing stop [GTC]\n\n"
+                f"{tp_line}"
+                f"{vwap_warning}\n\n"
                 f"outsideRth=True (pre/post market OK)\n"
                 f"TIF: DAY (buy) + GTC (stop/trail)\n"
                 f"Continue?",
@@ -6589,12 +7242,15 @@ class App:
         if not confirm:
             return
 
-        req = {'sym': sym, 'action': action, 'qty': qty, 'price': price}
+        order_price = buy_price if action == 'BUY' else price
+        req = {'sym': sym, 'action': action, 'qty': qty, 'price': order_price}
         if action == 'BUY':
             req['stop_price'] = stop_price
             req['limit_price'] = limit_price
             req['trailing_pct'] = trailing_pct
             req['stop_desc'] = stop_desc
+            if target_price > 0:
+                req['target_price'] = target_price
         elif stop_remaining_qty > 0:
             req['stop_remaining_qty'] = stop_remaining_qty
             req['stop_price'] = stop_price
@@ -6603,8 +7259,9 @@ class App:
         self._order_thread.submit(req)
         log.info(f"Order submitted: {req}")
         if action == 'BUY':
+            tp_info = f"TP ${target_price:.2f}" if target_price > 0 else f"Trail {trailing_pct}%"
             self._order_status_var.set(
-                f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop {stop_desc} | Trail {trailing_pct}%...")
+                f"Sending: BUY {qty} {sym} @ ${buy_price:.2f} (+1%) | Stop {stop_desc} | {tp_info}...")
         else:
             stop_info = f" | Stop {stop_remaining_qty}sh {stop_desc}" if stop_remaining_qty > 0 else ""
             self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}{stop_info}...")

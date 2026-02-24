@@ -406,10 +406,21 @@ class OrderThread(threading.Thread):
                 stop_msg = f" | Stop {stop_remaining_qty}sh ${stop_price:.2f} ({stop_status})"
                 log.info(f"Stop-loss on remaining: SELL {stop_remaining_qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
 
-            # Place trailing take-profit for BUY orders
+            # Place take-profit: manual LMT SELL or trailing stop
             trailing_pct = req.get('trailing_pct', 0)
+            target_price = req.get('target_price', 0)
             trail_msg = ""
-            if action == 'BUY' and trailing_pct > 0:
+            if action == 'BUY' and target_price > 0:
+                # Manual take-profit — LMT SELL GTC
+                tp_order = LimitOrder('SELL', qty, target_price)
+                tp_order.outsideRth = True
+                tp_order.tif = 'GTC'
+                tp_trade = ib.placeOrder(contract, tp_order)
+                ib.sleep(1)
+                tp_status = tp_trade.orderStatus.status
+                trail_msg = f" | TP ${target_price:.2f} ({tp_status})"
+                log.info(f"Take-profit placed: SELL {qty} {sym} @ ${target_price:.2f} (LMT GTC) — {tp_status}")
+            elif action == 'BUY' and trailing_pct > 0:
                 trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
                 trail_trade = ib.placeOrder(contract, trail_order)
                 ib.sleep(1)
@@ -428,7 +439,9 @@ class OrderThread(threading.Thread):
                     f"  Status: {status}",
                     f"  🛑 Stop: {stop_desc} → Lmt ${limit_price:.2f} [STP LMT GTC]",
                 ]
-                if trailing_pct > 0:
+                if target_price > 0:
+                    tg_lines.append(f"  🎯 TP: ${target_price:.2f} [LMT SELL GTC]")
+                elif trailing_pct > 0:
                     tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
                 tg_lines.append(f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop/trail)")
                 self._telegram("\n".join(tg_lines))
