@@ -64,6 +64,8 @@ class _GGSymbolState:
     in_position: bool = False
     last_bar_count: int = 0
     date_key: str = ""
+    entry_time: datetime | None = None
+    consecutive_exit_signals: int = 0
 
 
 # ── Heikin Ashi ────────────────────────────────────────────
@@ -160,7 +162,10 @@ class GapGoLiveStrategy:
         self._get_state(symbol).in_position = True
 
     def mark_position_closed(self, symbol: str):
-        self._get_state(symbol).in_position = False
+        state = self._get_state(symbol)
+        state.in_position = False
+        state.entry_time = None
+        state.consecutive_exit_signals = 0
 
     def sync_from_portfolio(self, held_symbols: set):
         """Sync strategy state from portfolio after restart."""
@@ -266,12 +271,20 @@ class GapGoLiveStrategy:
         if now_et >= _EOD_CLOSE_TIME and state.in_position:
             return None, GGExitSignal(sym, price, "eod_close")
 
-        # ── Check exit (both HA red) ──
+        # ── Check exit (both HA red, 2-bar confirmation + 3-min hold) ──
         if state.in_position:
             ha_1m_red = not latest_1m["is_green"]
             ha_5m_red = not latest_5m["is_green"]
             if ha_1m_red and ha_5m_red:
-                return None, GGExitSignal(sym, price, "ha_exit (1m+5m red)")
+                state.consecutive_exit_signals += 1
+            else:
+                state.consecutive_exit_signals = 0
+
+            # Require 2 consecutive red signals + minimum 3 minute hold
+            min_hold_ok = (state.entry_time is None or
+                           (datetime.now(_ET) - state.entry_time).total_seconds() >= 180)
+            if state.consecutive_exit_signals >= 2 and min_hold_ok:
+                return None, GGExitSignal(sym, price, "ha_exit (2x 1m+5m red)")
 
         # ── Check entry ──
         if not state.in_position and _ENTRY_OK_TIME <= now_et < _EOD_CLOSE_TIME:
@@ -292,6 +305,8 @@ class GapGoLiveStrategy:
             is_first = not state.first_entry_done
             state.in_position = True
             state.first_entry_done = True
+            state.entry_time = datetime.now(_ET)
+            state.consecutive_exit_signals = 0
             entry = GGEntrySignal(
                 symbol=sym,
                 price=price,

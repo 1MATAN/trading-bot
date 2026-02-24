@@ -253,7 +253,7 @@ FIB_DT_LIVE_ENTRY_END = "12:00"          # no entries after 12 PM ET
 FIB_DT_LIVE_GAP_MIN_PCT = 10.0           # minimum gap %
 FIB_DT_LIVE_GAP_MAX_PCT = 25.0           # maximum gap %
 FIB_DT_LIVE_FLOAT_MAX = 500_000_000      # max float 500M shares
-FIB_DT_LIVE_STOP_PCT = 0.03              # 3% below fib level
+FIB_DT_LIVE_STOP_PCT = 0.06              # 6% below fib level (was 3%, too tight on pennies)
 FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
 FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
 FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
@@ -293,8 +293,8 @@ GG_LIVE_MAX_TRACKED_SYMBOLS = 8
 MR_LIVE_INITIAL_CASH = 3000.0
 MR_LIVE_POSITION_SIZE_PCT = 0.95
 MR_LIVE_MAX_TRACKED_SYMBOLS = 5
-MR_TRAILING_STOP_PCT = 0.08            # 8% trailing from highest high (backtest + live)
-MR_SAFETY_STOP_PCT = 0.08             # 8% below entry (backtest + live)
+MR_TRAILING_STOP_PCT = 0.12            # 12% trailing from highest high (was 8%, too tight on 20-50% gap stocks)
+MR_SAFETY_STOP_PCT = 0.10             # 10% below entry (was 8%)
 MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
 MR_LIVE_SAFETY_STOP_PCT = MR_SAFETY_STOP_PCT
 MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
@@ -302,7 +302,7 @@ MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
 # ── Float Turnover (FT) Robot ──────────────────────────
 FT_LIVE_INITIAL_CASH = 3000.0
 FT_LIVE_POSITION_SIZE_PCT = 0.95
-FT_LIVE_MAX_TRACKED_SYMBOLS = 50       # no practical limit — track all ≥15% turnover
+FT_LIVE_MAX_TRACKED_SYMBOLS = 20       # was 50 — reduce to avoid churning
 FT_MIN_FLOAT_TURNOVER_PCT = 15.0     # minimum % of float traded
 
 # ── Screen Monitor (IBKR Scanner) ────────────────────

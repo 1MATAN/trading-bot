@@ -79,25 +79,33 @@ class OrderThread(threading.Thread):
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7497,
-                 on_account=None, on_order_result=None):
+                 on_account=None, on_order_result=None, on_live_price=None):
         """
         Parameters
         ----------
         host, port : IBKR TWS connection
         on_account : callable(net_liq, buying_power, positions) or None
         on_order_result : callable(msg, success) or None
+        on_live_price : callable(sym, price) or None — called on each price tick
         """
         super().__init__(daemon=True, name="OrderThread")
         self._host = host
         self._port = port
         self.on_account = on_account
         self.on_order_result = on_order_result
+        self.on_live_price = on_live_price
 
         self._queue: queue.Queue = queue.Queue()
         self._running = False
         self._ib: IB | None = None
         self._contract_cache: dict[str, Stock] = {}
         self._last_successful_fetch: float = time_mod.time()
+
+        # Live market data subscription
+        self._subscribed_sym: str = ""
+        self._subscribed_contract: Stock | None = None
+        self._subscribed_ticker = None
+        self._live_price: float = 0.0
 
         # Cached account data (accessible from GUI thread)
         self.net_liq: float = 0.0
@@ -109,6 +117,14 @@ class OrderThread(threading.Thread):
     def submit(self, req: dict):
         """Enqueue an order for immediate execution."""
         self._queue.put(req)
+
+    def subscribe_market_data(self, sym: str):
+        """Thread-safe: enqueue a market data subscription request."""
+        self._queue.put({'_type': 'subscribe', 'sym': sym})
+
+    def get_live_price(self) -> float:
+        """Thread-safe: read latest live price (float read is atomic)."""
+        return self._live_price
 
     def stop(self):
         self._running = False
@@ -135,13 +151,16 @@ class OrderThread(threading.Thread):
 
         last_account = time_mod.time()
         while self._running:
-            # Process all pending orders immediately
+            # Process all pending orders / subscribe requests
             had_orders = False
             while not self._queue.empty():
                 try:
                     req = self._queue.get_nowait()
-                    self._execute_order(req)
-                    had_orders = True
+                    if req.get('_type') == 'subscribe':
+                        self._handle_subscribe(req['sym'])
+                    else:
+                        self._execute_order(req)
+                        had_orders = True
                 except queue.Empty:
                     break
 
@@ -166,8 +185,16 @@ class OrderThread(threading.Thread):
             except Exception:
                 time_mod.sleep(0.3)
 
+            # Poll live market data ticker for price updates
+            self._poll_live_price()
+
         # Cleanup
         if self._ib and self._ib.isConnected():
+            if self._subscribed_ticker is not None:
+                try:
+                    self._ib.cancelMktData(self._subscribed_contract)
+                except Exception:
+                    pass
             log.info("OrderThread: disconnecting IBKR")
             self._ib.disconnect()
 
@@ -195,6 +222,10 @@ class OrderThread(threading.Thread):
                 log.info("OrderThread: account data ready")
             except Exception:
                 pass
+
+            # Re-subscribe to market data if we had an active subscription
+            if self._subscribed_sym:
+                self._handle_subscribe(self._subscribed_sym)
 
             return True
         except Exception as e:
@@ -322,6 +353,52 @@ class OrderThread(threading.Thread):
                         pass
                     self._ib = None
 
+    # ── Live market data ──
+
+    def _handle_subscribe(self, sym: str):
+        """Subscribe to streaming market data for a symbol."""
+        ib = self._ensure_connected()
+        if not ib:
+            return
+        # Cancel previous subscription
+        if self._subscribed_ticker is not None and self._subscribed_contract is not None:
+            try:
+                ib.cancelMktData(self._subscribed_contract)
+            except Exception:
+                pass
+            self._subscribed_ticker = None
+            self._live_price = 0.0
+
+        contract = self._get_contract(sym)
+        if not contract:
+            log.warning(f"OrderThread: cannot subscribe — failed to qualify {sym}")
+            return
+
+        self._subscribed_sym = sym
+        self._subscribed_contract = contract
+        self._subscribed_ticker = ib.reqMktData(contract, '', False, False)
+        log.info(f"OrderThread: subscribed to market data for {sym}")
+
+    def _poll_live_price(self):
+        """Check the subscribed ticker for price updates and fire callback."""
+        ticker = self._subscribed_ticker
+        if ticker is None:
+            return
+        price = ticker.marketPrice()
+        if price != price:  # NaN check
+            price = ticker.last
+        if price != price:  # still NaN
+            return
+        if price <= 0:
+            return
+        if price != self._live_price:
+            self._live_price = price
+            if self.on_live_price and self._subscribed_sym:
+                try:
+                    self.on_live_price(self._subscribed_sym, price)
+                except Exception as e:
+                    log.debug(f"on_live_price callback error: {e}")
+
     # ── Order execution ──
 
     def _execute_order(self, req: dict):
@@ -370,73 +447,123 @@ class OrderThread(threading.Thread):
             session = _get_market_session()
             outside_rth = session != 'market'
 
-            order = LimitOrder(action, qty, price)
-            order.outsideRth = outside_rth
-            order.tif = 'DAY'
-            trade = ib.placeOrder(contract, order)
-            ib.sleep(3)  # wait for async status callback
-
-            status = trade.orderStatus.status
-            if status in ('Inactive', 'Cancelled'):
-                err_log = [e for e in trade.log if e.errorCode]
-                reason = err_log[-1].message if err_log else "Unknown"
-                msg = f"Order REJECTED: {action} {qty} {sym} — {reason}"
-                log.error(msg)
-                self._report(msg, False)
-                self._telegram(
-                    f"❌ <b>Order Rejected</b>\n"
-                    f"  {action} {qty} {sym} @ ${price:.2f}\n"
-                    f"  Reason: {reason}"
-                )
-                return
-
             # Place stop-loss for BUY orders (STP LMT — triggers outside RTH)
             stop_msg = ""
             trailing_pct = req.get('trailing_pct', 0)
             target_price = req.get('target_price', 0)
             trail_msg = ""
 
-            if action == 'BUY' and stop_price > 0 and target_price > 0:
-                # ── OCA bracket: Stop + TP cancel each other ──
+            # ── Determine if we need a parentId bracket ──
+            use_parent_bracket = (action == 'BUY' and stop_price > 0
+                                  and target_price <= 0 and trailing_pct > 0)
+
+            if use_parent_bracket:
+                # ── parentId bracket: BUY(parent) → Stop + Trail (children) ──
+                # parentId tells IBKR these are protective orders — no extra margin.
+                # OCA on stop+trail ensures mutual cancellation on fill.
+                parent_order = LimitOrder(action, qty, price)
+                parent_order.outsideRth = outside_rth
+                parent_order.tif = 'DAY'
+                parent_order.orderId = ib.client.getReqId()
+                parent_order.transmit = False  # don't send yet
+
+                trade = ib.placeOrder(contract, parent_order)
+
                 oca_group = f"Bracket_{sym}_{int(time_mod.time())}"
 
                 stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
+                stop_order.parentId = parent_order.orderId
                 stop_order.ocaGroup = oca_group
-                stop_order.ocaType = 1  # cancel remaining on fill
+                stop_order.ocaType = 1
+                stop_order.transmit = False  # not yet
+
                 stop_trade = ib.placeOrder(contract, stop_order)
-                ib.sleep(1)
+
+                trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
+                trail_order.parentId = parent_order.orderId
+                trail_order.ocaGroup = oca_group
+                trail_order.ocaType = 1
+                trail_order.transmit = True  # last child → sends the entire bracket
+
+                trail_trade = ib.placeOrder(contract, trail_order)
+                ib.sleep(3)  # wait for all orders to process
+
+                status = trade.orderStatus.status
+                if status in ('Inactive', 'Cancelled'):
+                    err_log = [e for e in trade.log if e.errorCode]
+                    reason = err_log[-1].message if err_log else "Unknown"
+                    msg = f"Order REJECTED: {action} {qty} {sym} — {reason}"
+                    log.error(msg)
+                    self._report(msg, False)
+                    self._telegram(
+                        f"❌ <b>Order Rejected</b>\n"
+                        f"  {action} {qty} {sym} @ ${price:.2f}\n"
+                        f"  Reason: {reason}"
+                    )
+                    return
+
                 stop_status = stop_trade.orderStatus.status
+                trail_status = trail_trade.orderStatus.status
                 stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
-                log.info(f"OCA Stop placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+                trail_msg = f" | Trail {trailing_pct}% ({trail_status})"
+                log.info(f"parentId bracket: BUY {qty} {sym} @ ${price:.2f} — {status}")
+                log.info(f"  Stop: SELL {qty} @ ${stop_price:.2f} (STP LMT) — {stop_status} [parent={parent_order.orderId}]")
+                log.info(f"  Trail: SELL {qty} trail {trailing_pct}% — {trail_status} [parent={parent_order.orderId}, OCA={oca_group}]")
 
-                tp_order = LimitOrder('SELL', qty, target_price)
-                tp_order.outsideRth = True
-                tp_order.tif = 'GTC'
-                tp_order.ocaGroup = oca_group
-                tp_order.ocaType = 1
-                tp_trade = ib.placeOrder(contract, tp_order)
-                ib.sleep(1)
-                tp_status = tp_trade.orderStatus.status
-                trail_msg = f" | TP ${target_price:.2f} ({tp_status})"
-                log.info(f"OCA TP placed: SELL {qty} {sym} @ ${target_price:.2f} (LMT GTC) — {tp_status} [OCA={oca_group}]")
+            else:
+                # ── Standard order (no parentId bracket needed) ──
+                order = LimitOrder(action, qty, price)
+                order.outsideRth = outside_rth
+                order.tif = 'DAY'
+                trade = ib.placeOrder(contract, order)
+                ib.sleep(3)
 
-            elif action == 'BUY' and stop_price > 0:
-                # Stop-loss only (no manual TP)
-                stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
-                stop_trade = ib.placeOrder(contract, stop_order)
-                ib.sleep(1)
-                stop_status = stop_trade.orderStatus.status
-                stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
-                log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+                status = trade.orderStatus.status
+                if status in ('Inactive', 'Cancelled'):
+                    err_log = [e for e in trade.log if e.errorCode]
+                    reason = err_log[-1].message if err_log else "Unknown"
+                    msg = f"Order REJECTED: {action} {qty} {sym} — {reason}"
+                    log.error(msg)
+                    self._report(msg, False)
+                    self._telegram(
+                        f"❌ <b>Order Rejected</b>\n"
+                        f"  {action} {qty} {sym} @ ${price:.2f}\n"
+                        f"  Reason: {reason}"
+                    )
+                    return
 
-                # Trailing stop (only when no manual TP)
-                if trailing_pct > 0:
-                    trail_order = _make_trailing_stop('SELL', qty, trailing_pct)
-                    trail_trade = ib.placeOrder(contract, trail_order)
+                if action == 'BUY' and stop_price > 0 and target_price > 0:
+                    # ── OCA bracket: Stop + TP cancel each other ──
+                    oca_group = f"Bracket_{sym}_{int(time_mod.time())}"
+
+                    stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
+                    stop_order.ocaGroup = oca_group
+                    stop_order.ocaType = 1
+                    stop_trade = ib.placeOrder(contract, stop_order)
                     ib.sleep(1)
-                    trail_status = trail_trade.orderStatus.status
-                    trail_msg = f" | Trail {trailing_pct}% ({trail_status})"
-                    log.info(f"Trailing take-profit placed: SELL {qty} {sym} trail {trailing_pct}% — {trail_status}")
+                    stop_status = stop_trade.orderStatus.status
+                    stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
+                    log.info(f"OCA Stop placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+
+                    tp_order = LimitOrder('SELL', qty, target_price)
+                    tp_order.outsideRth = True
+                    tp_order.tif = 'GTC'
+                    tp_order.ocaGroup = oca_group
+                    tp_order.ocaType = 1
+                    tp_trade = ib.placeOrder(contract, tp_order)
+                    ib.sleep(1)
+                    tp_status = tp_trade.orderStatus.status
+                    trail_msg = f" | TP ${target_price:.2f} ({tp_status})"
+                    log.info(f"OCA TP placed: SELL {qty} {sym} @ ${target_price:.2f} (LMT GTC) — {tp_status} [OCA={oca_group}]")
+
+                elif action == 'BUY' and stop_price > 0:
+                    # ── Stop only (no trailing, no TP) ──
+                    stop_order = _make_stop_limit('SELL', qty, stop_price, limit_price)
+                    stop_trade = ib.placeOrder(contract, stop_order)
+                    ib.sleep(1)
+                    stop_status = stop_trade.orderStatus.status
+                    stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
+                    log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
 
             # Place stop-loss on remaining shares for partial SELL orders
             stop_remaining_qty = req.get('stop_remaining_qty', 0)
@@ -453,8 +580,9 @@ class OrderThread(threading.Thread):
             self._report(msg, True)
             stop_desc = req.get('stop_desc', f"${stop_price:.2f}")
             if action == 'BUY' and stop_price > 0:
+                bracket_type = "parentId" if use_parent_bracket else "OCA"
                 tg_lines = [
-                    f"📋 <b>Order Placed + Bracket</b>",
+                    f"📋 <b>Order Placed + Bracket ({bracket_type})</b>",
                     f"  BUY {qty} {sym} @ ${price:.2f}",
                     f"  Status: {status}",
                     f"  🛑 Stop: {stop_desc} → Lmt ${limit_price:.2f} [STP LMT GTC]",
@@ -464,6 +592,7 @@ class OrderThread(threading.Thread):
                     tg_lines.append(f"  🔗 OCA: Stop ↔ TP (אחד מבטל את השני)")
                 elif trailing_pct > 0:
                     tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
+                    tg_lines.append(f"  🔗 parentId bracket + OCA (stop ↔ trail)")
                 rth_icon = "✓" if outside_rth else "✗"
                 tg_lines.append(f"  outsideRth: {rth_icon}  |  TIF: DAY (buy) + GTC (stop/trail)")
                 self._telegram("\n".join(tg_lines))

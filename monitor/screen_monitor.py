@@ -1293,7 +1293,8 @@ _IBKR_HEADLINE_RE = re.compile(r'\{[^}]*\}\*?\s*')
 def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
     """Fetch recent news headlines from IBKR (Dow Jones, The Fly, Briefing).
 
-    Returns list of {'title_en': str, 'date': str, 'source': str}.
+    Returns list of {'title_en': str, 'date': str, 'source': str,
+                     'article_id': str, 'provider_code': str}.
     """
     ib = _get_ibkr()
     if not ib:
@@ -1322,11 +1323,53 @@ def _fetch_ibkr_news(symbol: str, max_news: int = 5) -> list[dict]:
                 'title_en': clean,
                 'date': date_str,
                 'source': h.providerCode or '',
+                'article_id': h.articleId or '',
+                'provider_code': h.providerCode or '',
             })
         return results
     except Exception as e:
         log.debug(f"IBKR news {symbol}: {e}")
         return []
+
+
+# ── Article body cache: {article_id: str_text} ──
+_article_cache: dict[str, str] = {}
+_HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _fetch_news_article(provider_code: str, article_id: str) -> str:
+    """Fetch full article body from IBKR, strip HTML, translate to Hebrew.
+
+    Returns translated plain text or empty string on failure.
+    Cached after first successful fetch.
+    """
+    if not article_id:
+        return ''
+    if article_id in _article_cache:
+        return _article_cache[article_id]
+    ib = _get_ibkr()
+    if not ib:
+        return ''
+    try:
+        article = ib.reqNewsArticle(provider_code, article_id)
+        if not article or not article.articleText:
+            _article_cache[article_id] = ''
+            return ''
+        # Strip HTML tags
+        text = _HTML_TAG_RE.sub('', article.articleText).strip()
+        # Collapse multiple blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        # Translate to Hebrew
+        try:
+            text_he = _batch_translate([text[:3000]])[0].strip()
+        except Exception:
+            text_he = text[:3000]
+        _article_cache[article_id] = text_he
+        return text_he
+    except Exception as e:
+        log.debug(f"reqNewsArticle({provider_code}, {article_id}): {e}")
+        _article_cache[article_id] = ''
+        return ''
 
 
 # ══════════════════════════════════════════════════════════
@@ -3007,27 +3050,25 @@ def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -
         if ibkr_news:
             # Collect titles for dedup and batch translate
             finviz_titles = {n.get('title_he', '').lower() for n in data['news']}
-            new_titles_en = []
-            new_dates = []
-            new_sources = []
+            new_items = []
             for n in ibkr_news:
                 title_lower = n['title_en'].lower()
                 # Skip if very similar to an existing Finviz headline
                 if any(title_lower[:30] in ft or ft[:30] in title_lower
                        for ft in finviz_titles if len(ft) > 10):
                     continue
-                new_titles_en.append(n['title_en'])
-                new_dates.append(n['date'])
-                new_sources.append(n['source'])
+                new_items.append(n)
 
-            if new_titles_en:
-                titles_he = _batch_translate(new_titles_en)
+            if new_items:
+                titles_he = _batch_translate([it['title_en'] for it in new_items])
                 for i, title_he in enumerate(titles_he):
-                    src = new_sources[i] if i < len(new_sources) else ''
+                    it = new_items[i]
                     data['news'].append({
                         'title_he': title_he.strip(),
-                        'date': new_dates[i] if i < len(new_dates) else '',
-                        'source': src,
+                        'date': it['date'],
+                        'source': it['source'],
+                        'article_id': it.get('article_id', ''),
+                        'provider_code': it.get('provider_code', ''),
                     })
             log.info(f"IBKR news {sym}: {len(ibkr_news)} raw → {len(new_titles_en)} new")
     except Exception as e:
@@ -5397,6 +5438,8 @@ class ScannerThread(threading.Thread):
 
                 if pct < 20 or price <= 0 or prev_close <= 0 or not contract:
                     continue
+                if price < 0.20:  # skip sub-$0.20 stocks (too volatile, huge losses)
+                    continue
                 if vwap > 0 and price <= vwap:
                     continue
 
@@ -5489,7 +5532,9 @@ class ScannerThread(threading.Thread):
                     )
                     continue
 
-                qty = int(self._virtual_portfolio.cash * 0.95 / entry_price) if entry_price > 0 else 0
+                max_pos_value = 500.0  # max $500 per position
+                qty = int(min(self._virtual_portfolio.cash * 0.95, max_pos_value) / entry_price) if entry_price > 0 else 0
+                qty = min(qty, 5000)  # absolute max shares
                 if qty >= 2:
                     alert = self._virtual_portfolio.buy(
                         req.symbol, qty, entry_price,
@@ -5762,6 +5807,7 @@ class ScannerThread(threading.Thread):
                     price=price,
                     float_shares=float_shares,
                     turnover_pct=turnover,
+                    vwap=vwap,
                 ))
 
             if not candidates:
@@ -5791,7 +5837,9 @@ class ScannerThread(threading.Thread):
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
-                qty = int(self._ft_portfolio.cash * FT_LIVE_POSITION_SIZE_PCT / entry_price) if entry_price > 0 else 0
+                max_pos_value = 500.0  # max $500 per position
+                qty = int(min(self._ft_portfolio.cash * FT_LIVE_POSITION_SIZE_PCT, max_pos_value) / entry_price) if entry_price > 0 else 0
+                qty = min(qty, 5000)  # absolute max shares
                 if qty >= 1:
                     alert = self._ft_portfolio.buy(
                         entry.symbol, qty, entry_price, entry.turnover_pct,
@@ -6677,6 +6725,12 @@ class App:
                               command=lambda s=sym: self._open_chart_window(s))
         chart_btn.pack(side='left', padx=(2, 0))
 
+        # News button
+        news_btn = tk.Button(row1, text="N", font=("Helvetica", 9), bg='#333',
+                             fg='#ffcc00', relief='flat', padx=2, pady=0,
+                             command=lambda s=sym: self._open_news_window(s))
+        news_btn.pack(side='left', padx=(2, 0))
+
         # Fib row
         row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
         row2.pack(fill='x', pady=0)
@@ -6870,7 +6924,7 @@ class App:
     # ── Trading Panel ──────────────────────────────────────
 
     def _build_trading_panel(self):
-        """Build the trading panel UI between stock table and settings."""
+        """Build the trading panel UI — two modes: Quick Entry + Planned Trade."""
         panel = tk.Frame(self.root, bg=self.BG)
         panel.pack(fill='x', padx=10, pady=1)
 
@@ -6904,41 +6958,68 @@ class App:
                  font=("Courier", 13), bg=self.BG, fg="#aaa"
                  ).pack(side='left')
 
-        # Row 2: BUY + SELL buttons
-        row2 = tk.Frame(panel, bg=self.BG)
-        row2.pack(fill='x', pady=2)
+        # ── Quick Entry section ──
+        sep1 = tk.Frame(panel, bg="#444", height=1)
+        sep1.pack(fill='x', pady=2)
 
-        for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 12, "bold"),
-                      bg="#1b5e20", fg="white", activebackground="#2e7d32",
-                      relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('BUY', p / 100)
-                      ).pack(side='left', padx=1)
+        row_quick = tk.Frame(panel, bg=self.BG)
+        row_quick.pack(fill='x', pady=2)
 
-        tk.Button(row2, text="CLOSE ALL", font=("Helvetica", 12, "bold"),
+        tk.Button(row_quick, text="QUICK BUY", font=("Helvetica", 13, "bold"),
+                  bg="#1b5e20", fg="white", activebackground="#2e7d32",
+                  relief='flat', padx=14, pady=2,
+                  command=self._quick_buy).pack(side='left', padx=2)
+
+        tk.Button(row_quick, text="QUICK SELL", font=("Helvetica", 13, "bold"),
+                  bg="#b71c1c", fg="white", activebackground="#c62828",
+                  relief='flat', padx=14, pady=2,
+                  command=self._quick_sell).pack(side='left', padx=2)
+
+        tk.Button(row_quick, text="CLOSE ALL", font=("Helvetica", 13, "bold"),
                   bg="#e6a800", fg="black", activebackground="#ffc107",
-                  relief='flat', padx=8, pady=1,
+                  relief='flat', padx=14, pady=2,
                   command=self._close_all_position).pack(side='left', padx=4)
 
-        for pct in [25, 50, 75, 100]:
-            tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 12, "bold"),
-                      bg="#b71c1c", fg="white", activebackground="#c62828",
-                      relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('SELL', p / 100)
-                      ).pack(side='left', padx=1)
+        tk.Label(row_quick, text="(80% BP, 5% trail, no dialog)",
+                 font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
 
-        # Row 3: Manual Stop / Take-Profit
-        row3 = tk.Frame(panel, bg=self.BG)
-        row3.pack(fill='x', pady=2)
-        tk.Label(row3, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
-        self._stop_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
+        # ── Planned Trade section ──
+        sep2 = tk.Frame(panel, bg="#444", height=1)
+        sep2.pack(fill='x', pady=2)
+
+        row_fields = tk.Frame(panel, bg=self.BG)
+        row_fields.pack(fill='x', pady=2)
+
+        tk.Label(row_fields, text="Entry:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
+        self._planned_entry_field = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
+                                             insertbackground="white", relief='flat')
+        self._planned_entry_field.pack(side='left', padx=2)
+
+        tk.Label(row_fields, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
+        self._stop_entry = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
                                     insertbackground="white", relief='flat')
         self._stop_entry.pack(side='left', padx=2)
-        tk.Label(row3, text="TP:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(12, 2))
-        self._tp_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
+
+        tk.Label(row_fields, text="TP:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
+        self._tp_entry = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
                                   insertbackground="white", relief='flat')
         self._tp_entry.pack(side='left', padx=2)
-        tk.Label(row3, text="(empty = auto)", font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
+
+        row_planned_btns = tk.Frame(panel, bg=self.BG)
+        row_planned_btns.pack(fill='x', pady=2)
+
+        tk.Button(row_planned_btns, text="BUY PLANNED", font=("Helvetica", 12, "bold"),
+                  bg="#0d47a1", fg="white", activebackground="#1565c0",
+                  relief='flat', padx=10, pady=1,
+                  command=self._planned_buy).pack(side='left', padx=2)
+
+        tk.Button(row_planned_btns, text="SELL PLANNED", font=("Helvetica", 12, "bold"),
+                  bg="#880e4f", fg="white", activebackground="#ad1457",
+                  relief='flat', padx=10, pady=1,
+                  command=self._planned_sell).pack(side='left', padx=2)
+
+        tk.Label(row_planned_btns, text="(OCA bracket: Stop + TP cancel each other)",
+                 font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
 
         # Order status
         self._order_status_var = tk.StringVar(value="")
@@ -7107,6 +7188,164 @@ class App:
 
         threading.Thread(target=_fetch_and_draw, daemon=True).start()
 
+    # ── News Window ──────────────────────────────────────────
+
+    def _open_news_window(self, sym: str):
+        """Open a Toplevel window showing expandable news headlines for sym."""
+        enrich = _enrichment.get(sym, {})
+        news_items = enrich.get('news', [])
+        stock_data = self._stock_data.get(sym, {})
+        price = stock_data.get('price', 0)
+        pct = stock_data.get('pct', 0)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"News — {sym}")
+        win.configure(bg='#0e1117')
+        win.geometry("700x500")
+        win.minsize(500, 300)
+
+        # Header
+        hdr = tk.Frame(win, bg='#0e1117')
+        hdr.pack(fill='x', padx=10, pady=(8, 4))
+        pct_fg = self.GREEN if pct >= 0 else self.RED
+        tk.Label(hdr, text=sym, font=("Helvetica", 18, "bold"),
+                 bg='#0e1117', fg=self.ACCENT).pack(side='left')
+        tk.Label(hdr, text=f"  ${price:.2f}  {pct:+.1f}%",
+                 font=("Helvetica", 14), bg='#0e1117', fg=pct_fg).pack(side='left', padx=(8, 0))
+        tk.Label(hdr, text=f"  ({len(news_items)} headlines)",
+                 font=("Helvetica", 11), bg='#0e1117', fg='#888').pack(side='left', padx=(8, 0))
+
+        tk.Frame(win, bg='#333', height=1).pack(fill='x', padx=10)
+
+        # Scrollable body
+        body_frame = tk.Frame(win, bg='#0e1117')
+        body_frame.pack(fill='both', expand=True, padx=10, pady=4)
+
+        canvas = tk.Canvas(body_frame, bg='#0e1117', highlightthickness=0)
+        scrollbar = tk.Scrollbar(body_frame, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg='#0e1117')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Mousewheel
+        def _mw(event):
+            canvas.yview_scroll(-1 * (event.delta // 120 or (1 if event.num == 4 else -1)), "units")
+        canvas.bind('<Button-4>', _mw)
+        canvas.bind('<Button-5>', _mw)
+        inner.bind('<Button-4>', _mw)
+        inner.bind('<Button-5>', _mw)
+
+        if not news_items:
+            tk.Label(inner, text="No news available", font=("Helvetica", 14),
+                     bg='#0e1117', fg='#666').pack(pady=20)
+            return
+
+        # Build collapsible rows
+        for idx, item in enumerate(news_items):
+            self._build_news_row(inner, item, idx, canvas)
+
+    def _build_news_row(self, parent: tk.Frame, item: dict, idx: int, canvas: tk.Canvas):
+        """Build a single collapsible news headline row."""
+        title_he = item.get('title_he', item.get('title_en', ''))
+        date_str = item.get('date', '')
+        source = item.get('source', '')
+        article_id = item.get('article_id', '')
+        provider_code = item.get('provider_code', '')
+
+        try:
+            title_display = bidi_display(title_he)
+        except Exception:
+            title_display = title_he
+
+        src_tag = f" [{source}]" if source else ""
+        has_article = bool(article_id)
+
+        row_bg = '#151520' if idx % 2 == 0 else '#0e1117'
+        row = tk.Frame(parent, bg=row_bg)
+        row.pack(fill='x', pady=1)
+
+        # State for expand/collapse
+        expanded = [False]
+        body_frame = [None]  # lazy-created
+
+        # Toggle button
+        toggle_text = tk.StringVar(value="▶" if has_article else "•")
+        toggle_btn = tk.Label(row, textvariable=toggle_text, font=("Helvetica", 12),
+                              bg=row_bg, fg='#00aaff' if has_article else '#555',
+                              width=2, cursor='hand2' if has_article else 'arrow')
+        toggle_btn.pack(side='left', padx=(4, 2))
+
+        # Headline text
+        hl_label = tk.Label(row, text=title_display, font=("Helvetica", 11),
+                            bg=row_bg, fg='#e0e0e0', anchor='w', justify='left',
+                            wraplength=500)
+        hl_label.pack(side='left', fill='x', expand=True)
+
+        # Date + source
+        meta_text = f"{date_str}{src_tag}" if date_str else src_tag
+        if meta_text:
+            tk.Label(row, text=meta_text, font=("Helvetica", 9),
+                     bg=row_bg, fg='#888', anchor='e').pack(side='right', padx=(4, 8))
+
+        def _toggle(event=None):
+            if not has_article:
+                return
+            if expanded[0]:
+                # Collapse
+                if body_frame[0]:
+                    body_frame[0].pack_forget()
+                toggle_text.set("▶")
+                expanded[0] = False
+            else:
+                # Expand
+                toggle_text.set("▼")
+                expanded[0] = True
+                if body_frame[0]:
+                    body_frame[0].pack(fill='x', padx=(24, 8), pady=(0, 4))
+                else:
+                    # Create body frame with loading indicator
+                    bf = tk.Frame(parent, bg=row_bg)
+                    bf.pack(fill='x', padx=(24, 8), pady=(0, 4))
+                    body_frame[0] = bf
+                    loading_lbl = tk.Label(bf, text="Loading article...",
+                                           font=("Helvetica", 10, "italic"),
+                                           bg=row_bg, fg='#888')
+                    loading_lbl.pack(anchor='w')
+
+                    # Fetch in background thread
+                    def _fetch():
+                        text = _fetch_news_article(provider_code, article_id)
+                        def _show():
+                            loading_lbl.destroy()
+                            if text:
+                                try:
+                                    display_text = bidi_display(text[:2000])
+                                except Exception:
+                                    display_text = text[:2000]
+                                body_lbl = tk.Label(
+                                    bf, text=display_text,
+                                    font=("Helvetica", 10), bg=row_bg, fg='#cccccc',
+                                    anchor='w', justify='left', wraplength=600,
+                                )
+                                body_lbl.pack(anchor='w', fill='x')
+                            else:
+                                tk.Label(bf, text="(Article content not available)",
+                                         font=("Helvetica", 10, "italic"),
+                                         bg=row_bg, fg='#666').pack(anchor='w')
+                        try:
+                            parent.after(0, _show)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_fetch, daemon=True).start()
+
+        if has_article:
+            toggle_btn.bind('<Button-1>', _toggle)
+            hl_label.bind('<Button-1>', _toggle)
+            row.bind('<Button-1>', _toggle)
+
     def _select_stock(self, sym: str):
         """Handle stock row click — populate trading panel fields."""
         self._selected_symbol_name = sym
@@ -7171,194 +7410,268 @@ class App:
             self._order_status_label.config(fg=self.GREEN if success else self.RED)
         self.root.after(0, _update)
 
-    def _place_order(self, action: str, pct: float):
-        """Validate and send a BUY or SELL order to the OrderThread."""
+    def _validate_order_prereqs(self):
+        """Validate common order prerequisites. Returns (sym, price) or None."""
         sym = self._selected_symbol_name
-        log.info(f"_place_order called: {action} {pct*100:.0f}% sym={sym}")
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "בחר מניה לפני ביצוע פקודה.", parent=self.root)
-            return
-
+            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
+            return None
         try:
             price = float(self._trade_price.get())
             if price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "הכנס מחיר תקין.", parent=self.root)
-            return
-
+            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
+            return None
         if not self._order_thread.connected:
             messagebox.showwarning(
                 "Not Connected",
-                "OrderThread לא מחובר ל-IBKR.\n\n"
-                "ודא ש-TWS רץ עם API על פורט 7497.\n"
-                f"סטטוס: {self.conn_var.get()}",
+                "OrderThread not connected to IBKR.\n\n"
+                "Make sure TWS is running with API on port 7497.\n"
+                f"Status: {self.conn_var.get()}",
                 parent=self.root,
             )
+            return None
+        return sym, price
+
+    def _quick_buy(self):
+        """Quick Buy: 80% of BP, 1% above price, 5% trailing stop. No confirmation dialog."""
+        result = self._validate_order_prereqs()
+        if not result:
+            return
+        sym, price = result
+        log.info(f"_quick_buy called: sym={sym} price={price:.4f}")
+
+        buy_price = round(price * 1.01, 2)
+        bp = self._cached_buying_power
+        nl = self._cached_net_liq
+        if nl <= 0:
+            messagebox.showwarning("No Data", "Waiting for account data from IBKR...", parent=self.root)
+            return
+        avail = bp if bp > 0 else nl
+        qty = int(avail * 0.80 / buy_price)
+        if qty <= 0:
+            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
             return
 
-        if action == 'BUY':
-            # Buy at 1% above current price for fast fill
-            buy_price = round(price * 1.01, 2)
-            bp = self._cached_buying_power
-            nl = self._cached_net_liq
-            if nl <= 0:
-                messagebox.showwarning(
-                    "No Data",
-                    "ממתין לנתוני חשבון מ-IBKR...\n"
-                    "נסה שוב בעוד כמה שניות.",
-                    parent=self.root,
-                )
-                return
-            # Use buying power (not NetLiq) to respect existing positions
-            # 80% margin buffer for penny stock requirements (IBKR can need >100%)
-            avail = bp if bp > 0 else nl
-            qty = int(avail * 0.80 * pct / buy_price)
-            if qty <= 0:
-                messagebox.showwarning("Qty Too Low",
-                                       f"Not enough buying power for {pct*100:.0f}%.",
-                                       parent=self.root)
-                return
-        else:  # SELL
-            pos = self._cached_positions.get(sym)
-            if not pos or pos[0] == 0:
-                messagebox.showwarning("No Position", f"אין פוזיציה ב-{sym}.", parent=self.root)
-                return
-            total_qty = abs(pos[0])
-            qty = max(1, int(total_qty * pct))
-            remaining = total_qty - qty
-            log.info(f"SELL: {sym} total={total_qty} sell={qty} remaining={remaining}")
+        # 5% trailing stop from entry
+        stop_price = round(price * 0.95, 2)
+        limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
 
-        # ── Read manual Stop / TP from GUI ──
-        manual_stop = 0.0
-        manual_tp = 0.0
+        req = {
+            'sym': sym, 'action': 'BUY', 'qty': qty, 'price': buy_price,
+            'stop_price': stop_price,
+            'limit_price': limit_price,
+            'trailing_pct': 5.0,
+            'stop_desc': f"${stop_price:.2f} (5% trail)",
+        }
+        self._order_thread.submit(req)
+        log.info(f"QUICK BUY submitted: {req}")
+        self._order_status_var.set(
+            f"QUICK BUY {qty} {sym} @ ${buy_price:.2f} | 5% trail stop")
+        self._order_status_label.config(fg="#00e676")
+
+    def _quick_sell(self):
+        """Quick Sell: 100% of position at price*0.99, cancel existing stops. No confirmation."""
+        result = self._validate_order_prereqs()
+        if not result:
+            return
+        sym, price = result
+        log.info(f"_quick_sell called: sym={sym} price={price:.4f}")
+
+        pos = self._cached_positions.get(sym)
+        if not pos or pos[0] == 0:
+            messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
+            return
+        qty = abs(pos[0])
+        sell_price = round(price * 0.99, 2)
+        if sell_price <= 0:
+            sell_price = 0.01
+
+        req = {
+            'sym': sym, 'action': 'SELL', 'qty': qty, 'price': sell_price,
+            'cancel_existing': True,
+        }
+        self._order_thread.submit(req)
+        log.info(f"QUICK SELL submitted: {req}")
+        self._order_status_var.set(
+            f"QUICK SELL {qty} {sym} @ ${sell_price:.2f} (-1%) + cancel stops")
+        self._order_status_label.config(fg="#ff5252")
+
+    def _planned_buy(self):
+        """Planned Buy: user-specified entry/stop/TP, OCA bracket. With confirmation dialog."""
+        result = self._validate_order_prereqs()
+        if not result:
+            return
+        sym, price = result
+        log.info(f"_planned_buy called: sym={sym}")
+
+        # Read entry/stop/tp fields
         try:
-            _s = self._stop_entry.get().strip()
-            if _s:
-                manual_stop = float(_s)
-                if manual_stop <= 0:
-                    manual_stop = 0.0
-        except ValueError:
-            pass
+            entry_str = self._planned_entry_field.get().strip()
+            entry_price = float(entry_str) if entry_str else price
+            if entry_price <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showwarning("Invalid Entry", "Enter a valid entry price.", parent=self.root)
+            return
+
         try:
-            _t = self._tp_entry.get().strip()
-            if _t:
-                manual_tp = float(_t)
-                if manual_tp <= 0:
-                    manual_tp = 0.0
-        except ValueError:
-            pass
+            stop_str = self._stop_entry.get().strip()
+            stop_price = float(stop_str) if stop_str else 0.0
+        except (ValueError, TypeError):
+            stop_price = 0.0
 
-        # ── Stop-loss calculation (for both BUY and partial SELL) ──
-        stop_price = 0.0
-        limit_price = 0.0
-        trailing_pct = 0.0
-        target_price = 0.0
-        stop_desc = ""
-        stop_remaining_qty = 0  # for partial SELL: stop on remaining shares
+        try:
+            tp_str = self._tp_entry.get().strip()
+            target_price = float(tp_str) if tp_str else 0.0
+        except (ValueError, TypeError):
+            target_price = 0.0
 
-        if manual_stop > 0:
-            # Manual stop override
-            stop_price = round(manual_stop, 2)
-            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
-            stop_desc = f"${stop_price:.2f} (manual)"
-        else:
-            # Find nearest fib support for smart stop-loss
+        # If no stop given, use fib-based or 5% fallback
+        if stop_price <= 0:
             with _fib_cache_lock:
                 cached = _fib_cache.get(sym)
             if cached:
                 _al, _ah, all_levels, _rm, *_ = cached
-                supports = [lv for lv in all_levels if lv <= price]
+                supports = [lv for lv in all_levels if lv <= entry_price]
                 if supports:
                     nearest_support = supports[-1]
                     stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
-                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
                 else:
-                    stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
+                    stop_price = round(entry_price * 0.95, 2)
             else:
-                stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
-            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+                stop_price = round(entry_price * 0.95, 2)
+        stop_price = round(stop_price, 2)
+        limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
 
-        if manual_tp > 0:
-            target_price = round(manual_tp, 2)
+        # Validate: stop < entry
+        if stop_price >= entry_price:
+            messagebox.showwarning("Invalid Stop", f"Stop ${stop_price:.2f} must be below entry ${entry_price:.2f}.", parent=self.root)
+            return
+        if target_price > 0 and target_price <= entry_price:
+            messagebox.showwarning("Invalid TP", f"TP ${target_price:.2f} must be above entry ${entry_price:.2f}.", parent=self.root)
+            return
 
-        if action == 'BUY':
-            if target_price > 0:
-                trailing_pct = 0  # manual TP replaces trailing stop
-            else:
-                trailing_pct = BRACKET_TRAILING_PROFIT_PCT
-        elif action == 'SELL' and remaining > 0:
-            # Partial sell — set stop-loss on remaining shares
-            stop_remaining_qty = remaining
+        # Qty based on buying power
+        bp = self._cached_buying_power
+        nl = self._cached_net_liq
+        if nl <= 0:
+            messagebox.showwarning("No Data", "Waiting for account data from IBKR...", parent=self.root)
+            return
+        avail = bp if bp > 0 else nl
+        buy_limit = round(entry_price, 2)
+        qty = int(avail * 0.80 / buy_limit)
+        if qty <= 0:
+            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
+            return
 
-        # VWAP distance warning (only when price is BELOW VWAP)
+        # Confirmation dialog
+        tp_line = f"TP: ${target_price:.2f} [LMT SELL GTC]" if target_price > 0 else "TP: (none, trailing 3%)"
+        trailing_pct = 0.0 if target_price > 0 else BRACKET_TRAILING_PROFIT_PCT
+
+        # VWAP distance warning
         vwap_warning = ""
         stock_data = self._stocks.get(sym, {})
         vwap_val = stock_data.get('vwap', 0)
-        if action == 'BUY' and vwap_val > 0 and price < vwap_val:
-            vwap_dist_pct = (vwap_val - price) / price * 100
-            vwap_warning = f"\n⚠️ מתחת ל-VWAP! מחיר ${price:.2f} < VWAP ${vwap_val:.2f} (מרחק {vwap_dist_pct:.1f}%)\n"
+        if vwap_val > 0 and entry_price < vwap_val:
+            vwap_dist_pct = (vwap_val - entry_price) / entry_price * 100
+            vwap_warning = f"\nBelow VWAP! ${entry_price:.2f} < VWAP ${vwap_val:.2f} ({vwap_dist_pct:.1f}%)\n"
 
-        # Confirmation dialog
-        if action == 'BUY':
-            if target_price > 0:
-                tp_line = f"🎯 Take-Profit: ${target_price:.2f} (manual) [LMT SELL GTC]"
-            else:
-                tp_line = f"📈 Trailing: {trailing_pct}% trailing stop [GTC]"
-            confirm = messagebox.askokcancel(
-                "Confirm Order",
-                f"BUY {qty} {sym} @ ${buy_price:.2f} (מחיר נוכחי ${price:.2f} +1%)\n"
-                f"Total: ${qty * buy_price:,.2f}\n\n"
-                f"🛑 Stop: {stop_desc}\n"
-                f"   → Limit ${limit_price:.2f} [STP LMT GTC]\n"
-                f"{tp_line}"
-                f"{vwap_warning}\n\n"
-                f"outsideRth=True (pre/post market OK)\n"
-                f"TIF: DAY (buy) + GTC (stop/trail)\n"
-                f"Continue?",
-                parent=self.root,
-            )
-        else:
-            sell_lines = [
-                f"SELL {qty} {sym} @ ${price:.2f}",
-                f"Total: ${qty * price:,.2f}",
-            ]
-            if stop_remaining_qty > 0:
-                sell_lines.append(f"\n🛑 Stop on remaining {stop_remaining_qty}sh:")
-                sell_lines.append(f"   {stop_desc}")
-                sell_lines.append(f"   → Limit ${limit_price:.2f} [STP LMT GTC]")
-            sell_lines.append(f"\noutsideRth=True (pre/post market OK)")
-            sell_lines.append("Continue?")
-            confirm = messagebox.askokcancel("Confirm Order", "\n".join(sell_lines), parent=self.root)
+        confirm = messagebox.askokcancel(
+            "Confirm Planned BUY",
+            f"BUY {qty} {sym} @ ${buy_limit:.2f}\n"
+            f"Total: ${qty * buy_limit:,.2f}\n\n"
+            f"Stop: ${stop_price:.2f} (limit ${limit_price:.2f}) [STP LMT GTC]\n"
+            f"{tp_line}\n"
+            f"OCA: Stop + TP cancel each other"
+            f"{vwap_warning}\n\n"
+            f"outsideRth=True | Continue?",
+            parent=self.root,
+        )
         if not confirm:
             return
 
-        order_price = buy_price if action == 'BUY' else price
-        req = {'sym': sym, 'action': action, 'qty': qty, 'price': order_price}
-        if action == 'BUY':
-            req['stop_price'] = stop_price
-            req['limit_price'] = limit_price
-            req['trailing_pct'] = trailing_pct
-            req['stop_desc'] = stop_desc
-            if target_price > 0:
-                req['target_price'] = target_price
-        elif stop_remaining_qty > 0:
-            req['stop_remaining_qty'] = stop_remaining_qty
-            req['stop_price'] = stop_price
-            req['limit_price'] = limit_price
-            req['stop_desc'] = stop_desc
-        self._order_thread.submit(req)
-        log.info(f"Order submitted: {req}")
-        if action == 'BUY':
-            tp_info = f"TP ${target_price:.2f}" if target_price > 0 else f"Trail {trailing_pct}%"
-            self._order_status_var.set(
-                f"Sending: BUY {qty} {sym} @ ${buy_price:.2f} (+1%) | Stop {stop_desc} | {tp_info}...")
+        req = {
+            'sym': sym, 'action': 'BUY', 'qty': qty, 'price': buy_limit,
+            'stop_price': stop_price,
+            'limit_price': limit_price,
+            'stop_desc': f"${stop_price:.2f} (planned)",
+        }
+        if target_price > 0:
+            req['target_price'] = target_price
+            req['trailing_pct'] = 0.0
         else:
-            stop_info = f" | Stop {stop_remaining_qty}sh {stop_desc}" if stop_remaining_qty > 0 else ""
-            self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}{stop_info}...")
-        self._order_status_label.config(fg="#ffcc00")
+            req['trailing_pct'] = trailing_pct
+        self._order_thread.submit(req)
+        log.info(f"PLANNED BUY submitted: {req}")
+        tp_info = f"TP ${target_price:.2f}" if target_price > 0 else f"Trail {trailing_pct}%"
+        self._order_status_var.set(
+            f"PLANNED BUY {qty} {sym} @ ${buy_limit:.2f} | Stop ${stop_price:.2f} | {tp_info}")
+        self._order_status_label.config(fg="#448aff")
+
+    def _planned_sell(self):
+        """Planned Sell: sell position with stop on remaining shares. With confirmation dialog."""
+        result = self._validate_order_prereqs()
+        if not result:
+            return
+        sym, price = result
+        log.info(f"_planned_sell called: sym={sym}")
+
+        pos = self._cached_positions.get(sym)
+        if not pos or pos[0] == 0:
+            messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
+            return
+        total_qty = abs(pos[0])
+
+        # Read stop/tp fields
+        try:
+            stop_str = self._stop_entry.get().strip()
+            stop_price = float(stop_str) if stop_str else 0.0
+        except (ValueError, TypeError):
+            stop_price = 0.0
+
+        try:
+            tp_str = self._tp_entry.get().strip()
+            sell_price_val = float(tp_str) if tp_str else price
+        except (ValueError, TypeError):
+            sell_price_val = price
+
+        sell_price = round(sell_price_val, 2)
+        if sell_price <= 0:
+            sell_price = round(price, 2)
+
+        # Confirmation
+        stop_info = ""
+        if stop_price > 0:
+            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+            stop_info = f"\nStop on remaining: ${stop_price:.2f} (limit ${limit_price:.2f}) [STP LMT GTC]"
+
+        confirm = messagebox.askokcancel(
+            "Confirm Planned SELL",
+            f"SELL {total_qty} {sym} @ ${sell_price:.2f}\n"
+            f"Total: ${total_qty * sell_price:,.2f}"
+            f"{stop_info}\n\n"
+            f"outsideRth=True | Continue?",
+            parent=self.root,
+        )
+        if not confirm:
+            return
+
+        req = {
+            'sym': sym, 'action': 'SELL', 'qty': total_qty, 'price': sell_price,
+            'cancel_existing': True,
+        }
+        if stop_price > 0:
+            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+            req['stop_price'] = stop_price
+            req['limit_price'] = limit_price
+            req['stop_desc'] = f"${stop_price:.2f} (planned)"
+        self._order_thread.submit(req)
+        log.info(f"PLANNED SELL submitted: {req}")
+        self._order_status_var.set(
+            f"PLANNED SELL {total_qty} {sym} @ ${sell_price:.2f}")
+        self._order_status_label.config(fg="#ff80ab")
 
     def _close_all_position(self):
         """Close entire position for selected symbol — aggressive limit $0.50 below current price."""
@@ -7486,6 +7799,10 @@ class App:
     def _push_alert(self, msg: str):
         """Add alert message to alerts panel (GUI thread safe)."""
         ts = datetime.now().strftime('%H:%M:%S')
+        try:
+            msg = bidi_display(msg)
+        except Exception:
+            pass
         line = f"[{ts}] {msg}\n"
         # Determine color tag based on alert type
         ml = msg.lower()
