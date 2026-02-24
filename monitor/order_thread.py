@@ -348,6 +348,16 @@ class OrderThread(threading.Thread):
                 stop_msg = f" | Stop ${stop_price:.2f} ({stop_status})"
                 log.info(f"Stop-loss placed: SELL {qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
 
+            # Place stop-loss on remaining shares for partial SELL orders
+            stop_remaining_qty = req.get('stop_remaining_qty', 0)
+            if action == 'SELL' and stop_remaining_qty > 0 and stop_price > 0:
+                stop_order = _make_stop_limit('SELL', stop_remaining_qty, stop_price, limit_price)
+                stop_trade = ib.placeOrder(contract, stop_order)
+                ib.sleep(1)
+                stop_status = stop_trade.orderStatus.status
+                stop_msg = f" | Stop {stop_remaining_qty}sh ${stop_price:.2f} ({stop_status})"
+                log.info(f"Stop-loss on remaining: SELL {stop_remaining_qty} {sym} @ ${stop_price:.2f} (STP LMT) — {stop_status}")
+
             # Place trailing take-profit for BUY orders
             trailing_pct = req.get('trailing_pct', 0)
             trail_msg = ""
@@ -374,6 +384,14 @@ class OrderThread(threading.Thread):
                     tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
                 tg_lines.append(f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop/trail)")
                 self._telegram("\n".join(tg_lines))
+            elif action == 'SELL' and stop_remaining_qty > 0 and stop_price > 0:
+                self._telegram(
+                    f"📋 <b>Order Placed + Stop on Remaining</b>\n"
+                    f"  SELL {qty} {sym} @ ${price:.2f}\n"
+                    f"  Status: {status}\n"
+                    f"  🛑 Stop on remaining {stop_remaining_qty}sh: {stop_desc} → Lmt ${limit_price:.2f} [STP LMT GTC]\n"
+                    f"  outsideRth: ✓  |  TIF: DAY (sell) + GTC (stop)"
+                )
             else:
                 self._telegram(
                     f"📋 <b>Order Placed</b>\n"

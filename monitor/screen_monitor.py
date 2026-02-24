@@ -2236,6 +2236,7 @@ VOL_ALERT_RVOL_MIN = 3.0  # minimum RVOL for volume alert
 
 _DOJI_COOLDOWN_SEC = 300  # 5 min cooldown per symbol+timeframe
 _doji_alerted: dict[str, float] = {}  # "SYM_5m" → timestamp
+_doji_pending: dict[str, tuple[float, float, str]] = {}  # "SYM_5m" → (doji_high, timestamp, tf_label)
 
 
 def _reset_alerts_if_new_day():
@@ -2256,6 +2257,7 @@ def _reset_alerts_if_new_day():
         _spike_alerted.clear()
         _vol_alert_sent.clear()
         _doji_alerted.clear()
+        _doji_pending.clear()
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
@@ -2525,15 +2527,45 @@ def check_volume_alert(sym: str, price: float, vwap: float,
 
 
 def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
-    """Alert on Doji candles using CACHED bars only (no new IBKR downloads).
+    """Alert on Doji breakout — only when price breaks above a completed Doji's high.
 
-    Only checks timeframes that are already in _intraday_cache from other
-    functions (stock reports, GG/MR strategies).  This avoids 95+ IBKR
-    requests per cycle that were causing 60-90s delays.
+    Two-phase detection using CACHED bars only (no new IBKR downloads):
+      1. Detect completed Doji candle → store its high in _doji_pending
+      2. On next cycle, if price > doji_high → fire alert and clear pending
+
+    Doji criteria: body ≤ 10% of range, range ≥ 0.3% of price.
+    Pending dojis expire after 10 minutes (no breakout = invalidated).
     """
     if sym not in _enrichment:
         return None
 
+    now = time_mod.time()
+
+    # ── Phase 2: Check if price breaks above any pending doji high ──
+    breakout_hits = []
+    expired = []
+    for key, (doji_high, doji_ts, tf_label) in _doji_pending.items():
+        if not key.startswith(f"{sym}_"):
+            continue
+        # Expire pending dojis after 10 minutes
+        if now - doji_ts > 600:
+            expired.append(key)
+            continue
+        if price > doji_high:
+            breakout_hits.append((tf_label, doji_high))
+            expired.append(key)
+    for key in expired:
+        _doji_pending.pop(key, None)
+
+    if breakout_hits:
+        tfs = ", ".join(tf for tf, _ in breakout_hits)
+        doji_h = breakout_hits[0][1]
+        return (
+            f"🟡 🔺 <b>Doji Breakout [{tfs}]</b> — {sym}\n"
+            f"💰 ${price:.2f} שבר מעל דוג'י ${doji_h:.4f} | {pct:+.1f}%"
+        )
+
+    # ── Phase 1: Detect new completed Doji candles → store pending ──
     tf_specs = [
         ('1 min',   '1m'),
         ('5 mins',  '5m'),
@@ -2541,15 +2573,15 @@ def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
         ('30 mins', '30m'),
         ('1 hour',  '1h'),
     ]
-    doji_hits = []
-    now = time_mod.time()
 
     for bar_size, tf_label in tf_specs:
         cooldown_key = f"{sym}_{tf_label}"
         if now - _doji_alerted.get(cooldown_key, 0) < _DOJI_COOLDOWN_SEC:
             continue
+        # Already have a pending doji for this sym+tf
+        if cooldown_key in _doji_pending:
+            continue
 
-        # Cache-only: skip if bars not already cached
         cache_key = f"{sym}_{bar_size}"
         entry = _intraday_cache.get(cache_key)
         if not entry:
@@ -2561,22 +2593,19 @@ def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
             continue
 
         # Use second-to-last bar (completed), not last (still forming)
-        last = df.iloc[-2]
-        o, h, l, c = last['open'], last['high'], last['low'], last['close']
+        bar = df.iloc[-2]
+        o, h, l, c = bar['open'], bar['high'], bar['low'], bar['close']
         total_range = h - l
         if total_range <= 0 or h <= 0:
             continue
         body = abs(c - o)
-        # Doji: body ≤ 10% of range, range ≥ 0.3% of price (not flat)
         if body <= total_range * 0.10 and total_range / h >= 0.003:
-            doji_hits.append(tf_label)
+            # Doji detected — store high as breakout level
+            _doji_pending[cooldown_key] = (h, now, tf_label)
             _doji_alerted[cooldown_key] = now
+            log.info(f"Doji detected [{tf_label}] {sym}: high=${h:.4f} — waiting for breakout")
 
-    if not doji_hits:
-        return None
-
-    tf_str = ", ".join(doji_hits)
-    return f"🟡 ⏸️ <b>Doji [{tf_str}]</b> — {sym}  ${price:.2f}  {pct:+.1f}%"
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -6445,8 +6474,9 @@ class App:
     def _place_order(self, action: str, pct: float):
         """Validate and send a BUY or SELL order to the OrderThread."""
         sym = self._selected_symbol_name
+        log.info(f"_place_order called: {action} {pct*100:.0f}% sym={sym}")
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
+            messagebox.showwarning("No Stock", "בחר מניה לפני ביצוע פקודה.", parent=self.root)
             return
 
         try:
@@ -6454,17 +6484,28 @@ class App:
             if price <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
+            messagebox.showwarning("Invalid Price", "הכנס מחיר תקין.", parent=self.root)
             return
 
         if not self._order_thread.connected:
-            messagebox.showwarning("Not Connected", "Order thread not connected to IBKR.", parent=self.root)
+            messagebox.showwarning(
+                "Not Connected",
+                "OrderThread לא מחובר ל-IBKR.\n\n"
+                "ודא ש-TWS רץ עם API על פורט 7497.\n"
+                f"סטטוס: {self.conn_var.get()}",
+                parent=self.root,
+            )
             return
 
         if action == 'BUY':
             nl = self._cached_net_liq
             if nl <= 0:
-                messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
+                messagebox.showwarning(
+                    "No Data",
+                    "ממתין לנתוני חשבון מ-IBKR...\n"
+                    "נסה שוב בעוד כמה שניות.",
+                    parent=self.root,
+                )
                 return
             qty = int(nl * 0.95 * pct / price)
             if qty <= 0:
@@ -6475,35 +6516,43 @@ class App:
         else:  # SELL
             pos = self._cached_positions.get(sym)
             if not pos or pos[0] == 0:
-                messagebox.showwarning("No Position", f"No position in {sym}.", parent=self.root)
+                messagebox.showwarning("No Position", f"אין פוזיציה ב-{sym}.", parent=self.root)
                 return
-            # abs() handles both long (positive) and short (negative) positions
-            qty = max(1, int(abs(pos[0]) * pct))
+            total_qty = abs(pos[0])
+            qty = max(1, int(total_qty * pct))
+            remaining = total_qty - qty
+            log.info(f"SELL: {sym} total={total_qty} sell={qty} remaining={remaining}")
 
-        # BUY orders: fib-based stop-loss + trailing take-profit
+        # ── Stop-loss calculation (for both BUY and partial SELL) ──
         stop_price = 0.0
         limit_price = 0.0
         trailing_pct = 0.0
-        stop_desc = ""       # human-readable for confirmation + Telegram
-        if action == 'BUY':
-            # Find nearest fib support for smart stop-loss
-            with _fib_cache_lock:
-                cached = _fib_cache.get(sym)
-            if cached:
-                _al, _ah, all_levels, _rm, *_ = cached
-                supports = [lv for lv in all_levels if lv <= price]
-                if supports:
-                    nearest_support = supports[-1]
-                    stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
-                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
-                else:
-                    stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-                    stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
+        stop_desc = ""
+        stop_remaining_qty = 0  # for partial SELL: stop on remaining shares
+
+        # Find nearest fib support for smart stop-loss
+        with _fib_cache_lock:
+            cached = _fib_cache.get(sym)
+        if cached:
+            _al, _ah, all_levels, _rm, *_ = cached
+            supports = [lv for lv in all_levels if lv <= price]
+            if supports:
+                nearest_support = supports[-1]
+                stop_price = round(nearest_support * (1 - BRACKET_FIB_STOP_PCT), 2)
+                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% below fib ${nearest_support:.4f})"
             else:
                 stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
-                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
-            limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+                stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib support)"
+        else:
+            stop_price = round(price * (1 - BRACKET_FIB_STOP_PCT), 2)
+            stop_desc = f"${stop_price:.2f} ({BRACKET_FIB_STOP_PCT*100:.0f}% fallback, no fib data)"
+        limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+
+        if action == 'BUY':
             trailing_pct = BRACKET_TRAILING_PROFIT_PCT
+        elif action == 'SELL' and remaining > 0:
+            # Partial sell — set stop-loss on remaining shares
+            stop_remaining_qty = remaining
 
         # Confirmation dialog
         if action == 'BUY':
@@ -6520,14 +6569,17 @@ class App:
                 parent=self.root,
             )
         else:
-            confirm = messagebox.askokcancel(
-                "Confirm Order",
-                f"SELL {qty} {sym} @ ${price:.2f}\n"
-                f"Total: ${qty * price:,.2f}\n\n"
-                f"outsideRth=True (pre/post market OK)\n"
-                f"Continue?",
-                parent=self.root,
-            )
+            sell_lines = [
+                f"SELL {qty} {sym} @ ${price:.2f}",
+                f"Total: ${qty * price:,.2f}",
+            ]
+            if stop_remaining_qty > 0:
+                sell_lines.append(f"\n🛑 Stop on remaining {stop_remaining_qty}sh:")
+                sell_lines.append(f"   {stop_desc}")
+                sell_lines.append(f"   → Limit ${limit_price:.2f} [STP LMT GTC]")
+            sell_lines.append(f"\noutsideRth=True (pre/post market OK)")
+            sell_lines.append("Continue?")
+            confirm = messagebox.askokcancel("Confirm Order", "\n".join(sell_lines), parent=self.root)
         if not confirm:
             return
 
@@ -6537,12 +6589,19 @@ class App:
             req['limit_price'] = limit_price
             req['trailing_pct'] = trailing_pct
             req['stop_desc'] = stop_desc
+        elif stop_remaining_qty > 0:
+            req['stop_remaining_qty'] = stop_remaining_qty
+            req['stop_price'] = stop_price
+            req['limit_price'] = limit_price
+            req['stop_desc'] = stop_desc
         self._order_thread.submit(req)
+        log.info(f"Order submitted: {req}")
         if action == 'BUY':
             self._order_status_var.set(
                 f"Sending: BUY {qty} {sym} @ ${price:.2f} | Stop {stop_desc} | Trail {trailing_pct}%...")
         else:
-            self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}...")
+            stop_info = f" | Stop {stop_remaining_qty}sh {stop_desc}" if stop_remaining_qty > 0 else ""
+            self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}{stop_info}...")
         self._order_status_label.config(fg="#ffcc00")
 
     def _place_fib_dt_order(self):
