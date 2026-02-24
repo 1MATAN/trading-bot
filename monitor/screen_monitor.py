@@ -410,6 +410,7 @@ def _get_market_session() -> str:
     return 'closed'
 
 
+
 def _expected_volume_fraction() -> float:
     """Expected fraction of daily volume traded by current time of day.
 
@@ -6452,7 +6453,13 @@ class App:
         turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
         is_hot = turnover >= 10.0  # volume > 10% of float
 
+        # Country tag (non-USA only)
+        _country = enrich.get('country', '') if enrich else ''
+        _ctag = f"[{_country}]" if _country and _country not in ('USA', '-', '') else ''
+
         sym_text = f"🔥{sym}" if is_hot else sym
+        if _ctag:
+            sym_text = f"{sym_text} {_ctag}"
         sym_fg = "#ff6600" if is_hot else self.FG
 
         pct = d['pct']
@@ -6543,7 +6550,7 @@ class App:
         row1.bind('<Double-Button-1>', _dbl_click)
 
         sym_lbl = tk.Label(row1, text=rd['sym_text'], font=font_b,
-                           bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
+                           bg=rd['bg'], fg=rd['sym_fg'], width=10, anchor='w')
         sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
 
         price_lbl = tk.Label(row1, text=rd['price_text'], font=font_r,
@@ -6819,7 +6826,7 @@ class App:
             tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#1b5e20", fg="white", activebackground="#2e7d32",
                       relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('BUY', p / 100)
+                      command=lambda p=pct: self._place_order('BUY', p / 100, skip_manual=True)
                       ).pack(side='left', padx=1)
 
         tk.Button(row2, text="CLOSE ALL", font=("Helvetica", 12, "bold"),
@@ -6831,10 +6838,10 @@ class App:
             tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#b71c1c", fg="white", activebackground="#c62828",
                       relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('SELL', p / 100)
+                      command=lambda p=pct: self._place_order('SELL', p / 100, skip_manual=True)
                       ).pack(side='left', padx=1)
 
-        # Row 3: Manual Stop / Take-Profit
+        # Row 3: Planned Mode — Stop/TP + % radio + BUY/SELL fire buttons
         row3 = tk.Frame(panel, bg=self.BG)
         row3.pack(fill='x', pady=2)
         tk.Label(row3, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
@@ -6845,7 +6852,27 @@ class App:
         self._tp_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
                                   insertbackground="white", relief='flat')
         self._tp_entry.pack(side='left', padx=2)
-        tk.Label(row3, text="(empty = auto)", font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
+
+        # % radio selector
+        self._planned_pct_var = tk.IntVar(value=100)
+        for p in [25, 50, 75, 100]:
+            tk.Radiobutton(row3, text=f"{p}%", variable=self._planned_pct_var, value=p,
+                           font=("Helvetica", 10), bg=self.BG, fg="#ccc",
+                           selectcolor="#333", activebackground=self.BG, activeforeground="white",
+                           indicatoron=True, highlightthickness=0,
+                           ).pack(side='left', padx=1)
+
+        # Fire buttons
+        tk.Button(row3, text="BUY", font=("Helvetica", 12, "bold"),
+                  bg="#1b5e20", fg="white", activebackground="#2e7d32",
+                  relief='flat', padx=8, pady=1,
+                  command=lambda: self._place_order('BUY', self._planned_pct_var.get() / 100)
+                  ).pack(side='left', padx=(6, 2))
+        tk.Button(row3, text="SELL", font=("Helvetica", 12, "bold"),
+                  bg="#b71c1c", fg="white", activebackground="#c62828",
+                  relief='flat', padx=8, pady=1,
+                  command=lambda: self._place_order('SELL', self._planned_pct_var.get() / 100)
+                  ).pack(side='left', padx=2)
 
         # Order status
         self._order_status_var = tk.StringVar(value="")
@@ -7078,7 +7105,7 @@ class App:
             self._order_status_label.config(fg=self.GREEN if success else self.RED)
         self.root.after(0, _update)
 
-    def _place_order(self, action: str, pct: float):
+    def _place_order(self, action: str, pct: float, skip_manual: bool = False):
         """Validate and send a BUY or SELL order to the OrderThread."""
         sym = self._selected_symbol_name
         log.info(f"_place_order called: {action} {pct*100:.0f}% sym={sym}")
@@ -7136,25 +7163,26 @@ class App:
             remaining = total_qty - qty
             log.info(f"SELL: {sym} total={total_qty} sell={qty} remaining={remaining}")
 
-        # ── Read manual Stop / TP from GUI ──
+        # ── Read manual Stop / TP from GUI (skip for quick buttons) ──
         manual_stop = 0.0
         manual_tp = 0.0
-        try:
-            _s = self._stop_entry.get().strip()
-            if _s:
-                manual_stop = float(_s)
-                if manual_stop <= 0:
-                    manual_stop = 0.0
-        except ValueError:
-            pass
-        try:
-            _t = self._tp_entry.get().strip()
-            if _t:
-                manual_tp = float(_t)
-                if manual_tp <= 0:
-                    manual_tp = 0.0
-        except ValueError:
-            pass
+        if not skip_manual:
+            try:
+                _s = self._stop_entry.get().strip()
+                if _s:
+                    manual_stop = float(_s)
+                    if manual_stop <= 0:
+                        manual_stop = 0.0
+            except ValueError:
+                pass
+            try:
+                _t = self._tp_entry.get().strip()
+                if _t:
+                    manual_tp = float(_t)
+                    if manual_tp <= 0:
+                        manual_tp = 0.0
+            except ValueError:
+                pass
 
         # ── Stop-loss calculation (for both BUY and partial SELL) ──
         stop_price = 0.0
@@ -7209,6 +7237,9 @@ class App:
             vwap_warning = f"\n⚠️ מתחת ל-VWAP! מחיר ${price:.2f} < VWAP ${vwap_val:.2f} (מרחק {vwap_dist_pct:.1f}%)\n"
 
         # Confirmation dialog
+        session = _get_market_session()
+        outside_rth = session != 'market'
+        rth_text = f"outsideRth={'Yes' if outside_rth else 'No'} ({session})"
         if action == 'BUY':
             if target_price > 0:
                 tp_line = f"🎯 Take-Profit: ${target_price:.2f} (manual) [LMT SELL GTC]"
@@ -7222,7 +7253,7 @@ class App:
                 f"   → Limit ${limit_price:.2f} [STP LMT GTC]\n"
                 f"{tp_line}"
                 f"{vwap_warning}\n\n"
-                f"outsideRth=True (pre/post market OK)\n"
+                f"{rth_text}\n"
                 f"TIF: DAY (buy) + GTC (stop/trail)\n"
                 f"Continue?",
                 parent=self.root,
@@ -7236,7 +7267,7 @@ class App:
                 sell_lines.append(f"\n🛑 Stop on remaining {stop_remaining_qty}sh:")
                 sell_lines.append(f"   {stop_desc}")
                 sell_lines.append(f"   → Limit ${limit_price:.2f} [STP LMT GTC]")
-            sell_lines.append(f"\noutsideRth=True (pre/post market OK)")
+            sell_lines.append(f"\n{rth_text}")
             sell_lines.append("Continue?")
             confirm = messagebox.askokcancel("Confirm Order", "\n".join(sell_lines), parent=self.root)
         if not confirm:
@@ -7310,6 +7341,9 @@ class App:
         pnl_est = (current_price - avg_cost) * qty
         pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
 
+        session = _get_market_session()
+        outside_rth = session != 'market'
+        rth_text = f"outsideRth={'Yes' if outside_rth else 'No'} ({session})"
         confirm = messagebox.askokcancel(
             "⚠️ CLOSE ALL",
             f"סגירת כל הפוזיציה ב-{sym}\n\n"
@@ -7318,7 +7352,7 @@ class App:
             f"Limit: ${sell_price:.2f} (−${offset:.2f} למילוי מיידי)\n"
             f"עלות ממוצעת: ${avg_cost:.4f}\n"
             f"רווח/הפסד משוער: ${pnl_est:+,.2f} ({pnl_pct:+.1f}%)\n\n"
-            f"outsideRth=True\n"
+            f"{rth_text}\n"
             f"Continue?",
             parent=self.root,
         )

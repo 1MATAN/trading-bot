@@ -366,8 +366,12 @@ class OrderThread(threading.Thread):
                     ib.sleep(1)  # wait for cancellations to process
                     log.info(f"Cancelled {cancelled} open order(s) for {sym}")
 
+            from monitor.screen_monitor import _get_market_session
+            session = _get_market_session()
+            outside_rth = session != 'market'
+
             order = LimitOrder(action, qty, price)
-            order.outsideRth = True
+            order.outsideRth = outside_rth
             order.tif = 'DAY'
             trade = ib.placeOrder(contract, order)
             ib.sleep(3)  # wait for async status callback
@@ -460,7 +464,8 @@ class OrderThread(threading.Thread):
                     tg_lines.append(f"  🔗 OCA: Stop ↔ TP (אחד מבטל את השני)")
                 elif trailing_pct > 0:
                     tg_lines.append(f"  📈 Trail: {trailing_pct}% trailing stop [GTC]")
-                tg_lines.append(f"  outsideRth: ✓  |  TIF: DAY (buy) + GTC (stop/trail)")
+                rth_icon = "✓" if outside_rth else "✗"
+                tg_lines.append(f"  outsideRth: {rth_icon}  |  TIF: DAY (buy) + GTC (stop/trail)")
                 self._telegram("\n".join(tg_lines))
             elif action == 'SELL' and stop_remaining_qty > 0 and stop_price > 0:
                 self._telegram(
@@ -468,14 +473,14 @@ class OrderThread(threading.Thread):
                     f"  SELL {qty} {sym} @ ${price:.2f}\n"
                     f"  Status: {status}\n"
                     f"  🛑 Stop on remaining {stop_remaining_qty}sh: {stop_desc} → Lmt ${limit_price:.2f} [STP LMT GTC]\n"
-                    f"  outsideRth: ✓  |  TIF: DAY (sell) + GTC (stop)"
+                    f"  outsideRth: {'✓' if outside_rth else '✗'}  |  TIF: DAY (sell) + GTC (stop)"
                 )
             else:
                 self._telegram(
                     f"📋 <b>Order Placed</b>\n"
                     f"  {action} {qty} {sym} @ ${price:.2f}\n"
                     f"  Status: {status}\n"
-                    f"  outsideRth: ✓  |  TIF: DAY"
+                    f"  outsideRth: {'✓' if outside_rth else '✗'}  |  TIF: DAY"
                 )
         except Exception as e:
             msg = f"Order failed: {action} {qty} {sym} — {e}"
