@@ -129,7 +129,11 @@ class OrderThread(threading.Thread):
         self._running = True
         self._connect()
 
-        last_account = 0.0
+        # Fetch account data immediately after connection (don't wait 5s)
+        if self._ib and self._ib.isConnected():
+            self._fetch_account_data()
+
+        last_account = time_mod.time()
         while self._running:
             # Process all pending orders immediately
             had_orders = False
@@ -183,6 +187,16 @@ class OrderThread(threading.Thread):
                              clientId=MONITOR_ORDER_CLIENT_ID,
                              timeout=_CONNECT_TIMEOUT)
             log.info(f"OrderThread: IBKR connected (clientId={MONITOR_ORDER_CLIENT_ID})")
+
+            # Subscribe to account updates so IBKR pushes data to this clientId.
+            # Without this, accountValues()/portfolio() may return empty.
+            try:
+                self._ib.reqAccountUpdates(subscribe=True, account="")
+                self._ib.sleep(1)  # give TWS a moment to send initial snapshot
+                log.info("OrderThread: subscribed to account updates")
+            except Exception as e:
+                log.warning(f"OrderThread: reqAccountUpdates failed: {e}")
+
             return True
         except Exception as e:
             log.error(f"OrderThread: IBKR connect failed: {e}")
@@ -228,10 +242,15 @@ class OrderThread(threading.Thread):
 
         ib = self._ensure_connected()
         if not ib:
+            log.warning("OrderThread: cannot fetch account — not connected")
             return
         try:
-            ib.sleep(0.1)  # pump event loop to get latest TWS data
+            ib.sleep(0.2)  # pump event loop to get latest TWS data
             acct_vals = ib.accountValues()
+            if not acct_vals:
+                log.warning("OrderThread: accountValues() returned empty — waiting for subscription data")
+                ib.sleep(1)  # give more time for TWS to send data
+                acct_vals = ib.accountValues()
             net_liq = 0.0
             buying_power = 0.0
             for av in acct_vals:
@@ -264,6 +283,22 @@ class OrderThread(threading.Thread):
                     round(item.marketPrice, 4),
                     round(item.unrealizedPNL, 2),
                 )
+
+            # If NetLiq is 0, subscription may not be active — re-subscribe
+            if net_liq <= 0 and ib.isConnected():
+                log.warning("OrderThread: NetLiq=0, re-subscribing to account updates")
+                try:
+                    ib.reqAccountUpdates(subscribe=True, account="")
+                    ib.sleep(1)
+                    # Retry
+                    acct_vals = ib.accountValues()
+                    for av in acct_vals:
+                        if av.tag == 'NetLiquidation' and av.currency == 'USD':
+                            net_liq = float(av.value)
+                        elif av.tag == 'BuyingPower' and av.currency == 'USD':
+                            buying_power = float(av.value)
+                except Exception as e:
+                    log.warning(f"OrderThread: re-subscribe failed: {e}")
 
             self.net_liq = net_liq
             self.buying_power = buying_power

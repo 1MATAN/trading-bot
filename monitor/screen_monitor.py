@@ -5829,8 +5829,13 @@ class App:
         except Exception:
             scan_ok = False
         order_ok = self._order_thread.connected
+        nl = self._cached_net_liq
+        n_pos = len(self._cached_positions)
+
         if scan_ok and order_ok:
-            self.conn_var.set("Scan ✓ | Orders ✓")
+            acct_info = f"${nl:,.0f}" if nl > 0 else "..."
+            pos_info = f" | {n_pos} pos" if n_pos > 0 else ""
+            self.conn_var.set(f"Scan ✓ | Orders ✓ | {acct_info}{pos_info}")
             self.conn_label.config(fg=self.GREEN)
         elif order_ok:
             self.conn_var.set("Scan ✗ | Orders ✓")
