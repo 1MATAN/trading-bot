@@ -6234,10 +6234,10 @@ class App:
                       command=lambda p=pct: self._place_order('BUY', p / 100)
                       ).pack(side='left', padx=1)
 
-        tk.Button(row2, text="FIB DT", font=("Helvetica", 12, "bold"),
-                  bg="#00838f", fg="white", activebackground="#00acc1",
-                  relief='flat', padx=6, pady=1,
-                  command=self._place_fib_dt_order).pack(side='left', padx=4)
+        tk.Button(row2, text="CLOSE ALL", font=("Helvetica", 12, "bold"),
+                  bg="#e6a800", fg="black", activebackground="#ffc107",
+                  relief='flat', padx=8, pady=1,
+                  command=self._close_all_position).pack(side='left', padx=4)
 
         for pct in [25, 50, 75, 100]:
             tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 12, "bold"),
@@ -6610,85 +6610,56 @@ class App:
             self._order_status_var.set(f"Sending: SELL {qty} {sym} @ ${price:.2f}{stop_info}...")
         self._order_status_label.config(fg="#ffcc00")
 
-    def _place_fib_dt_order(self):
-        """Validate and send a Fib Double-Touch split-exit bracket order to OrderThread."""
+    def _close_all_position(self):
+        """Close entire position for selected symbol — aggressive limit $0.50 below current price."""
         sym = self._selected_symbol_name
+        log.info(f"_close_all_position called: sym={sym}")
         if not sym or sym == "---":
-            messagebox.showwarning("No Stock", "Select a stock first.", parent=self.root)
-            return
-
-        try:
-            entry_price = float(self._trade_price.get())
-            if entry_price <= 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            messagebox.showwarning("Invalid Price", "Enter a valid price.", parent=self.root)
+            messagebox.showwarning("No Stock", "בחר מניה לפני סגירה.", parent=self.root)
             return
 
         if not self._order_thread.connected:
-            messagebox.showwarning("Not Connected", "Order thread not connected to IBKR.", parent=self.root)
+            messagebox.showwarning(
+                "Not Connected",
+                "OrderThread לא מחובר ל-IBKR.\n"
+                f"סטטוס: {self.conn_var.get()}",
+                parent=self.root,
+            )
             return
 
-        # Look up fib levels
-        with _fib_cache_lock:
-            cached = _fib_cache.get(sym)
-        if not cached:
-            messagebox.showwarning("No Fib Data",
-                                   f"No Fibonacci data for {sym}.\nWait for enrichment.",
-                                   parent=self.root)
+        pos = self._cached_positions.get(sym)
+        if not pos or pos[0] == 0:
+            messagebox.showwarning("No Position", f"אין פוזיציה ב-{sym}.", parent=self.root)
             return
 
-        _anchor_low, _anchor_high, all_levels, _ratio_map, *_ = cached
-        if not all_levels:
-            messagebox.showwarning("No Fib Levels", f"Empty fib levels for {sym}.",
-                                   parent=self.root)
+        qty = abs(pos[0])
+        avg_cost = pos[1]
+
+        # Get current price from trade price field or scan data
+        try:
+            current_price = float(self._trade_price.get())
+            if current_price <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showwarning("Invalid Price", "הכנס מחיר תקין.", parent=self.root)
             return
 
-        # Nearest support fib = max level <= entry_price
-        supports = [lv for lv in all_levels if lv <= entry_price]
-        if not supports:
-            messagebox.showwarning("No Support", f"No fib support below ${entry_price:.2f}.",
-                                   parent=self.root)
-            return
-        nearest_support = supports[-1]  # all_levels is sorted
+        # Aggressive limit: $0.50 below current to ensure immediate fill
+        sell_price = round(current_price - 0.50, 2)
+        if sell_price <= 0:
+            sell_price = 0.01
 
-        # Stop price = nearest support × (1 - STOP_PCT)
-        stop_price = round(nearest_support * (1 - FIB_DT_LIVE_STOP_PCT), 2)
+        pnl_est = (current_price - avg_cost) * qty
+        pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
 
-        # Target = Nth fib level above entry
-        above_levels = [lv for lv in all_levels if lv > entry_price]
-        if len(above_levels) < FIB_DT_LIVE_TARGET_LEVELS:
-            messagebox.showwarning("Not Enough Levels",
-                                   f"Need {FIB_DT_LIVE_TARGET_LEVELS} fib levels above entry, "
-                                   f"only {len(above_levels)} available.",
-                                   parent=self.root)
-            return
-        target_price = round(above_levels[FIB_DT_LIVE_TARGET_LEVELS - 1], 2)
-
-        # Qty = 100% of NetLiq (not margin-inflated BuyingPower)
-        bp = self._cached_net_liq
-        if bp <= 0:
-            messagebox.showwarning("No Data", "Waiting for account data...", parent=self.root)
-            return
-        qty = int(bp * 0.95 / entry_price)
-        if qty <= 0:
-            messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
-            return
-
-        half = qty // 2
-        other_half = qty - half
-
-        # Confirmation dialog
         confirm = messagebox.askokcancel(
-            "FIB DT Order",
-            f"FIB DOUBLE-TOUCH — {sym}\n\n"
-            f"Entry: MARKET BUY {qty} shares\n"
-            f"Support: ${nearest_support:.4f}\n"
-            f"Stop: ${stop_price:.2f} (−{FIB_DT_LIVE_STOP_PCT*100:.0f}%)\n"
-            f"Target: ${target_price:.2f} (fib #{FIB_DT_LIVE_TARGET_LEVELS})\n\n"
-            f"Split exit:\n"
-            f"  OCA half: {half} shares (stop + target)\n"
-            f"  Standalone stop: {other_half} shares\n\n"
+            "⚠️ CLOSE ALL",
+            f"סגירת כל הפוזיציה ב-{sym}\n\n"
+            f"SELL {qty} shares\n"
+            f"מחיר נוכחי: ${current_price:.2f}\n"
+            f"Limit: ${sell_price:.2f} (−$0.50 למילוי מיידי)\n"
+            f"עלות ממוצעת: ${avg_cost:.4f}\n"
+            f"רווח/הפסד משוער: ${pnl_est:+,.2f} ({pnl_pct:+.1f}%)\n\n"
             f"outsideRth=True\n"
             f"Continue?",
             parent=self.root,
@@ -6697,16 +6668,12 @@ class App:
             return
 
         self._order_thread.submit({
-            'sym': sym, 'action': 'BUY', 'qty': qty, 'price': entry_price,
-            'strategy': 'fib_dt',
-            'stop_price': stop_price,
-            'target_price': target_price,
-            'half': half,
-            'other_half': other_half,
+            'sym': sym, 'action': 'SELL', 'qty': qty, 'price': sell_price,
         })
+        log.info(f"CLOSE ALL submitted: SELL {qty} {sym} @ ${sell_price:.2f} (limit)")
         self._order_status_var.set(
-            f"Sending: FIB DT {qty} {sym} | stop ${stop_price:.2f} | target ${target_price:.2f}")
-        self._order_status_label.config(fg="#ffcc00")
+            f"Sending: CLOSE ALL {qty} {sym} @ ${sell_price:.2f} (−$0.50)")
+        self._order_status_label.config(fg="#e6a800")
 
     def _toggle_sound(self):
         """Toggle sound alerts on/off."""
