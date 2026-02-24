@@ -6644,8 +6644,9 @@ class App:
             messagebox.showwarning("Invalid Price", "הכנס מחיר תקין.", parent=self.root)
             return
 
-        # Aggressive limit: $0.50 below current to ensure immediate fill
-        sell_price = round(current_price - 0.50, 2)
+        # Aggressive limit: 5% or $0.50 below current (whichever is smaller)
+        offset = min(0.50, current_price * 0.05)
+        sell_price = round(current_price - offset, 2)
         if sell_price <= 0:
             sell_price = 0.01
 
@@ -6657,7 +6658,7 @@ class App:
             f"סגירת כל הפוזיציה ב-{sym}\n\n"
             f"SELL {qty} shares\n"
             f"מחיר נוכחי: ${current_price:.2f}\n"
-            f"Limit: ${sell_price:.2f} (−$0.50 למילוי מיידי)\n"
+            f"Limit: ${sell_price:.2f} (−${offset:.2f} למילוי מיידי)\n"
             f"עלות ממוצעת: ${avg_cost:.4f}\n"
             f"רווח/הפסד משוער: ${pnl_est:+,.2f} ({pnl_pct:+.1f}%)\n\n"
             f"outsideRth=True\n"
@@ -6669,10 +6670,11 @@ class App:
 
         self._order_thread.submit({
             'sym': sym, 'action': 'SELL', 'qty': qty, 'price': sell_price,
+            'cancel_existing': True,  # cancel open orders first (stops etc.)
         })
         log.info(f"CLOSE ALL submitted: SELL {qty} {sym} @ ${sell_price:.2f} (limit)")
         self._order_status_var.set(
-            f"Sending: CLOSE ALL {qty} {sym} @ ${sell_price:.2f} (−$0.50)")
+            f"Sending: CLOSE ALL {qty} {sym} @ ${sell_price:.2f} (−${offset:.2f})")
         self._order_status_label.config(fg="#e6a800")
 
     def _toggle_sound(self):

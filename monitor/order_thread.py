@@ -350,6 +350,22 @@ class OrderThread(threading.Thread):
             if not contract:
                 raise RuntimeError(f"Could not qualify contract for {sym}")
 
+            # Cancel existing open orders for this symbol first (e.g. stop-losses)
+            if req.get('cancel_existing'):
+                open_trades = ib.openTrades()
+                cancelled = 0
+                for trade in open_trades:
+                    if trade.contract.symbol == sym and trade.orderStatus.status in (
+                        'PreSubmitted', 'Submitted', 'PendingSubmit'
+                    ):
+                        ib.cancelOrder(trade.order)
+                        cancelled += 1
+                        log.info(f"Cancelled open order: {trade.order.action} {trade.order.totalQuantity} {sym} "
+                                 f"({trade.order.orderType} @ ${trade.order.lmtPrice})")
+                if cancelled:
+                    ib.sleep(1)  # wait for cancellations to process
+                    log.info(f"Cancelled {cancelled} open order(s) for {sym}")
+
             order = LimitOrder(action, qty, price)
             order.outsideRth = True
             order.tif = 'DAY'
