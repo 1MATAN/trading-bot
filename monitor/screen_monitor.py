@@ -5059,14 +5059,16 @@ class FTVirtualPortfolio:
 
 class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
-                 on_status=None, on_stocks=None, on_alert=None):
+                 on_status=None, on_stocks=None, on_alert=None,
+                 on_price_update=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
         self.price_max = price_max
         self.on_status = on_status
-        self.on_stocks = on_stocks  # callback(dict) to update GUI table
+        self.on_stocks = on_stocks  # callback(dict) to update GUI table (full rebuild)
         self.on_alert = on_alert    # callback(str) for alert messages
+        self.on_price_update = on_price_update  # callback(dict) for in-place price updates
         self.running = False
         self.previous: dict = {}
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
@@ -5153,7 +5155,7 @@ class ScannerThread(threading.Thread):
         now_ts = time_mod.time()
         for sym in raw:
             self._last_seen_in_scan[sym] = now_ts
-        updated = False
+        price_changes: dict[str, tuple[float, float]] = {}  # sym → (price, pct)
         for sym, d in raw.items():
             if sym not in self.previous:
                 continue
@@ -5165,10 +5167,11 @@ class ScannerThread(threading.Thread):
             # Use IBKR prev_close if available for accurate pct
             prev_close = self.previous[sym].get('prev_close', 0)
             if prev_close > 0:
-                self.previous[sym]['pct'] = round(
-                    (new_price - prev_close) / prev_close * 100, 1)
+                new_pct = round((new_price - prev_close) / prev_close * 100, 1)
+                self.previous[sym]['pct'] = new_pct
             else:
-                self.previous[sym]['pct'] = d['pct']
+                new_pct = d['pct']
+                self.previous[sym]['pct'] = new_pct
             # Update day_high / day_low with real-time price
             cur_high = self.previous[sym].get('day_high', 0)
             cur_low = self.previous[sym].get('day_low', 0)
@@ -5183,11 +5186,15 @@ class ScannerThread(threading.Thread):
             prev_rl = _running_low.get(sym, 0)
             if prev_rl <= 0 or new_price < prev_rl:
                 _running_low[sym] = new_price
-            updated = True
-        if updated:
-            merged = self._merge_stocks(self.previous)
-            if self.on_stocks and merged:
-                self.on_stocks(merged)
+            price_changes[sym] = (new_price, new_pct)
+        if price_changes:
+            # Push lightweight in-place price update to GUI (no rebuild)
+            self._push_price_update(price_changes)
+
+    def _push_price_update(self, changes: dict):
+        """Push price/pct changes to GUI without full table rebuild."""
+        if self.on_price_update:
+            self.on_price_update(changes)
 
     _CYCLE_WARN_SECS = 60      # warn if cycle exceeds this
     _CYCLE_FORCE_SECS = 120     # force IBKR reconnect if cycle exceeds this
@@ -6498,6 +6505,30 @@ class App:
             self.conn_label.config(fg=self.RED)
         self.root.after(5_000, self._check_connection)
 
+    def _update_prices_inplace(self, changes: dict):
+        """In-place price/pct update — no widget rebuild, no flicker.
+
+        changes: {sym: (price, pct)}
+        Only touches existing labels in _row_widgets.
+        """
+        def _do():
+            for sym, (price, pct) in changes.items():
+                w = self._row_widgets.get(sym)
+                if not w:
+                    continue
+                # Update price label
+                price_text = f"${price:.2f}" if price >= 1 else f"${price:.4f}"
+                w['price_lbl'].config(text=price_text)
+                # Update pct label
+                pct_text = f"{pct:+.1f}%"
+                pct_fg = self.GREEN if pct >= 0 else self.RED
+                w['pct_lbl'].config(text=pct_text, fg=pct_fg)
+            # Update trade price for selected stock
+            sel = self._selected_symbol_name
+            if sel and sel in changes:
+                self._trade_price.set(f"{changes[sel][0]:.2f}")
+        self.root.after(0, _do)
+
     def _update_stock_table(self, stocks: dict):
         """Update the stock table in the GUI (called from scanner thread)."""
         self._stock_data = stocks
@@ -7543,6 +7574,7 @@ class App:
                 on_status=self._st,
                 on_stocks=self._update_stock_table,
                 on_alert=self._push_alert,
+                on_price_update=self._update_prices_inplace,
             )
             global _gui_alert_cb
             _gui_alert_cb = self._push_alert
