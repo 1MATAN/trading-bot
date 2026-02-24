@@ -2271,7 +2271,7 @@ def _reset_alerts_if_new_day():
         log.info(f"Alert state reset for new day: {today}")
 
 
-def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
+def check_hod_break(sym: str, current: dict, previous: dict) -> tuple[str, str] | None:
     """Alert when price breaks today's high of day (≥20% only).
 
     Uses _running_high tracker (updated every cycle including quick OCR
@@ -2301,11 +2301,13 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
             return None
         _hod_break_alerted[sym] = price
         pct = current.get('pct', 0)
-        return (
+        full = (
             f"🟢 🔺 <b>HOD BREAK — {sym}</b>\n"
             f"💰 ${price:.2f} → שיא יומי חדש!\n"
             f"📊 קודם: ${known_high:.2f} | שינוי: {pct:+.1f}%"
         )
+        compact = f"🟢 HOD — שיא חדש ${price:.2f} (קודם ${known_high:.2f})"
+        return full, compact
     else:
         # Not a new high — keep tracker up to date with IBKR data
         if ibkr_high > prev_running:
@@ -2313,7 +2315,7 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> str | None:
         return None
 
 
-def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
+def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str] | None:
     """Alert on 2nd+ touch of a Fibonacci level (≥20% only, 0.8% proximity)."""
     if pct < ALERT_MIN_PCT or price <= 0:
         return None
@@ -2341,15 +2343,17 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> str | None:
                 if count + 1 == 2:
                     info = ratio_map.get(lv_key)
                     ratio_label = f"{info[0]} {info[1]}" if info else ""
-                    return (
+                    full = (
                         f"🟢 🎯🎯 <b>FIB TOUCH x2 — {sym}</b>\n"
                         f"📍 רמה: ${lv:.4f} ({ratio_label})\n"
                         f"💰 ${price:.2f} | שינוי: {pct:+.1f}%"
                     )
+                    compact = f"🎯 FIB x2 — ${lv:.4f} ({ratio_label})"
+                    return full, compact
     return None
 
 
-def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str | None:
+def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> tuple[str, str] | None:
     """Alert on 2nd touch of day's low (≥20% only, 0.5% proximity).
 
     Uses _running_low tracker for accurate day low instead of stale
@@ -2384,16 +2388,18 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> str |
         count = _lod_touch_tracker.get(sym, 0) + 1
         _lod_touch_tracker[sym] = count
         if count == 2:
-            return (
+            full = (
                 f"🔴 🔻🔻 <b>LOD TOUCH x2 — {sym}</b>\n"
                 f"📍 נמוך יומי: ${effective_low:.2f}\n"
                 f"💰 ${price:.2f} | שינוי: {pct:+.1f}%\n"
                 f"⚠️ נגיעה שנייה — תמיכה/שבירה?"
             )
+            compact = f"🔴 LOD x2 — נמוך ${effective_low:.2f}, תמיכה/שבירה?"
+            return full, compact
     return None
 
 
-def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | None:
+def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> tuple[str, str] | None:
     """Alert when price crosses VWAP (10-min cooldown per symbol).
 
     State update is deferred until after cooldown check to prevent
@@ -2424,20 +2430,24 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> str | N
     _vwap_last_alert[sym] = time_mod.time()
 
     if prev_side == 'below':
-        return (
+        full = (
             f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"🟢 חצה מעל VWAP!\n"
             f"💰 ${price:.2f} > VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
+        compact = f"⚡ VWAP ↑ חצה מעל ${vwap:.2f}"
+        return full, compact
     else:
-        return (
+        full = (
             f"🔵 ⚡ <b>VWAP CROSS — {sym}</b>\n"
             f"🔴 חצה מתחת VWAP!\n"
             f"💰 ${price:.2f} < VWAP ${vwap:.2f} | {pct:+.1f}%"
         )
+        compact = f"⚡ VWAP ↓ חצה מתחת ${vwap:.2f}"
+        return full, compact
 
 
-def check_spike(sym: str, price: float, pct: float) -> str | None:
+def check_spike(sym: str, price: float, pct: float) -> tuple[str, str] | None:
     """Alert when price rises 8%+ within 1-3 minutes (≥20% only).
 
     Tracks price history per symbol and compares current price
@@ -2479,16 +2489,18 @@ def check_spike(sym: str, price: float, pct: float) -> str | None:
 
     if change_pct >= 8.0:
         _spike_alerted[sym] = now
-        return (
+        full = (
             f"🟠 🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b>\n"
             f"⏱️ עלייה של {change_pct:.1f}% ב-{elapsed_min:.1f} דקות!\n"
             f"💰 ${old_price:.2f} → ${price:.2f} | יומי: {pct:+.1f}%"
         )
+        compact = f"🚀 SPIKE +{change_pct:.1f}% ב-{elapsed_min:.1f} דק (${old_price:.2f}→${price:.2f})"
+        return full, compact
     return None
 
 
 def check_volume_alert(sym: str, price: float, vwap: float,
-                       rvol: float, pct: float) -> str | None:
+                       rvol: float, pct: float) -> tuple[str, str] | None:
     """Alert on high-volume stocks above VWAP, even below 20%.
 
     Fires for enriched stocks (≥16%) with RVOL ≥ 3.0 and price > VWAP.
@@ -2518,15 +2530,17 @@ def check_volume_alert(sym: str, price: float, vwap: float,
         if title:
             news_line = f"\n📰 {title}"
 
-    return (
+    full = (
         f"🟣 📊 <b>VOLUME — {sym}</b>\n"
         f"🔥 RVOL {rvol:.1f}x | מעל VWAP!\n"
         f"💰 ${price:.2f} ({pct:+.1f}%) > VWAP ${vwap:.2f}"
         f"{news_line}"
     )
+    compact = f"📊 RVOL {rvol:.1f}x מעל VWAP{' 📰' if news else ''}"
+    return full, compact
 
 
-def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
+def check_doji_candle(sym: str, price: float, pct: float) -> tuple[str, str] | None:
     """Alert on Doji breakout — only when price breaks above a completed Doji's high.
 
     Two-phase detection using CACHED bars only (no new IBKR downloads):
@@ -2560,10 +2574,12 @@ def check_doji_candle(sym: str, price: float, pct: float) -> str | None:
     if breakout_hits:
         tfs = ", ".join(tf for tf, _ in breakout_hits)
         doji_h = breakout_hits[0][1]
-        return (
+        full = (
             f"🟡 🔺 <b>Doji Breakout [{tfs}]</b> — {sym}\n"
             f"💰 ${price:.2f} שבר מעל דוג'י ${doji_h:.4f} | {pct:+.1f}%"
         )
+        compact = f"🔺 Doji Breakout [{tfs}] — שבר ${doji_h:.4f}"
+        return full, compact
 
     # ── Phase 1: Detect new completed Doji candles → store pending ──
     tf_specs = [
@@ -5350,8 +5366,21 @@ class ScannerThread(threading.Thread):
 
         # ── Real-time alerts (enriched ≥20% stocks) ──
         if not is_baseline and current and not self._warmup:
-            batch_alerts: list[str] = []
-            batch_syms: list[str] = []
+            # Grouped alert collection: {sym: [compact_line, ...]}
+            batch_by_sym: dict[str, list[str]] = {}
+            batch_full_texts: list[str] = []   # full texts for GUI display
+            batch_syms: list[str] = []         # ordered unique symbols
+
+            def _collect(sym, result, sound_type, counter_name):
+                if result is None:
+                    return
+                full, compact = result
+                batch_full_texts.append(full)
+                batch_by_sym.setdefault(sym, []).append(compact)
+                play_alert_sound(sound_type)
+                _daily_alert_counts[counter_name] = _daily_alert_counts.get(counter_name, 0) + 1
+                if sym not in batch_syms:
+                    batch_syms.append(sym)
 
             for sym, d in current.items():
                 if sym not in _enrichment:
@@ -5360,89 +5389,28 @@ class ScannerThread(threading.Thread):
                 pct = d.get('pct', 0)
                 prev_d = self.previous.get(sym, {}) if self.previous else {}
 
-                # HOD break
-                hod_msg = check_hod_break(sym, d, prev_d)
-                if hod_msg:
-                    batch_alerts.append(hod_msg)
-                    play_alert_sound('hod')
-                    _daily_alert_counts['HOD Break'] = _daily_alert_counts.get('HOD Break', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # Fib 2nd touch
-                fib_msg = check_fib_second_touch(sym, price, pct)
-                if fib_msg:
-                    batch_alerts.append(fib_msg)
-                    play_alert_sound('fib')
-                    _daily_alert_counts['FIB Touch'] = _daily_alert_counts.get('FIB Touch', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # LOD touch
+                _collect(sym, check_hod_break(sym, d, prev_d), 'hod', 'HOD Break')
+                _collect(sym, check_fib_second_touch(sym, price, pct), 'fib', 'FIB Touch')
                 day_low = d.get('day_low', 0)
-                lod_msg = check_lod_touch(sym, price, day_low, pct)
-                if lod_msg:
-                    batch_alerts.append(lod_msg)
-                    play_alert_sound('lod')
-                    _daily_alert_counts['LOD Touch'] = _daily_alert_counts.get('LOD Touch', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # VWAP cross
+                _collect(sym, check_lod_touch(sym, price, day_low, pct), 'lod', 'LOD Touch')
                 vwap = d.get('vwap', 0)
-                vwap_msg = check_vwap_cross(sym, price, vwap, pct)
-                if vwap_msg:
-                    batch_alerts.append(vwap_msg)
-                    play_alert_sound('vwap')
-                    _daily_alert_counts['VWAP Cross'] = _daily_alert_counts.get('VWAP Cross', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # Spike 8%+ in 1-3 minutes
-                spike_msg = check_spike(sym, price, pct)
-                if spike_msg:
-                    batch_alerts.append(spike_msg)
-                    play_alert_sound('spike')
-                    _daily_alert_counts['Spike'] = _daily_alert_counts.get('Spike', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # Volume alert — high RVOL + above VWAP (even below 20%)
+                _collect(sym, check_vwap_cross(sym, price, vwap, pct), 'vwap', 'VWAP Cross')
+                _collect(sym, check_spike(sym, price, pct), 'spike', 'Spike')
                 rvol = d.get('rvol', 0)
-                vol_msg = check_volume_alert(sym, price, vwap, rvol, pct)
-                if vol_msg:
-                    batch_alerts.append(vol_msg)
-                    play_alert_sound('vwap')
-                    _daily_alert_counts['Volume'] = _daily_alert_counts.get('Volume', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
-
-                # Doji candle alert
-                doji_msg = check_doji_candle(sym, price, pct)
-                if doji_msg:
-                    batch_alerts.append(doji_msg)
-                    play_alert_sound('spike')
-                    _daily_alert_counts['Doji'] = _daily_alert_counts.get('Doji', 0) + 1
-                    if sym not in batch_syms:
-                        batch_syms.append(sym)
+                _collect(sym, check_volume_alert(sym, price, vwap, rvol, pct), 'vwap', 'Volume')
+                _collect(sym, check_doji_candle(sym, price, pct), 'spike', 'Doji')
 
             # Send all alerts as one batch
-            if batch_alerts:
+            if batch_by_sym:
+                # GUI alerts (full text, stripped of HTML)
                 if self.on_alert:
-                    for ba in batch_alerts:
-                        clean = re.sub(r'<[^>]+>', '', ba)[:100]
+                    for full_text in batch_full_texts:
+                        clean = re.sub(r'<[^>]+>', '', full_text)[:100]
                         self.on_alert(clean)
 
-                # Append fib levels + MAs for each alerted symbol (fresh from cache)
-                for s in batch_syms:
-                    sd = current.get(s, {})
-                    sp = sd.get('price', 0)
-                    if sp > 0:
-                        fresh_ma = _get_fresh_ma_rows(s, sp)
-                        fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
-                        if fib_txt:
-                            batch_alerts.append(fib_txt.strip())
+                total_alerts = sum(len(v) for v in batch_by_sym.values())
 
+                # Inline keyboard buttons per symbol
                 keyboard_rows = []
                 for s in batch_syms:
                     keyboard_rows.append([
@@ -5451,13 +5419,46 @@ class ScannerThread(threading.Thread):
                     ])
                 btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
 
-                if len(batch_alerts) == 1:
-                    send_telegram_alert(batch_alerts[0], reply_markup=btn)
+                if len(batch_syms) == 1 and total_alerts == 1:
+                    # Single stock, single alert — full text + fib levels
+                    sym0 = batch_syms[0]
+                    sd = current.get(sym0, {})
+                    sp = sd.get('price', 0)
+                    msg = batch_full_texts[0]
+                    if sp > 0:
+                        fresh_ma = _get_fresh_ma_rows(sym0, sp)
+                        fib_txt = _format_fib_text(sym0, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
+                        if fib_txt:
+                            msg += "\n" + fib_txt.strip()
+                    send_telegram_alert(msg, reply_markup=btn)
                 else:
+                    # Multiple alerts — grouped by symbol
                     now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
-                    header = f"🔔 <b>התראות ({len(batch_alerts)})</b> — {now_et} ET\n━━━━━━━━━━━━━━━━━━\n\n"
-                    send_telegram_alert(header + "\n\n".join(batch_alerts), reply_markup=btn)
-                status += f"  🔔{len(batch_alerts)}"
+                    blocks = []
+                    for s in batch_syms:
+                        sd = current.get(s, {})
+                        sp = sd.get('price', 0)
+                        spct = sd.get('pct', 0)
+                        alerts = batch_by_sym[s]
+
+                        # Stock header + compact alert lines
+                        block = f"📌 <b>{s}</b> — ${sp:.2f} ({spct:+.1f}%)"
+                        for line in alerts:
+                            block += f"\n  {line}"
+
+                        # Fib levels + MAs per symbol
+                        if sp > 0:
+                            fresh_ma = _get_fresh_ma_rows(s, sp)
+                            fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
+                            if fib_txt:
+                                block += "\n" + fib_txt.strip()
+
+                        blocks.append(block)
+
+                    header = f"🔔 <b>התראות ({total_alerts})</b> — {now_et} ET\n"
+                    send_telegram_alert(header + "\n\n".join(blocks), reply_markup=btn)
+
+                status += f"  🔔{total_alerts}"
             else:
                 status += "  ✓"
 
