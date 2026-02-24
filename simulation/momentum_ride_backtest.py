@@ -35,6 +35,8 @@ from config.settings import (
     MR_GAP_MAX_PCT,
     MR_MIN_GAP_VOLUME,
     MR_EXIT_BARS_IN_MINUTE,
+    MR_TRAILING_STOP_PCT,
+    MR_SAFETY_STOP_PCT,
 )
 from simulation.sim_engine import SimPosition, SimResult
 from strategies.fibonacci_engine import (
@@ -321,7 +323,7 @@ class MomentumRideEngine:
                         trades_this_day.append(trade_dict)
                     position = None
 
-                # Safety stop: -5% from entry
+                # Safety stop
                 if position is not None and mc["low"] <= position["stop_price"]:
                     fill = min(mc["open"], position["stop_price"])
                     fill = max(fill, 0.01)
@@ -356,8 +358,8 @@ class MomentumRideEngine:
                         fill_price = round(mc["close"] * (1 + SLIPPAGE_PCT), 4)
                         vwap_dist = (fill_price - current_vwap) / current_vwap
 
-                        # Safety stop = -5% from entry
-                        stop_price = round(fill_price * 0.95, 4)
+                        # Safety stop
+                        stop_price = round(fill_price * (1 - MR_SAFETY_STOP_PCT), 4)
 
                         qty = int((self._cash * POSITION_SIZE_PCT) / fill_price)
                         if qty <= 0:
@@ -485,7 +487,7 @@ class MomentumRideEngine:
         start_idx = mc["start_15s_idx"]
         end_idx = mc["end_15s_idx"]
         highest = position["highest_high"]
-        trail_pct = 0.05  # 5% trailing stop
+        trail_pct = MR_TRAILING_STOP_PCT
 
         for bi in range(start_idx, end_idx + 1):
             bar = df_15s.iloc[bi]
@@ -496,7 +498,7 @@ class MomentumRideEngine:
             if bar_high > highest:
                 highest = bar_high
 
-            # Check trailing stop: price dropped 5% from peak
+            # Check trailing stop: price dropped from peak
             trail_stop = highest * (1 - trail_pct)
             if bar_low <= trail_stop:
                 position["highest_high"] = highest
@@ -505,7 +507,7 @@ class MomentumRideEngine:
                 return (
                     exit_price,
                     exit_time,
-                    f"trailing_stop (peak=${highest:.4f}, -5%=${trail_stop:.4f})",
+                    f"trailing_stop (peak=${highest:.4f}, -{MR_TRAILING_STOP_PCT:.0%}=${trail_stop:.4f})",
                 )
 
         # Update highest for next minute
@@ -521,8 +523,8 @@ class MomentumRideEngine:
         return below[-1] if below else None
 
     def _find_stop(self, fib_prices: list[float], entry_price: float) -> float:
-        """Stop = 5% below entry price."""
-        return round(entry_price * 0.95, 4)
+        """Stop = MR_SAFETY_STOP_PCT below entry price."""
+        return round(entry_price * (1 - MR_SAFETY_STOP_PCT), 4)
 
     # ── Position Close ────────────────────────────────────
 
@@ -623,7 +625,7 @@ class MomentumRideEngine:
         print(f"\n{'='*60}")
         print(f"Momentum Ride Backtest (15-sec)")
         print(f"  Entry: VWAP cross up OR pullback to VWAP + above SMA 9 hourly")
-        print(f"  Exit: 5% trailing stop | Safety stop: -5% from entry")
+        print(f"  Exit: {MR_TRAILING_STOP_PCT:.0%} trailing stop | Safety stop: -{MR_SAFETY_STOP_PCT:.0%} from entry")
         print(f"  Gap filter: {MR_GAP_MIN_PCT}-{MR_GAP_MAX_PCT}% | "
               f"Min vol: {MR_MIN_GAP_VOLUME:,} | "
               f"Tracking: {MR_TRACKING_MINUTES} min")

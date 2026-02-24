@@ -293,8 +293,10 @@ GG_LIVE_MAX_TRACKED_SYMBOLS = 8
 MR_LIVE_INITIAL_CASH = 3000.0
 MR_LIVE_POSITION_SIZE_PCT = 0.95
 MR_LIVE_MAX_TRACKED_SYMBOLS = 5
-MR_LIVE_TRAILING_STOP_PCT = 0.05       # 5% trailing from highest high
-MR_LIVE_SAFETY_STOP_PCT = 0.05         # 5% below entry
+MR_TRAILING_STOP_PCT = 0.08            # 8% trailing from highest high (backtest + live)
+MR_SAFETY_STOP_PCT = 0.08             # 8% below entry (backtest + live)
+MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
+MR_LIVE_SAFETY_STOP_PCT = MR_SAFETY_STOP_PCT
 MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
 
 # ── Screen Monitor (IBKR Scanner) ────────────────────

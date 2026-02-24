@@ -5,8 +5,21 @@ export DISPLAY=:0
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 export WAYLAND_DISPLAY=wayland-0
 
+# Wait for graphical session to be fully ready (up to 90s)
+echo "$(date): Waiting for graphical session..."
+for i in $(seq 1 30); do
+    XAUTH_FILE=$(find /run/user/$(id -u) -name '.mutter-Xwaylandauth.*' -type f 2>/dev/null | head -1)
+    if [ -n "$XAUTH_FILE" ]; then
+        echo "$(date): Xwayland auth found after $((i*3))s"
+        break
+    fi
+    sleep 3
+done
+
 # Find the current Xwayland auth file (path changes on each login)
-XAUTH_FILE=$(find /run/user/$(id -u) -name '.mutter-Xwaylandauth.*' -type f 2>/dev/null | head -1)
+if [ -z "$XAUTH_FILE" ]; then
+    XAUTH_FILE=$(find /run/user/$(id -u) -name '.mutter-Xwaylandauth.*' -type f 2>/dev/null | head -1)
+fi
 if [ -n "$XAUTH_FILE" ]; then
     export XAUTHORITY="$XAUTH_FILE"
 else
