@@ -533,21 +533,17 @@ def _format_volume(volume: float) -> str:
 _avg_vol_cache: dict[str, float] = {}
 
 
-def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
-                   price_max: float = MONITOR_PRICE_MAX) -> dict:
-    """Run multiple IBKR scanners and merge results.
+def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
+                           price_max: float = MONITOR_PRICE_MAX) -> list[tuple[str, object]]:
+    """Fast IBKR scanner: only get symbol list + contracts (no enrichment).
 
-    Runs TOP_PERC_GAIN + HOT_BY_VOLUME + MOST_ACTIVE for broad coverage
-    across pre-market, market, and after-hours sessions.
-
-    Returns dict: {symbol: {'price': float, 'pct': float, 'volume': str, ...}}
+    Returns list of (symbol, contract) tuples.
     """
     ib = _get_ibkr()
     if not ib:
-        return {}
+        return []
 
-    # ── Phase 1: Run all scan types and collect unique contracts ──
-    valid_items: list[tuple[str, object]] = []  # (sym, contract)
+    valid_items: list[tuple[str, object]] = []
     seen_syms: set[str] = set()
 
     for scan_code in MONITOR_SCAN_CODES:
@@ -574,15 +570,30 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
             if sym not in seen_syms:
                 seen_syms.add(sym)
                 valid_items.append((sym, contract))
-                # Cache scanner contract (already qualified by IBKR)
                 if contract.conId and sym not in _contract_cache:
                     _contract_cache[sym] = contract
                 added += 1
         log.debug(f"Scan [{scan_code}]: {len(results)} raw → {added} new unique")
 
+    return valid_items
+
+
+def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
+                   price_max: float = MONITOR_PRICE_MAX) -> dict:
+    """Run multiple IBKR scanners and merge results (with full enrichment).
+
+    Runs TOP_PERC_GAIN + HOT_BY_VOLUME + MOST_ACTIVE for broad coverage
+    across pre-market, market, and after-hours sessions.
+
+    Returns dict: {symbol: {'price': float, 'pct': float, 'volume': str, ...}}
+    """
+    valid_items = _run_ibkr_scanner_list(price_min, price_max)
+    if not valid_items:
+        return {}
+
     stocks: dict[str, dict] = {}
 
-    # ── Phase 2: Enrich with historical data ──
+    # ── Enrich with historical data ──
     for sym, stock_contract in valid_items:
 
         # Known stock with cached avg volume → only 2D needed
@@ -803,6 +814,17 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
 # Generic OCR patterns — Webull format: SYM PRICE +PCT% VOL FLOAT
 # PRICE is plain digits, PCT always starts with +/- — used to distinguish columns.
 # Symbols accept lowercase (Tesseract reads I→l), uppercased in parser.
+# IBKR TWS Scanner format: [icons/junk] SYMBOL [@ = + 8] PRICE VOLUME [FLOAT] [RANGE%] CHANGE% ...
+_OCR_RE_TWS = re.compile(
+    r'([A-Z][A-Z0-9]{1,4})\s+'          # symbol (2-5 uppercase chars)
+    r'(?:[@+=»·]|\d(?=\s))?\s*=?\s*'    # optional TWS markers or stray standalone digit
+    r'([\d]+\.[\d]+|[\d]+)\s+'           # price
+    r'([\d.,]+[KMBkmb])\s+'             # volume with K/M/B suffix
+    r'.*?'                                # skip middle columns (float, range%)
+    r'([+-][\d]+[.,][\d]+)%',            # change% with +/- prefix
+)
+
+# Webull formats (existing)
 _OCR_RE_5COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'        # symbol (allow lowercase for OCR misreads)
     r'([\d.]+)\s+'                # price (plain digits before +/- pct)
@@ -840,11 +862,33 @@ def _fix_ocr_text(text: str) -> str:
     return text
 
 
+def _clean_tws_line(line: str) -> str:
+    """Clean IBKR TWS OCR line: strip emoji-junk prefixes that OCR produces from TWS icons.
+
+    TWS row icons get OCR'd as: 'fe}', 'e}', 'ey', 'fey', 'fey}', 'O', 'Q', etc.
+    Also strips leading digits (row numbers) and special chars.
+    """
+    # Strip common OCR-garbage prefixes from TWS icons (repeat to handle nested junk)
+    for _ in range(3):
+        line = re.sub(r'^[\s]*(?:fe[y}]?[\s}]*|e[y}][\s]*|[Oo0Q]\s+|[a-z]{1,3}[\s}]+|[\d]{1,4}\s+[,;.!?)}\]]*\s*)', '', line)
+        # Remove stray single lowercase chars / digits at start
+        line = re.sub(r'^[a-z0-9]\s+', '', line)
+        # Remove leftover bracket/paren/special junk
+        line = re.sub(r'^[(){}\[\]@+=»·&:;,\-]+\s*', '', line)
+    # (intentionally not stripping V/W/I/H — they're often real symbol letters)
+    # Collapse spaces inside likely symbols: "FLY W" → "FLYW" (uppercase word + space + single uppercase)
+    line = re.sub(r'^([A-Z]{2,4})\s([A-Z])\s', r'\1\2 ', line)
+    # Remove "HO." or similar OCR-prefix before price
+    line = re.sub(r'\s+HO\.\s+', ' ', line)
+    return line.strip()
+
+
 def _parse_ocr_generic(text: str) -> list[dict]:
     """Parse OCR text into structured stock data.
 
-    Tries 3 regex patterns in priority order (Webull column order):
-    1. 5 columns: SYMBOL PCT% PRICE VOLUME FLOAT
+    Tries patterns in priority order:
+    0. IBKR TWS format: [junk] SYMBOL [@ = +] PRICE VOLUME ... CHANGE%
+    1. 5 columns: SYMBOL PCT% PRICE VOLUME FLOAT  (Webull)
     2. 4 columns: SYMBOL PCT% PRICE VOLUME
     3. 3 columns: SYMBOL PCT% PRICE
     """
@@ -878,7 +922,31 @@ def _parse_ocr_generic(text: str) -> list[dict]:
                         return variant
         return sym
 
-    # Try 5-column first (most data)
+    # Try TWS format first (line-by-line, clean prefix junk)
+    for raw_line in text.split('\n'):
+        cleaned = _clean_tws_line(raw_line)
+        if not cleaned:
+            continue
+        m = _OCR_RE_TWS.search(cleaned)
+        if not m:
+            continue
+        sym = _fix_ocr_sym(m.group(1))
+        if sym in seen:
+            continue
+        try:
+            price = float(m.group(2))
+            pct = float(m.group(4).replace(',', '.').rstrip('.'))
+        except ValueError:
+            continue
+        vol_raw, vol_display = _parse_ocr_volume(m.group(3))
+        results.append({
+            'sym': sym, 'price': price, 'pct': pct,
+            'volume_raw': vol_raw, 'volume': vol_display,
+            'float_raw': 0, 'float_display': '',
+        })
+        seen.add(sym)
+
+    # Try 5-column first (most data) — Webull format
     for m in _OCR_RE_5COL.finditer(text):
         sym = _fix_ocr_sym(m.group(1))
         if sym in seen:
@@ -5922,13 +5990,35 @@ class ScannerThread(threading.Thread):
                 self.on_status(f"Session: {cur_label} — rescanning...")
         self._last_session = current_session
 
-        # ── OCR scan with IBKR fallback ──
+        # ── Dual scan: OCR + IBKR scanner list, merge results ──
         _phase('scan_start')
-        current = _run_ocr_scan(self.price_min, self.price_max)
-        scan_source = "OCR"
-        if not current:
-            current = _run_ibkr_scan(self.price_min, self.price_max)
-            scan_source = "IBKR"
+        ocr_data = _run_ocr_scan(self.price_min, self.price_max)
+        _phase('ocr_done')
+
+        # Fast IBKR scanner list (symbols + contracts only, no enrichment)
+        ibkr_list = _run_ibkr_scanner_list(self.price_min, self.price_max)
+        _phase('ibkr_list_done')
+
+        # Merge: OCR provides real-time prices, IBKR adds missing stocks + contracts
+        current = dict(ocr_data) if ocr_data else {}
+        ibkr_added = 0
+        for sym, contract in ibkr_list:
+            if sym in current:
+                # OCR already has this stock — just add the contract if missing
+                if not current[sym].get('contract'):
+                    current[sym]['contract'] = contract
+            else:
+                # IBKR-only stock — add with minimal data (enrichment will fill price/pct)
+                current[sym] = {
+                    'sym': sym, 'price': 0, 'pct': 0, 'volume': '',
+                    'volume_raw': 0, 'contract': contract,
+                }
+                ibkr_added += 1
+
+        ocr_count = len(ocr_data) if ocr_data else 0
+        scan_source = "OCR+IBKR" if ocr_count > 0 else "IBKR"
+        if ibkr_added:
+            log.info(f"Scan merge: {ocr_count} OCR + {ibkr_added} IBKR-only = {len(current)} total")
         _phase('scan_done')
 
         # Track when each stock was last found by a fresh scan
@@ -5941,7 +6031,7 @@ class ScannerThread(threading.Thread):
         # Only carry over if stock was seen by a scan within the last 5 minutes;
         # beyond that it has genuinely dropped off the scanner.
         _CARRYOVER_MAX_AGE = 60  # 1 minute
-        if scan_source == "OCR" and self.previous:
+        if "OCR" in scan_source and self.previous:
             kept = 0
             for sym, prev_d in self.previous.items():
                 if sym not in current and sym in _enrichment:
@@ -5952,9 +6042,12 @@ class ScannerThread(threading.Thread):
             if kept:
                 log.debug(f"Kept {kept} enriched stocks from previous scan (OCR miss, <5min)")
 
-        # IBKR enrichment for momentum stocks from OCR scan
-        if scan_source == "OCR" and current:
-            momentum_syms = [s for s, d in current.items() if d.get('pct', 0) >= 16.0]
+        # IBKR enrichment for stocks that need price/VWAP/RVOL data
+        if current:
+            # Enrich: momentum stocks (>=16%) + IBKR-only stocks (have contract but no price)
+            momentum_syms = [s for s, d in current.items()
+                             if d.get('pct', 0) >= 16.0
+                             or (d.get('contract') and d.get('price', 0) <= 0)]
             if momentum_syms:
                 if self.on_status:
                     self.on_status(f"Enriching {len(momentum_syms)} momentum stocks via IBKR...")
@@ -6962,6 +7055,24 @@ class App:
         sep1 = tk.Frame(panel, bg="#444", height=1)
         sep1.pack(fill='x', pady=2)
 
+        row_quick_fields = tk.Frame(panel, bg=self.BG)
+        row_quick_fields.pack(fill='x', pady=1)
+
+        tk.Label(row_quick_fields, text="BP%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
+        self._quick_bp_var = tk.StringVar(value="80")
+        tk.Entry(row_quick_fields, textvariable=self._quick_bp_var, width=4, font=("Courier", 12),
+                 bg="#333", fg="#00e676", insertbackground="white", relief='flat').pack(side='left', padx=2)
+
+        tk.Label(row_quick_fields, text="Stop%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
+        self._quick_stop_var = tk.StringVar(value="5")
+        tk.Entry(row_quick_fields, textvariable=self._quick_stop_var, width=4, font=("Courier", 12),
+                 bg="#333", fg="#ff5252", insertbackground="white", relief='flat').pack(side='left', padx=2)
+
+        tk.Label(row_quick_fields, text="TP%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
+        self._quick_tp_var = tk.StringVar(value="20")
+        tk.Entry(row_quick_fields, textvariable=self._quick_tp_var, width=4, font=("Courier", 12),
+                 bg="#333", fg="#448aff", insertbackground="white", relief='flat').pack(side='left', padx=2)
+
         row_quick = tk.Frame(panel, bg=self.BG)
         row_quick.pack(fill='x', pady=2)
 
@@ -6979,9 +7090,6 @@ class App:
                   bg="#e6a800", fg="black", activebackground="#ffc107",
                   relief='flat', padx=14, pady=2,
                   command=self._close_all_position).pack(side='left', padx=4)
-
-        tk.Label(row_quick, text="(80% BP, 5% trail, no dialog)",
-                 font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
 
         # ── Planned Trade section ──
         sep2 = tk.Frame(panel, bg="#444", height=1)
@@ -7435,12 +7543,32 @@ class App:
         return sym, price
 
     def _quick_buy(self):
-        """Quick Buy: 80% of BP, 1% above price, 5% trailing stop. No confirmation dialog."""
+        """Quick Buy: configurable BP%, Stop%, TP%. No confirmation dialog."""
         result = self._validate_order_prereqs()
         if not result:
             return
         sym, price = result
         log.info(f"_quick_buy called: sym={sym} price={price:.4f}")
+
+        # Read configurable fields (defaults: 80% BP, 5% stop, 20% TP)
+        try:
+            bp_pct = float(self._quick_bp_var.get()) / 100.0
+            if bp_pct <= 0 or bp_pct > 1:
+                bp_pct = 0.80
+        except (ValueError, TypeError):
+            bp_pct = 0.80
+        try:
+            stop_pct = float(self._quick_stop_var.get()) / 100.0
+            if stop_pct <= 0 or stop_pct >= 1:
+                stop_pct = 0.05
+        except (ValueError, TypeError):
+            stop_pct = 0.05
+        try:
+            tp_pct = float(self._quick_tp_var.get()) / 100.0
+            if tp_pct <= 0:
+                tp_pct = 0.0  # 0 = no TP, trailing only
+        except (ValueError, TypeError):
+            tp_pct = 0.20
 
         buy_price = round(price * 1.01, 2)
         bp = self._cached_buying_power
@@ -7449,26 +7577,30 @@ class App:
             messagebox.showwarning("No Data", "Waiting for account data from IBKR...", parent=self.root)
             return
         avail = bp if bp > 0 else nl
-        qty = int(avail * 0.80 / buy_price)
+        qty = int(avail * bp_pct / buy_price)
         if qty <= 0:
             messagebox.showwarning("Qty Too Low", "Not enough buying power.", parent=self.root)
             return
 
-        # 5% trailing stop from entry
-        stop_price = round(price * 0.95, 2)
+        stop_price = round(price * (1 - stop_pct), 2)
         limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
 
         req = {
             'sym': sym, 'action': 'BUY', 'qty': qty, 'price': buy_price,
             'stop_price': stop_price,
             'limit_price': limit_price,
-            'trailing_pct': 5.0,
-            'stop_desc': f"${stop_price:.2f} (5% trail)",
+            'stop_desc': f"${stop_price:.2f} ({stop_pct*100:.0f}% stop)",
         }
+        if tp_pct > 0:
+            req['target_price'] = round(price * (1 + tp_pct), 2)
+            req['trailing_pct'] = 0.0
+        else:
+            req['trailing_pct'] = stop_pct * 100  # use stop% as trailing %
         self._order_thread.submit(req)
         log.info(f"QUICK BUY submitted: {req}")
+        tp_info = f"TP ${req.get('target_price', 0):.2f}" if tp_pct > 0 else f"Trail {stop_pct*100:.0f}%"
         self._order_status_var.set(
-            f"QUICK BUY {qty} {sym} @ ${buy_price:.2f} | 5% trail stop")
+            f"QUICK BUY {qty} {sym} @ ${buy_price:.2f} | Stop {stop_pct*100:.0f}% | {tp_info}")
         self._order_status_label.config(fg="#00e676")
 
     def _quick_sell(self):
