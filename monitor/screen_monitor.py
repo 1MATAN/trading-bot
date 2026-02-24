@@ -410,7 +410,6 @@ def _get_market_session() -> str:
     return 'closed'
 
 
-
 def _expected_volume_fraction() -> float:
     """Expected fraction of daily volume traded by current time of day.
 
@@ -681,6 +680,7 @@ def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
 _scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 3
 _scanner_sources_lock = threading.Lock()
 _MAX_SCANNER_SOURCES = 3
+_ocr_capture_lock = threading.Lock()  # prevent simultaneous OCR captures
 
 
 def _verify_wid(wid: int) -> bool:
@@ -748,27 +748,29 @@ def _capture_and_ocr(wid: int) -> str:
     """Capture a window via import(1) and OCR with pytesseract.
 
     Pipeline: screenshot → 3x resize → grayscale → invert → sharpen → OCR.
+    Uses _ocr_capture_lock to prevent simultaneous captures from multiple threads.
     """
-    try:
-        result = subprocess.run(
-            ['import', '-silent', '-window', str(wid), 'png:-'],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout:
-            log.warning(f"import -window failed (rc={result.returncode})")
+    with _ocr_capture_lock:
+        try:
+            result = subprocess.run(
+                ['import', '-silent', '-window', str(wid), 'png:-'],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout:
+                log.warning(f"import -window failed (rc={result.returncode})")
+                return ""
+        except Exception as e:
+            log.warning(f"Window capture failed: {e}")
             return ""
-    except Exception as e:
-        log.warning(f"Window capture failed: {e}")
-        return ""
 
-    img = Image.open(io.BytesIO(result.stdout))
-    # 3x resize for better OCR accuracy
-    img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
-    img = img.convert('L')          # grayscale
-    img = ImageOps.invert(img)      # invert (dark bg → light bg)
-    img = img.filter(ImageFilter.SHARPEN)
+        img = Image.open(io.BytesIO(result.stdout))
+        # 3x resize for better OCR accuracy
+        img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+        img = img.convert('L')          # grayscale
+        img = ImageOps.invert(img)      # invert (dark bg → light bg)
+        img = img.filter(ImageFilter.SHARPEN)
 
-    text = pytesseract.image_to_string(img, config='--psm 6')
+        text = pytesseract.image_to_string(img, config='--psm 6')
     return text
 
 
@@ -798,31 +800,28 @@ def _parse_ocr_volume(vol_str: str) -> tuple[int, str]:
     return (raw, _format_volume(raw))
 
 
-# Generic OCR patterns — Webull format: SYM +PCT% PRICE VOL FLOAT
-# PCT always starts with +/-, PRICE is plain digits — used to distinguish columns.
+# Generic OCR patterns — Webull format: SYM PRICE +PCT% VOL FLOAT
+# PRICE is plain digits, PCT always starts with +/- — used to distinguish columns.
 # Symbols accept lowercase (Tesseract reads I→l), uppercased in parser.
 _OCR_RE_5COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'        # symbol (allow lowercase for OCR misreads)
-    r'[^+\d-]*'                   # skip OCR junk (=, —, spaces) before +/- sign
-    r'([+-][\d.,]+)%?\S*\s+'      # pct change (+/- prefix, optional %, ignore junk)
-    r'([\d.]+)\s+'                # price
+    r'([\d.]+)\s+'                # price (plain digits before +/- pct)
+    r'([+-][\d.,]+)%?\S*\s+'     # pct change (+/- prefix, optional %, ignore junk)
     r'([\d.,]+[KMBkmb]?)\s+'     # volume
     r'[^\d]*([\d.,]+[KMBkmb]?)\S*$',  # float (skip OCR junk like dashes before digits)
     re.MULTILINE,
 )
 _OCR_RE_4COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'
-    r'[^+\d-]*'                   # skip OCR junk before +/- sign
-    r'([+-][\d.,]+)%?\S*\s+'
-    r'([\d.]+)\s+'
+    r'([\d.]+)\s+'                # price
+    r'([+-][\d.,]+)%?\S*\s+'     # pct change
     r'([\d.,]+[KMBkmb]?)\s*$',
     re.MULTILINE,
 )
 _OCR_RE_3COL = re.compile(
     r'^([A-Za-z]{1,5})\s+'
-    r'[^+\d-]*'                   # skip OCR junk before +/- sign
-    r'([+-][\d.,]+)%?\S*\s+'
-    r'([\d.]+)\s*$',
+    r'([\d.]+)\s+'                # price
+    r'([+-][\d.,]+)%?\S*$',       # pct change
     re.MULTILINE,
 )
 
@@ -885,8 +884,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', '').rstrip('.'))
-            price = float(m.group(3))
+            price = float(m.group(2))
+            pct = float(m.group(3).replace(',', '').rstrip('.'))
         except ValueError:
             continue
         vol_raw, vol_display = _parse_ocr_volume(m.group(4))
@@ -904,8 +903,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', '').rstrip('.'))
-            price = float(m.group(3))
+            price = float(m.group(2))
+            pct = float(m.group(3).replace(',', '').rstrip('.'))
         except ValueError:
             continue
         vol_raw, vol_display = _parse_ocr_volume(m.group(4))
@@ -922,8 +921,8 @@ def _parse_ocr_generic(text: str) -> list[dict]:
         if sym in seen:
             continue
         try:
-            pct = float(m.group(2).replace(',', '').rstrip('.'))
-            price = float(m.group(3))
+            price = float(m.group(2))
+            pct = float(m.group(3).replace(',', '').rstrip('.'))
         except ValueError:
             continue
         results.append({
@@ -1022,6 +1021,44 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
     session = _get_market_session()
     src_count = len(_scanner_sources)
     log.info(f"OCR scan [{session}]: {src_count} sources → {len(best)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
+    return stocks
+
+
+def _quick_ocr_capture(price_min: float = MONITOR_PRICE_MIN,
+                      price_max: float = MONITOR_PRICE_MAX) -> dict:
+    """Ultra-fast OCR capture — skips WID verification (already validated).
+
+    Used by the real-time refresh thread for ~1s updates.
+    Returns {sym: {'price': float, 'pct': float}} — minimal fields.
+    """
+    with _scanner_sources_lock:
+        snapshot = list(_scanner_sources)
+    if not snapshot:
+        return {}
+
+    all_parsed: list[dict] = []
+    for src in snapshot:
+        text = _capture_and_ocr(src['wid'])
+        if not text.strip():
+            continue
+        parsed = _parse_ocr_generic(text)
+        all_parsed.extend(parsed)
+
+    if not all_parsed:
+        return {}
+
+    stocks: dict[str, dict] = {}
+    for p in all_parsed:
+        sym = p['sym']
+        if sym in stocks:
+            continue
+        price = p['price']
+        if price < price_min or price > price_max:
+            continue
+        stocks[sym] = {
+            'price': round(price, 2),
+            'pct': round(p['pct'], 1),
+        }
     return stocks
 
 
@@ -5074,15 +5111,42 @@ class ScannerThread(threading.Thread):
         if self._telegram_listener:
             self._telegram_listener.stop()
 
-    def _quick_ocr_price_update(self):
-        """Fast OCR-only price refresh between full scan cycles.
+    def _start_ocr_refresh_thread(self):
+        """Launch a daemon thread that continuously reads OCR prices (~1s interval).
 
-        Reads Webull screen via OCR (~1s) and updates only price/pct
-        for stocks already in self.previous. No enrichment, no alerts.
+        Runs independently of the main enrichment cycle so the GUI always
+        shows near-real-time prices regardless of how long enrichment takes.
+        """
+        def _ocr_loop():
+            _n = 0
+            while self.running:
+                t0 = time_mod.time()
+                try:
+                    self._quick_ocr_price_update()
+                except Exception as e:
+                    log.warning(f"OCR refresh error: {e}")
+                    time_mod.sleep(2)
+                    continue
+                elapsed = time_mod.time() - t0
+                _n += 1
+                if _n % 60 == 0:
+                    log.info(f"OCR refresh: {_n} reads, last={elapsed:.2f}s")
+                time_mod.sleep(max(0, 1.0 - elapsed))
+            log.info("OCR refresh thread stopped (self.running=False)")
+
+        t = threading.Thread(target=_ocr_loop, daemon=True, name="OCR-refresh")
+        t.start()
+        log.info("OCR real-time refresh thread started (1s interval)")
+
+    def _quick_ocr_price_update(self):
+        """Ultra-fast OCR price refresh for real-time GUI updates.
+
+        Only captures OCR + updates prices/pct + pushes to GUI.
+        No IBKR calls, no fib recalc, no enrichment — keeps it under 1s.
         """
         if not self.previous:
             return
-        raw = _run_ocr_scan(self.price_min, self.price_max)
+        raw = _quick_ocr_capture(self.price_min, self.price_max)
         if not raw:
             return
         # Update last-seen timestamps for carry-over freshness
@@ -5121,7 +5185,6 @@ class ScannerThread(threading.Thread):
                 _running_low[sym] = new_price
             updated = True
         if updated:
-            self._refresh_enrichment_fibs(self.previous)
             merged = self._merge_stocks(self.previous)
             if self.on_stocks and merged:
                 self.on_stocks(merged)
@@ -5141,6 +5204,8 @@ class ScannerThread(threading.Thread):
         # Start Telegram listener for stock lookups
         self._telegram_listener = TelegramListenerThread(self._lookup_queue)
         self._telegram_listener.start()
+        # Start continuous OCR price refresh (independent of enrichment cycle)
+        self._start_ocr_refresh_thread()
         log.info(f"Scanner started: freq={self.freq}s, price ${self.price_min}-${self.price_max}")
         self._consecutive_slow = 0
         while self.running:
@@ -5181,12 +5246,8 @@ class ScannerThread(threading.Thread):
                     break
                 self._process_lookup_queue()
                 _check_news_updates(self.previous, suppress_send=self._warmup)
-                # Quick OCR price refresh (~1s per read)
-                t0 = time_mod.time()
-                self._quick_ocr_price_update()
-                elapsed = time_mod.time() - t0
-                if elapsed < 1:
-                    time_mod.sleep(1 - elapsed)
+                # OCR price refresh is handled by the dedicated thread
+                time_mod.sleep(1)
 
     def _process_lookup_queue(self):
         """Process pending Telegram stock lookup requests."""
@@ -6453,13 +6514,7 @@ class App:
         turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
         is_hot = turnover >= 10.0  # volume > 10% of float
 
-        # Country tag (non-USA only)
-        _country = enrich.get('country', '') if enrich else ''
-        _ctag = f"[{_country}]" if _country and _country not in ('USA', '-', '') else ''
-
         sym_text = f"🔥{sym}" if is_hot else sym
-        if _ctag:
-            sym_text = f"{sym_text} {_ctag}"
         sym_fg = "#ff6600" if is_hot else self.FG
 
         pct = d['pct']
@@ -6550,7 +6605,7 @@ class App:
         row1.bind('<Double-Button-1>', _dbl_click)
 
         sym_lbl = tk.Label(row1, text=rd['sym_text'], font=font_b,
-                           bg=rd['bg'], fg=rd['sym_fg'], width=10, anchor='w')
+                           bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
         sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
 
         price_lbl = tk.Label(row1, text=rd['price_text'], font=font_r,
@@ -6826,7 +6881,7 @@ class App:
             tk.Button(row2, text=f"BUY {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#1b5e20", fg="white", activebackground="#2e7d32",
                       relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('BUY', p / 100, skip_manual=True)
+                      command=lambda p=pct: self._place_order('BUY', p / 100)
                       ).pack(side='left', padx=1)
 
         tk.Button(row2, text="CLOSE ALL", font=("Helvetica", 12, "bold"),
@@ -6838,10 +6893,10 @@ class App:
             tk.Button(row2, text=f"SELL {pct}%", font=("Helvetica", 12, "bold"),
                       bg="#b71c1c", fg="white", activebackground="#c62828",
                       relief='flat', padx=6, pady=1,
-                      command=lambda p=pct: self._place_order('SELL', p / 100, skip_manual=True)
+                      command=lambda p=pct: self._place_order('SELL', p / 100)
                       ).pack(side='left', padx=1)
 
-        # Row 3: Planned Mode — Stop/TP + % radio + BUY/SELL fire buttons
+        # Row 3: Manual Stop / Take-Profit
         row3 = tk.Frame(panel, bg=self.BG)
         row3.pack(fill='x', pady=2)
         tk.Label(row3, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
@@ -6852,27 +6907,7 @@ class App:
         self._tp_entry = tk.Entry(row3, width=8, font=("Courier", 12), bg="#333", fg="white",
                                   insertbackground="white", relief='flat')
         self._tp_entry.pack(side='left', padx=2)
-
-        # % radio selector
-        self._planned_pct_var = tk.IntVar(value=100)
-        for p in [25, 50, 75, 100]:
-            tk.Radiobutton(row3, text=f"{p}%", variable=self._planned_pct_var, value=p,
-                           font=("Helvetica", 10), bg=self.BG, fg="#ccc",
-                           selectcolor="#333", activebackground=self.BG, activeforeground="white",
-                           indicatoron=True, highlightthickness=0,
-                           ).pack(side='left', padx=1)
-
-        # Fire buttons
-        tk.Button(row3, text="BUY", font=("Helvetica", 12, "bold"),
-                  bg="#1b5e20", fg="white", activebackground="#2e7d32",
-                  relief='flat', padx=8, pady=1,
-                  command=lambda: self._place_order('BUY', self._planned_pct_var.get() / 100)
-                  ).pack(side='left', padx=(6, 2))
-        tk.Button(row3, text="SELL", font=("Helvetica", 12, "bold"),
-                  bg="#b71c1c", fg="white", activebackground="#c62828",
-                  relief='flat', padx=8, pady=1,
-                  command=lambda: self._place_order('SELL', self._planned_pct_var.get() / 100)
-                  ).pack(side='left', padx=2)
+        tk.Label(row3, text="(empty = auto)", font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
 
         # Order status
         self._order_status_var = tk.StringVar(value="")
@@ -7105,7 +7140,7 @@ class App:
             self._order_status_label.config(fg=self.GREEN if success else self.RED)
         self.root.after(0, _update)
 
-    def _place_order(self, action: str, pct: float, skip_manual: bool = False):
+    def _place_order(self, action: str, pct: float):
         """Validate and send a BUY or SELL order to the OrderThread."""
         sym = self._selected_symbol_name
         log.info(f"_place_order called: {action} {pct*100:.0f}% sym={sym}")
@@ -7163,26 +7198,25 @@ class App:
             remaining = total_qty - qty
             log.info(f"SELL: {sym} total={total_qty} sell={qty} remaining={remaining}")
 
-        # ── Read manual Stop / TP from GUI (skip for quick buttons) ──
+        # ── Read manual Stop / TP from GUI ──
         manual_stop = 0.0
         manual_tp = 0.0
-        if not skip_manual:
-            try:
-                _s = self._stop_entry.get().strip()
-                if _s:
-                    manual_stop = float(_s)
-                    if manual_stop <= 0:
-                        manual_stop = 0.0
-            except ValueError:
-                pass
-            try:
-                _t = self._tp_entry.get().strip()
-                if _t:
-                    manual_tp = float(_t)
-                    if manual_tp <= 0:
-                        manual_tp = 0.0
-            except ValueError:
-                pass
+        try:
+            _s = self._stop_entry.get().strip()
+            if _s:
+                manual_stop = float(_s)
+                if manual_stop <= 0:
+                    manual_stop = 0.0
+        except ValueError:
+            pass
+        try:
+            _t = self._tp_entry.get().strip()
+            if _t:
+                manual_tp = float(_t)
+                if manual_tp <= 0:
+                    manual_tp = 0.0
+        except ValueError:
+            pass
 
         # ── Stop-loss calculation (for both BUY and partial SELL) ──
         stop_price = 0.0
@@ -7237,9 +7271,6 @@ class App:
             vwap_warning = f"\n⚠️ מתחת ל-VWAP! מחיר ${price:.2f} < VWAP ${vwap_val:.2f} (מרחק {vwap_dist_pct:.1f}%)\n"
 
         # Confirmation dialog
-        session = _get_market_session()
-        outside_rth = session != 'market'
-        rth_text = f"outsideRth={'Yes' if outside_rth else 'No'} ({session})"
         if action == 'BUY':
             if target_price > 0:
                 tp_line = f"🎯 Take-Profit: ${target_price:.2f} (manual) [LMT SELL GTC]"
@@ -7253,7 +7284,7 @@ class App:
                 f"   → Limit ${limit_price:.2f} [STP LMT GTC]\n"
                 f"{tp_line}"
                 f"{vwap_warning}\n\n"
-                f"{rth_text}\n"
+                f"outsideRth=True (pre/post market OK)\n"
                 f"TIF: DAY (buy) + GTC (stop/trail)\n"
                 f"Continue?",
                 parent=self.root,
@@ -7267,7 +7298,7 @@ class App:
                 sell_lines.append(f"\n🛑 Stop on remaining {stop_remaining_qty}sh:")
                 sell_lines.append(f"   {stop_desc}")
                 sell_lines.append(f"   → Limit ${limit_price:.2f} [STP LMT GTC]")
-            sell_lines.append(f"\n{rth_text}")
+            sell_lines.append(f"\noutsideRth=True (pre/post market OK)")
             sell_lines.append("Continue?")
             confirm = messagebox.askokcancel("Confirm Order", "\n".join(sell_lines), parent=self.root)
         if not confirm:
@@ -7341,9 +7372,6 @@ class App:
         pnl_est = (current_price - avg_cost) * qty
         pnl_pct = ((current_price / avg_cost) - 1) * 100 if avg_cost > 0 else 0
 
-        session = _get_market_session()
-        outside_rth = session != 'market'
-        rth_text = f"outsideRth={'Yes' if outside_rth else 'No'} ({session})"
         confirm = messagebox.askokcancel(
             "⚠️ CLOSE ALL",
             f"סגירת כל הפוזיציה ב-{sym}\n\n"
@@ -7352,7 +7380,7 @@ class App:
             f"Limit: ${sell_price:.2f} (−${offset:.2f} למילוי מיידי)\n"
             f"עלות ממוצעת: ${avg_cost:.4f}\n"
             f"רווח/הפסד משוער: ${pnl_est:+,.2f} ({pnl_pct:+.1f}%)\n\n"
-            f"{rth_text}\n"
+            f"outsideRth=True\n"
             f"Continue?",
             parent=self.root,
         )
