@@ -597,8 +597,9 @@ def _get_spy_daily_change() -> float:
     return _spy_cache['pct']
 
 
-# Minimum dollar volume for alerts
+# Alert filter: dollar volume >= $60K OR RVOL >= 3.0
 _MIN_DOLLAR_VOL_ALERT = 60_000
+_MIN_RVOL_ALERT = 3.0
 
 
 def _build_smart_line(sym: str, d: dict) -> str:
@@ -6463,8 +6464,10 @@ class ScannerThread(threading.Thread):
             has_news = bool(enrich.get('news'))
             report_vol_raw = d.get('volume_raw', 0)
             report_dol_vol = report_vol_raw * price if report_vol_raw and price else 0
+            report_rvol = d.get('rvol', 0)
+            passes_vol_filter = report_dol_vol >= _MIN_DOLLAR_VOL_ALERT or report_rvol >= _MIN_RVOL_ALERT
 
-            if above_vwap and has_news and report_dol_vol >= _MIN_DOLLAR_VOL_ALERT and not self._warmup:
+            if above_vwap and has_news and passes_vol_filter and not self._warmup:
                 _send_stock_report(sym, d, enrich)
                 self._reports_sent.add(sym)
                 global _daily_reports_sent
@@ -6480,8 +6483,8 @@ class ScannerThread(threading.Thread):
             elif above_vwap and has_news and self._warmup:
                 self._warmup_pending[sym] = dict(d)  # save snapshot
                 log.info(f"Deferred report (warmup): {sym} pct={pct:+.1f}% vwap=above news=yes")
-            elif report_dol_vol < _MIN_DOLLAR_VOL_ALERT and above_vwap and has_news:
-                log.info(f"Filtered {sym}: dol_vol={_format_dollar_short(report_dol_vol)} < $60K min")
+            elif not passes_vol_filter and above_vwap and has_news:
+                log.info(f"Filtered {sym}: dol_vol={_format_dollar_short(report_dol_vol)} rvol={report_rvol:.1f}x — need $60K+ or פי 3+")
             else:
                 log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={enrich.get('float', '-')} news={'yes' if has_news else 'no'} dol_vol={_format_dollar_short(report_dol_vol)}")
 
@@ -6526,10 +6529,11 @@ class ScannerThread(threading.Thread):
                 pct = d.get('pct', 0)
                 vwap = d.get('vwap', 0)
 
-                # Dollar volume filter — skip stocks with < $60K volume
+                # Filter: need $60K+ dollar volume OR RVOL 3x+
                 vol_raw = d.get('volume_raw', 0)
                 dollar_vol = vol_raw * price if vol_raw and price else 0
-                if dollar_vol < _MIN_DOLLAR_VOL_ALERT:
+                rvol_val = d.get('rvol', 0)
+                if dollar_vol < _MIN_DOLLAR_VOL_ALERT and rvol_val < _MIN_RVOL_ALERT:
                     continue
 
                 # Skip alerts if price is below VWAP by more than 5%
