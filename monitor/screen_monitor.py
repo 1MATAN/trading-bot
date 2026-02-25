@@ -539,6 +539,102 @@ def _format_volume(volume: float) -> str:
     return str(int(volume))
 
 
+def _format_dollar_short(val: float) -> str:
+    """Format dollar value as short string: $1.2M, $456K, $3.2K."""
+    if val >= 1_000_000:
+        return f"${val / 1_000_000:.1f}M"
+    elif val >= 1_000:
+        return f"${val / 1_000:.0f}K"
+    elif val > 0:
+        return f"${val:,.0f}"
+    return "$0"
+
+
+# ── SPY daily change cache (for Relative Strength) ──
+_spy_cache: dict = {'pct': 0.0, 'price': 0.0, 'ts': 0.0}
+_SPY_CACHE_TTL = 300  # refresh every 5 minutes
+
+
+def _get_spy_daily_change() -> float:
+    """Get SPY daily % change (cached 5 min). Returns 0.0 on failure."""
+    now = time_mod.time()
+    if now - _spy_cache['ts'] < _SPY_CACHE_TTL:
+        return _spy_cache['pct']
+
+    ib = _get_ibkr()
+    if not ib:
+        return _spy_cache['pct']
+
+    try:
+        spy = Stock('SPY', 'SMART', 'USD')
+        ib.qualifyContracts(spy)
+        bars = ib.reqHistoricalData(
+            spy, endDateTime="", durationStr="2 D",
+            barSizeSetting="1 day", whatToShow="TRADES",
+            useRTH=True, timeout=10,
+        )
+        if bars and len(bars) >= 2:
+            prev_close = bars[-2].close
+            cur_close = bars[-1].close
+            if prev_close > 0:
+                pct = round((cur_close - prev_close) / prev_close * 100, 2)
+                _spy_cache.update({'pct': pct, 'price': cur_close, 'ts': now})
+                return pct
+    except Exception as e:
+        log.debug(f"SPY daily change fetch failed: {e}")
+
+    return _spy_cache['pct']
+
+
+# Minimum dollar volume for alerts
+_MIN_DOLLAR_VOL_ALERT = 60_000
+
+
+def _build_smart_line(sym: str, d: dict) -> str:
+    """Build smart context line: RVOL + Dollar Volume + RS + Float Turnover.
+
+    Returns formatted Hebrew context string for Telegram alerts.
+    """
+    price = d.get('price', 0)
+    vol_raw = d.get('volume_raw', 0)
+    rvol = d.get('rvol', 0)
+    pct = d.get('pct', 0)
+
+    parts = []
+
+    # Dollar volume
+    dol_vol = vol_raw * price if vol_raw and price else 0
+    if dol_vol > 0:
+        parts.append(f"💵 {_format_dollar_short(dol_vol)}")
+
+    # RVOL
+    if rvol >= 1.5:
+        parts.append(f"🔥 RVOL {rvol:.1f}x")
+    elif rvol > 0:
+        parts.append(f"📊 RVOL {rvol:.1f}x")
+
+    # Relative Strength vs SPY
+    spy_pct = _get_spy_daily_change()
+    if spy_pct < -0.3 and pct > 0 and rvol >= 1.5:
+        parts.append(f"💪 חזקה מהשוק (SPY {spy_pct:+.1f}%)")
+
+    # Float Turnover
+    enrich = _enrichment.get(sym, {})
+    float_str = enrich.get('float', '-')
+    float_shares = _parse_float_to_shares(float_str)
+    if float_shares > 0 and vol_raw > 0:
+        turnover = vol_raw / float_shares
+        float_dol = float_shares * price
+        if turnover >= 1.0:
+            parts.append(f"🚀 סיבוב x{turnover:.1f} (פלאט {_format_dollar_short(float_dol)})")
+        elif turnover >= 0.5:
+            parts.append(f"⚡ סיבוב {turnover:.0%} (פלאט {_format_dollar_short(float_dol)})")
+        elif turnover >= 0.2:
+            parts.append(f"📈 סיבוב {turnover:.0%} (פלאט {_format_dollar_short(float_dol)})")
+
+    return " | ".join(parts)
+
+
 # ══════════════════════════════════════════════════════════
 #  IBKR Scanner — replaces screenshot + OCR + parse
 # ══════════════════════════════════════════════════════════
@@ -1879,8 +1975,11 @@ def _check_stocks_in_play(current: dict):
         pct = d.get('pct', 0)
         price = d.get('price', 0)
         vol = d.get('volume_raw', 0)
-        vol_str = _format_volume(vol) if vol else '-'
+        dol_vol = vol * price if vol and price else 0
+        dol_str = _format_dollar_short(dol_vol) if dol_vol > 0 else '-'
         flt = enrich.get('float', '-')
+        flt_shares = _parse_float_to_shares(flt)
+        flt_dol = _format_dollar_short(flt_shares * price) if flt_shares > 0 and price > 0 else flt
         short = enrich.get('short', '-')
         arrow = "🟢" if pct > 0 else "🔴"
 
@@ -1888,7 +1987,7 @@ def _check_stocks_in_play(current: dict):
             f"  {i}. {arrow} <b>{sym}</b>  ${price:.2f}  {pct:+.1f}%"
         )
         lines.append(
-            f"      Float:{flt}  Short:{short}  Vol:{vol_str}  Turnover:{turnover:.0f}%"
+            f"      פלאט:{flt_dol}  Short:{short}  💵{dol_str}  Turnover:{turnover:.0f}%"
         )
 
         # Latest news
@@ -1923,6 +2022,8 @@ _daily_events: list[dict] = []           # {time, type, symbol, detail}
 _daily_alert_counts: dict[str, int] = {}  # alert_type → count
 _alerts_per_stock: dict[str, dict[str, int]] = {}  # sym → {alert_type → count}
 _last_alert_summary_time: float = 0.0
+_news_summary_sent: set[str] = set()       # headline strings already included in a 30-min summary
+_last_news_summary_time: float = 0.0
 _daily_reports_sent: int = 0             # full stock reports sent to group
 
 
@@ -2510,6 +2611,80 @@ def _check_alert_summary(current: dict):
     log.info(f"Alert summary sent: {len(stock_totals)} stocks, {total_all} total alerts")
 
 
+_NEWS_SUMMARY_TARGETS = [0, 30]  # fire at :00 and :30
+
+def _check_news_summary(current: dict):
+    """Send a grouped news summary for gapped stocks every 30 minutes."""
+    global _last_news_summary_time
+
+    now = time_mod.time()
+    # Debounce: at least 25 minutes since last summary
+    if now - _last_news_summary_time < 1500:
+        return
+
+    now_et = datetime.now(_ET)
+    m = now_et.minute
+    if not any(t <= m < t + 2 for t in _NEWS_SUMMARY_TARGETS):
+        return
+
+    session = _get_market_session()
+    if session == 'closed':
+        return
+
+    # Collect news from enrichment + _news_sent for stocks ≥ 20%
+    stock_news: dict[str, list[str]] = {}  # sym → [headline, ...]
+    for sym, d in current.items():
+        if d.get('pct', 0) < 20:
+            continue
+
+        headlines: list[str] = []
+
+        # From enrichment (Finviz + IBKR news fetched during enrichment)
+        enrich = _enrichment.get(sym, {})
+        for n in enrich.get('news', []):
+            title = n.get('title_he') or n.get('title_en', '')
+            if title and title not in _news_summary_sent:
+                src = n.get('source', '')
+                date = n.get('date', '')
+                tag = f" [{src}]" if src else ""
+                tag += f" ({date})" if date else ""
+                headlines.append(f"  • {title}{tag}")
+                _news_summary_sent.add(title)
+
+        # From _news_sent (IBKR news sent individually by _check_news_updates)
+        for title in _news_sent.get(sym, set()):
+            if title not in _news_summary_sent:
+                headlines.append(f"  • {title}")
+                _news_summary_sent.add(title)
+
+        if headlines:
+            stock_news[sym] = headlines
+
+    if not stock_news:
+        return
+
+    _last_news_summary_time = now
+
+    session_label = {'pre_market': 'Pre-Market', 'market': 'Market',
+                     'after_hours': 'After-Hours'}.get(session, session)
+
+    lines = [
+        f"📰 <b>סיכום חדשות</b> [{session_label} {now_et.strftime('%H:%M')}]",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for sym, headlines in stock_news.items():
+        d = current.get(sym, {})
+        price = d.get('price', 0)
+        pct = d.get('pct', 0)
+        lines.append(f"\n📌 <b>{sym}</b> — ${price:.2f} ({pct:+.1f}%)")
+        lines.extend(headlines[:5])  # max 5 headlines per stock
+
+    send_telegram_alert("\n".join(lines))
+    total = sum(len(h) for h in stock_news.values())
+    log.info(f"News summary sent: {len(stock_news)} stocks, {total} headlines")
+
+
 # ══════════════════════════════════════════════════════════
 #  Session Summaries (pre-market / market / after-hours)
 # ══════════════════════════════════════════════════════════
@@ -2564,9 +2739,9 @@ def _check_session_summary():
         # Top 5 by percentage
         by_pct = sorted(_session_stocks.items(),
                         key=lambda x: abs(x[1]['pct']), reverse=True)[:5]
-        # Top 5 by volume
+        # Top 5 by dollar volume
         by_vol = sorted(_session_stocks.items(),
-                        key=lambda x: x[1].get('volume_raw', 0), reverse=True)[:5]
+                        key=lambda x: x[1].get('volume_raw', 0) * x[1].get('price', 0), reverse=True)[:5]
 
         lines = [
             f"📋 <b>סיכום {label}</b>",
@@ -2585,23 +2760,31 @@ def _check_session_summary():
             for i, (sym, info) in enumerate(by_pct, 1):
                 arrow = "🟢" if info['pct'] > 0 else "🔴"
                 vol = info.get('volume_raw', 0)
-                vol_str = _format_volume(vol) if vol else '-'
+                p = info.get('price', 0)
+                dol_v = vol * p if vol and p else 0
+                dol_str = _format_dollar_short(dol_v) if dol_v > 0 else '-'
                 enrich = _enrichment.get(sym, {})
                 flt = enrich.get('float', '-')
+                flt_sh = _parse_float_to_shares(flt)
+                flt_dol = _format_dollar_short(flt_sh * p) if flt_sh > 0 and p > 0 else flt
                 lines.append(
-                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}  Float:{flt}"
+                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  💵{dol_str}  פלאט:{flt_dol}"
                 )
 
         if by_vol:
             lines.append("")
-            lines.append("📊 <b>ווליום:</b>")
+            lines.append("📊 <b>ווליום (לפי $):</b>")
             for i, (sym, info) in enumerate(by_vol, 1):
                 vol = info.get('volume_raw', 0)
-                vol_str = _format_volume(vol) if vol else '-'
+                p = info.get('price', 0)
+                dol_v = vol * p if vol and p else 0
+                dol_str = _format_dollar_short(dol_v) if dol_v > 0 else '-'
                 enrich = _enrichment.get(sym, {})
                 flt = enrich.get('float', '-')
+                flt_sh = _parse_float_to_shares(flt)
+                flt_dol = _format_dollar_short(flt_sh * p) if flt_sh > 0 and p > 0 else flt
                 lines.append(
-                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${info['price']:.2f}  Vol:{vol_str}  Float:{flt}"
+                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  💵{dol_str}  פלאט:{flt_dol}"
                 )
 
         # News section — show latest headline per stock
@@ -2677,10 +2860,15 @@ _DOJI_COOLDOWN_SEC = 300  # 5 min cooldown per symbol+timeframe
 _doji_alerted: dict[str, float] = {}  # "SYM_5m" → timestamp
 _doji_pending: dict[str, tuple[float, float, str]] = {}  # "SYM_5m" → (doji_high, timestamp, tf_label)
 
+# ── Timeframe High Break tracking ──
+_tf_highs_cache: dict[str, dict[str, float]] = {}   # {sym: {day: X, week: Y, month: Z, quarter: Q, year: A}}
+_tf_high_alerted: dict[str, bool] = {}               # {"SYM_day": True, ...} — one alert per TF per symbol per day
+_TF_LABELS_HE = {'day': 'יומי', 'week': 'שבועי', 'month': 'חודשי', 'quarter': 'רבעוני', 'year': 'שנתי'}
+
 
 def _reset_alerts_if_new_day():
     """Clear all alert tracking state when date changes."""
-    global _alerts_date
+    global _alerts_date, _last_news_summary_time
     today = datetime.now(ZoneInfo('US/Eastern')).strftime('%Y-%m-%d')
     if today != _alerts_date:
         _alerts_date = today
@@ -2698,6 +2886,10 @@ def _reset_alerts_if_new_day():
         _vol_alert_sent.clear()
         _doji_alerted.clear()
         _doji_pending.clear()
+        _tf_highs_cache.clear()
+        _tf_high_alerted.clear()
+        _news_summary_sent.clear()
+        _last_news_summary_time = 0.0
         _session_summary_sent.clear()
         _session_stocks.clear()
         _avg_vol_cache.clear()
@@ -2974,10 +3166,23 @@ def check_volume_alert(sym: str, price: float, vwap: float,
         if title:
             news_line = f"\n📰 {title}"
 
+    # Dollar volume
+    vol_raw = 0
+    for s, d in []:  # can't access current dict here
+        pass
+    # Use enrichment avg_volume as fallback for dollar context
+    dol_line = ""
+    float_str = enrich.get('float', '-')
+    float_shares = _parse_float_to_shares(float_str)
+    if float_shares > 0:
+        float_dol = float_shares * price
+        dol_line = f"\n📦 פלאט בשווי {_format_dollar_short(float_dol)}"
+
     full = (
         f"🟣 📊 <b>VOLUME — {sym}</b>\n"
         f"🔥 RVOL {rvol:.1f}x | מעל VWAP!\n"
         f"💰 ${price:.2f} ({pct:+.1f}%) > VWAP ${vwap:.2f}"
+        f"{dol_line}"
         f"{news_line}"
     )
     compact = f"📊 RVOL {rvol:.1f}x מעל VWAP{' 📰' if news else ''}"
@@ -3065,6 +3270,101 @@ def check_doji_candle(sym: str, price: float, pct: float) -> tuple[str, str] | N
             log.info(f"Doji detected [{tf_label}] {sym}: high=${h:.4f} — waiting for breakout")
 
     return None
+
+
+# ── Timeframe High Break ──
+
+def _compute_tf_highs(sym: str) -> dict[str, float] | None:
+    """Compute previous-candle highs for day/week/month/quarter/year from _daily_cache.
+
+    Returns {day: X, week: Y, month: Z, quarter: Q, year: A} or None if no data.
+    Caches result in _tf_highs_cache (one computation per symbol per day).
+    """
+    if sym in _tf_highs_cache:
+        return _tf_highs_cache[sym]
+
+    df = _daily_cache.get(sym)
+    if df is None or len(df) < 5:
+        return None
+
+    # Ensure datetime index for resampling
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if 'date' in df.columns:
+            df = df.copy()
+            df.index = pd.to_datetime(df['date'])
+        else:
+            return None
+
+    highs: dict[str, float] = {}
+    try:
+        # Previous day high = second-to-last daily bar
+        if len(df) >= 2:
+            highs['day'] = float(df['high'].iloc[-2])
+
+        # Resample to weekly, monthly, quarterly, yearly
+        for tf, rule in [('week', 'W'), ('month', 'ME'), ('quarter', 'QE'), ('year', 'YE')]:
+            resampled = df['high'].resample(rule).max().dropna()
+            if len(resampled) >= 2:
+                highs[tf] = float(resampled.iloc[-2])
+    except Exception as e:
+        log.debug(f"TF highs compute error {sym}: {e}")
+        return None
+
+    if not highs:
+        return None
+
+    _tf_highs_cache[sym] = highs
+    return highs
+
+
+def check_timeframe_high_break(sym: str, price: float, pct: float) -> tuple[str, str] | None:
+    """Alert when price breaks above previous day/week/month/quarter/year candle high.
+
+    One alert per timeframe per symbol per day (cooldown via _tf_high_alerted).
+    Requires enrichment (daily data must be cached via calc_fib_levels).
+    """
+    if pct < 20 or price <= 0:
+        return None
+
+    highs = _compute_tf_highs(sym)
+    if not highs:
+        return None
+
+    broken = []  # [(tf_key, prev_high), ...]
+    for tf, prev_high in highs.items():
+        alert_key = f"{sym}_{tf}"
+        if _tf_high_alerted.get(alert_key):
+            continue
+        if price > prev_high > 0:
+            broken.append((tf, prev_high))
+            _tf_high_alerted[alert_key] = True
+
+    if not broken:
+        return None
+
+    if len(broken) == 1:
+        tf, prev_high = broken[0]
+        label = _TF_LABELS_HE[tf]
+        change_pct = (price - prev_high) / prev_high * 100
+        full = (
+            f"🟢 📊 <b>TF HIGH</b> — {sym}\n"
+            f"💰 ${price:.2f} שבר גבוה {label}!\n"
+            f"📊 גבוה קודם: ${prev_high:.2f} | שינוי: {change_pct:+.1f}%"
+        )
+        compact = f"📊 שבר גבוה {label} ${prev_high:.2f}"
+    else:
+        # Multiple timeframes broken simultaneously
+        broken.sort(key=lambda x: ['day', 'week', 'month', 'quarter', 'year'].index(x[0]))
+        labels = [_TF_LABELS_HE[tf] for tf, _ in broken]
+        details = " + ".join(f"גבוה {_TF_LABELS_HE[tf]} (${h:.2f})" for tf, h in broken)
+        full = (
+            f"🟢 📊 <b>TF HIGH</b> — {sym}\n"
+            f"💰 ${price:.2f} שבר: {details}\n"
+            f"📊 שינוי: {pct:+.1f}%"
+        )
+        compact = f"📊 שבר גבוה {'/'.join(labels)} ${price:.2f}"
+
+    return full, compact
 
 
 # ══════════════════════════════════════════════════════════
@@ -3522,8 +3822,13 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
 
     # ── Build consolidated message ──
     # Order: Header → News → Fundamentals → Technical → Fib
+    vol_raw = stock.get('volume_raw', 0)
+    dol_vol = vol_raw * price if vol_raw and price else 0
+    dol_vol_str = _format_dollar_short(dol_vol) if dol_vol > 0 else stock.get('volume', '-')
+    rvol = stock.get('rvol', 0)
+    rvol_tag = f"  RVOL {rvol:.1f}x" if rvol > 0 else ""
     lines = [
-        f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  Vol:{stock.get('volume', '-')}",
+        f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  💵{dol_vol_str}{rvol_tag}",
     ]
 
     # Warn if stock is NOT tradeable on IBKR
@@ -3548,10 +3853,26 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     lines.append(f"🏛️ Inst: {enriched.get('inst_own', '-')} ({enriched.get('inst_trans', '-')}) | Insider: {enriched.get('insider_own', '-')} ({enriched.get('insider_trans', '-')})")
     lines.append(f"💰 MCap: {enriched.get('market_cap', '-')}")
     lines.append("")
-    lines.append(f"📊 Float: {enriched['float']} | Short: {enriched['short']}")
+    # Float — show both shares and dollar value
+    float_str = enriched['float']
+    float_shares = _parse_float_to_shares(float_str)
+    float_dol_str = f" ({_format_dollar_short(float_shares * price)})" if float_shares > 0 and price > 0 else ""
+    lines.append(f"📊 Float: {float_str}{float_dol_str} | Short: {enriched['short']}")
     lines.append(f"💰 {eps_icon} EPS: {eps} | Cash: ${enriched['cash']}")
     lines.append(f"📅 Earnings: {enriched['earnings']}")
-    lines.append(f"📉 Vol: {enriched.get('fvz_volume', '-')} | Avg: {enriched.get('avg_volume', '-')}")
+    # Volume — show dollar volume
+    fvz_vol_str = enriched.get('fvz_volume', '-')
+    avg_vol_str = enriched.get('avg_volume', '-')
+    lines.append(f"📉 Vol: {fvz_vol_str} (💵{dol_vol_str}) | Avg: {avg_vol_str}")
+    # Float turnover
+    if float_shares > 0 and vol_raw > 0:
+        turnover_ratio = vol_raw / float_shares
+        if turnover_ratio >= 1.0:
+            lines.append(f"🚀 סיבוב פלאט: x{turnover_ratio:.1f} — הפלאט עבר מיד ליד!")
+        elif turnover_ratio >= 0.5:
+            lines.append(f"⚡ סיבוב פלאט: {turnover_ratio:.0%} — חצי מהפלאט עבר")
+        elif turnover_ratio >= 0.2:
+            lines.append(f"📈 סיבוב פלאט: {turnover_ratio:.0%}")
     lines.append(f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}")
     lines.append(f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}")
 
@@ -3564,6 +3885,11 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
         else:
             vwap_dist = (vwap - price) / price * 100
             lines.append(f"🔴 VWAP: ${vwap:.2f} — מחיר מתחת ל-VWAP ({vwap_dist:.1f}% מתחת)")
+
+    # Relative Strength vs SPY
+    spy_pct = _get_spy_daily_change()
+    if spy_pct < -0.3 and stock.get('pct', 0) > 0 and rvol >= 1.5:
+        lines.append(f"💪 <b>חזקה מהשוק!</b> SPY {spy_pct:+.1f}% | המניה {stock['pct']:+.1f}% בווליום גבוה")
 
     # Unfilled gap detection from daily data (threshold: $0.05)
     df_daily = ma_frames.get('D')
@@ -6128,15 +6454,17 @@ class ScannerThread(threading.Thread):
                 self.on_status(f"#{self.count}  Enriching {sym}... ({enriched_count+1}/{len(new_syms)})")
             _enrich_stock(sym, d['price'], on_status=self.on_status)
 
-            # Filter: send Telegram report if above VWAP + has news
+            # Filter: send Telegram report if above VWAP + has news + $60K min volume
             enrich = _enrichment.get(sym, {})
             vwap = d.get('vwap', 0)
             pct = d.get('pct', 0)
             price = d.get('price', 0)
             above_vwap = vwap > 0 and price > vwap
             has_news = bool(enrich.get('news'))
+            report_vol_raw = d.get('volume_raw', 0)
+            report_dol_vol = report_vol_raw * price if report_vol_raw and price else 0
 
-            if above_vwap and has_news and not self._warmup:
+            if above_vwap and has_news and report_dol_vol >= _MIN_DOLLAR_VOL_ALERT and not self._warmup:
                 _send_stock_report(sym, d, enrich)
                 self._reports_sent.add(sym)
                 global _daily_reports_sent
@@ -6152,8 +6480,10 @@ class ScannerThread(threading.Thread):
             elif above_vwap and has_news and self._warmup:
                 self._warmup_pending[sym] = dict(d)  # save snapshot
                 log.info(f"Deferred report (warmup): {sym} pct={pct:+.1f}% vwap=above news=yes")
+            elif report_dol_vol < _MIN_DOLLAR_VOL_ALERT and above_vwap and has_news:
+                log.info(f"Filtered {sym}: dol_vol={_format_dollar_short(report_dol_vol)} < $60K min")
             else:
-                log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={enrich.get('float', '-')} news={'yes' if has_news else 'no'}")
+                log.info(f"Filtered {sym}: pct={pct:+.1f}% vwap={'above' if above_vwap else 'below'} float={enrich.get('float', '-')} news={'yes' if has_news else 'no'} dol_vol={_format_dollar_short(report_dol_vol)}")
 
             enriched_count += 1
             # Live-update GUI after each enrichment
@@ -6196,6 +6526,12 @@ class ScannerThread(threading.Thread):
                 pct = d.get('pct', 0)
                 vwap = d.get('vwap', 0)
 
+                # Dollar volume filter — skip stocks with < $60K volume
+                vol_raw = d.get('volume_raw', 0)
+                dollar_vol = vol_raw * price if vol_raw and price else 0
+                if dollar_vol < _MIN_DOLLAR_VOL_ALERT:
+                    continue
+
                 # Skip alerts if price is below VWAP by more than 5%
                 # (above VWAP or within 5% below → OK)
                 if vwap > 0 and price > 0 and price < vwap:
@@ -6214,6 +6550,7 @@ class ScannerThread(threading.Thread):
                 rvol = d.get('rvol', 0)
                 _collect(sym, check_volume_alert(sym, price, vwap, rvol, pct), 'vwap', 'Volume')
                 _collect(sym, check_doji_candle(sym, price, pct), 'spike', 'Doji')
+                _collect(sym, check_timeframe_high_break(sym, price, pct), 'hod', 'TF High')
 
             # Send all alerts as one batch
             if batch_by_sym:
@@ -6235,11 +6572,15 @@ class ScannerThread(threading.Thread):
                 btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
 
                 if len(batch_syms) == 1 and total_alerts == 1:
-                    # Single stock, single alert — full text + fib levels
+                    # Single stock, single alert — full text + fib levels + smart context
                     sym0 = batch_syms[0]
                     sd = current.get(sym0, {})
                     sp = sd.get('price', 0)
                     msg = batch_full_texts[0]
+                    # Smart context: RVOL, dollar volume, RS, float turnover
+                    smart = _build_smart_line(sym0, sd)
+                    if smart:
+                        msg += f"\n{smart}"
                     if sp > 0:
                         fresh_ma = _get_fresh_ma_rows(sym0, sp)
                         fib_txt = _format_fib_text(sym0, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
@@ -6256,8 +6597,11 @@ class ScannerThread(threading.Thread):
                         spct = sd.get('pct', 0)
                         alerts = batch_by_sym[s]
 
-                        # Stock header + compact alert lines
+                        # Stock header + smart context + compact alert lines
                         block = f"📌 <b>{s}</b> — ${sp:.2f} ({spct:+.1f}%)"
+                        smart = _build_smart_line(s, sd)
+                        if smart:
+                            block += f"\n{smart}"
                         for line in alerts:
                             block += f"\n  {line}"
 
@@ -6334,9 +6678,10 @@ class ScannerThread(threading.Thread):
         # Float report runs even during warmup (for force-flag support)
         _check_float_report(current)
 
-        # Alert summary every 30 minutes
+        # Alert summary + news summary every 30 minutes
         if not self._warmup:
             _check_alert_summary(current)
+            _check_news_summary(current)
 
         # ── Final GUI update with all enrichment ──
         merged = self._merge_stocks(current)
