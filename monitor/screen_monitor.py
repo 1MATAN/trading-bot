@@ -1551,8 +1551,9 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
             btn = _make_lookup_button(sym)
             send_telegram_alert("\n".join(lines), reply_markup=btn)
             # Push to GUI ALERTS panel
-            if _gui_alert_cb:
-                _gui_alert_cb(f"📰 NEWS — {sym} ({len(new_headlines)} headlines)")
+            # GUI alert disabled — Telegram alerts only
+            # if _gui_alert_cb:
+            #     _gui_alert_cb(f"📰 NEWS — {sym} ({len(new_headlines)} headlines)")
         log.info(f"News alert: {sym} — {len(new_headlines)} new headlines{' (warmup)' if suppress_send else ''}")
 
     # Clean up symbols that dropped below threshold
@@ -3610,10 +3611,10 @@ def _send_stock_report(sym: str, stock: dict, enriched: dict):
     send_telegram_alert(text)
     if chart_path:
         send_telegram_alert_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
-    # Push summary to GUI ALERTS panel
-    if _gui_alert_cb:
-        flt = enriched.get('float', '-')
-        _gui_alert_cb(f"📋 REPORT — {sym} ${stock['price']:.2f} {stock['pct']:+.1f}% Float:{flt}")
+    # GUI alert disabled — Telegram alerts only
+    # if _gui_alert_cb:
+    #     flt = enriched.get('float', '-')
+    #     _gui_alert_cb(f"📋 REPORT — {sym} ${stock['price']:.2f} {stock['pct']:+.1f}% Float:{flt}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -6181,7 +6182,7 @@ class ScannerThread(threading.Thread):
                 full, compact = result
                 batch_full_texts.append(full)
                 batch_by_sym.setdefault(sym, []).append(compact)
-                play_alert_sound(sound_type)
+                # play_alert_sound(sound_type)  # disabled — Telegram alerts only
                 _daily_alert_counts[counter_name] = _daily_alert_counts.get(counter_name, 0) + 1
                 _alerts_per_stock.setdefault(sym, {})
                 _alerts_per_stock[sym][counter_name] = _alerts_per_stock[sym].get(counter_name, 0) + 1
@@ -6216,11 +6217,11 @@ class ScannerThread(threading.Thread):
 
             # Send all alerts as one batch
             if batch_by_sym:
-                # GUI alerts (full text, stripped of HTML)
-                if self.on_alert:
-                    for full_text in batch_full_texts:
-                        clean = re.sub(r'<[^>]+>', '', full_text)[:100]
-                        self.on_alert(clean)
+                # GUI alerts disabled — Telegram alerts only
+                # if self.on_alert:
+                #     for full_text in batch_full_texts:
+                #         clean = re.sub(r'<[^>]+>', '', full_text)[:100]
+                #         self.on_alert(clean)
 
                 total_alerts = sum(len(v) for v in batch_by_sym.values())
 
@@ -8051,11 +8052,12 @@ class App:
                 price_max=self.price_max.get(),
                 on_status=self._st,
                 on_stocks=self._update_stock_table,
-                on_alert=self._push_alert,
+                on_alert=None,  # GUI alerts disabled — Telegram only
                 on_price_update=self._update_prices_inplace,
             )
-            global _gui_alert_cb
-            _gui_alert_cb = self._push_alert
+            # GUI alerts disabled — Telegram alerts only
+            # global _gui_alert_cb
+            # _gui_alert_cb = self._push_alert
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
             self.status.set("Scanner running...")
