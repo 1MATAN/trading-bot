@@ -540,9 +540,9 @@ def _format_volume(volume: float) -> str:
 
 
 def _format_dollar_short(val: float) -> str:
-    """Format dollar value as short string: $1.2M, $456K, $3.2K."""
+    """Format dollar value as short string: $3.16M, $456K."""
     if val >= 1_000_000:
-        return f"${val / 1_000_000:.1f}M"
+        return f"${val / 1_000_000:.2f}מ"
     elif val >= 1_000:
         return f"${val / 1_000:.0f}K"
     elif val > 0:
@@ -605,7 +605,7 @@ def _build_smart_line(sym: str, d: dict) -> str:
     # Dollar volume
     dol_vol = vol_raw * price if vol_raw and price else 0
     if dol_vol > 0:
-        parts.append(f"💵 {_format_dollar_short(dol_vol)}")
+        parts.append(f"💵 ווליום {_format_dollar_short(dol_vol)}")
 
     # RVOL
     if rvol >= 1.5:
@@ -626,11 +626,11 @@ def _build_smart_line(sym: str, d: dict) -> str:
         turnover = vol_raw / float_shares
         float_dol = float_shares * price
         if turnover >= 1.0:
-            parts.append(f"🚀 סיבוב x{turnover:.1f} (פלאט {_format_dollar_short(float_dol)})")
+            parts.append(f"🚀 סיבוב x{turnover:.1f} (מניות פניות {_format_dollar_short(float_dol)})")
         elif turnover >= 0.5:
-            parts.append(f"⚡ סיבוב {turnover:.0%} (פלאט {_format_dollar_short(float_dol)})")
+            parts.append(f"⚡ סיבוב {turnover:.0%} (מניות פניות {_format_dollar_short(float_dol)})")
         elif turnover >= 0.2:
-            parts.append(f"📈 סיבוב {turnover:.0%} (פלאט {_format_dollar_short(float_dol)})")
+            parts.append(f"📈 סיבוב {turnover:.0%} (מניות פניות {_format_dollar_short(float_dol)})")
 
     return " | ".join(parts)
 
@@ -1987,7 +1987,7 @@ def _check_stocks_in_play(current: dict):
             f"  {i}. {arrow} <b>{sym}</b>  ${price:.2f}  {pct:+.1f}%"
         )
         lines.append(
-            f"      פלאט:{flt_dol}  Short:{short}  💵{dol_str}  Turnover:{turnover:.0f}%"
+            f"      מניות פניות:{flt_dol}  Short:{short}  ווליום:{dol_str}  Turnover:{turnover:.0f}%"
         )
 
         # Latest news
@@ -2768,7 +2768,7 @@ def _check_session_summary():
                 flt_sh = _parse_float_to_shares(flt)
                 flt_dol = _format_dollar_short(flt_sh * p) if flt_sh > 0 and p > 0 else flt
                 lines.append(
-                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  💵{dol_str}  פלאט:{flt_dol}"
+                    f"  {i}. {arrow} <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  ווליום:{dol_str}  מ.פניות:{flt_dol}"
                 )
 
         if by_vol:
@@ -2784,7 +2784,7 @@ def _check_session_summary():
                 flt_sh = _parse_float_to_shares(flt)
                 flt_dol = _format_dollar_short(flt_sh * p) if flt_sh > 0 and p > 0 else flt
                 lines.append(
-                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  💵{dol_str}  פלאט:{flt_dol}"
+                    f"  {i}. <b>{sym}</b> {info['pct']:+.1f}%  ${p:.2f}  ווליום:{dol_str}  מ.פניות:{flt_dol}"
                 )
 
         # News section — show latest headline per stock
@@ -3163,7 +3163,7 @@ def check_volume_alert(sym: str, price: float, vwap: float,
     # Float dollar value
     float_str = enrich.get('float', '-')
     float_shares = _parse_float_to_shares(float_str)
-    flt_tag = f" | פלאט {_format_dollar_short(float_shares * price)}" if float_shares > 0 else ""
+    flt_tag = f" | מניות פניות {_format_dollar_short(float_shares * price)}" if float_shares > 0 else ""
 
     full = (
         f"📊 <b>ווליום חריג — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
@@ -3811,7 +3811,7 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     rvol = stock.get('rvol', 0)
     rvol_tag = f"  RVOL {rvol:.1f}x" if rvol > 0 else ""
     lines = [
-        f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  💵{dol_vol_str}{rvol_tag}",
+        f"🆕 <b>{sym}</b> — ${price:.2f}  {stock['pct']:+.1f}%  ווליום {dol_vol_str}{rvol_tag}",
     ]
 
     # Warn if stock is NOT tradeable on IBKR
@@ -3846,16 +3846,16 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     # Volume — show dollar volume
     fvz_vol_str = enriched.get('fvz_volume', '-')
     avg_vol_str = enriched.get('avg_volume', '-')
-    lines.append(f"📉 Vol: {fvz_vol_str} (💵{dol_vol_str}) | Avg: {avg_vol_str}")
+    lines.append(f"📉 ווליום: {fvz_vol_str} ({dol_vol_str}) | ממוצע: {avg_vol_str}")
     # Float turnover
     if float_shares > 0 and vol_raw > 0:
         turnover_ratio = vol_raw / float_shares
         if turnover_ratio >= 1.0:
-            lines.append(f"🚀 סיבוב פלאט: x{turnover_ratio:.1f} — הפלאט עבר מיד ליד!")
+            lines.append(f"🚀 סיבוב מניות פניות: x{turnover_ratio:.1f} — המניות פניות עבר מיד ליד!")
         elif turnover_ratio >= 0.5:
-            lines.append(f"⚡ סיבוב פלאט: {turnover_ratio:.0%} — חצי מהפלאט עבר")
+            lines.append(f"⚡ סיבוב מניות פניות: {turnover_ratio:.0%} — חצי מהמניות פניות עבר")
         elif turnover_ratio >= 0.2:
-            lines.append(f"📈 סיבוב פלאט: {turnover_ratio:.0%}")
+            lines.append(f"📈 סיבוב מניות פניות: {turnover_ratio:.0%}")
     lines.append(f"📊 Volatility: W {enriched.get('vol_w', '-')} | M {enriched.get('vol_m', '-')}")
     lines.append(f"🎯 52W: ↑${enriched.get('52w_high', '-')} | ↓${enriched.get('52w_low', '-')}")
 
