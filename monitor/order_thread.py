@@ -112,6 +112,10 @@ class OrderThread(threading.Thread):
         self.buying_power: float = 0.0
         self.positions: dict[str, tuple] = {}  # sym → (qty, avgCost, mktPrice, pnl)
 
+        # Connection backoff — prevent reconnect spam when TWS needs manual action
+        self._connect_fail_count: int = 0
+        self._connect_last_attempt: float = 0.0
+
     # ── Public API (called from GUI thread) ──
 
     def submit(self, req: dict):
@@ -203,17 +207,27 @@ class OrderThread(threading.Thread):
     def _connect(self) -> bool:
         if self._ib and self._ib.isConnected():
             return True
+
+        # Backoff: prevent reconnect spam when TWS needs manual action
+        if self._connect_fail_count > 0:
+            backoff = min(5 * (2 ** (self._connect_fail_count - 1)), 60)
+            elapsed = time_mod.time() - self._connect_last_attempt
+            if elapsed < backoff:
+                return False
+
         if self._ib:
             try:
                 self._ib.disconnect()
             except Exception:
                 pass
         try:
+            self._connect_last_attempt = time_mod.time()
             self._ib = IB()
             self._ib.connect(self._host, self._port,
                              clientId=MONITOR_ORDER_CLIENT_ID,
                              timeout=_CONNECT_TIMEOUT)
             log.info(f"OrderThread: IBKR connected (clientId={MONITOR_ORDER_CLIENT_ID})")
+            self._connect_fail_count = 0
 
             # ib_insync auto-subscribes to account updates on connect.
             # Pump event loop to receive the initial account snapshot.
@@ -229,7 +243,11 @@ class OrderThread(threading.Thread):
 
             return True
         except Exception as e:
-            log.error(f"OrderThread: IBKR connect failed: {e}")
+            self._connect_fail_count += 1
+            backoff = min(5 * (2 ** (self._connect_fail_count - 1)), 60)
+            if self._connect_fail_count <= 3 or self._connect_fail_count % 10 == 0:
+                log.error(f"OrderThread: IBKR connect failed: {e} "
+                          f"(attempt #{self._connect_fail_count}, next in {backoff}s)")
             self._ib = None
             return False
 

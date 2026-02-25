@@ -112,6 +112,20 @@ logging.basicConfig(
 log = logging.getLogger("monitor")
 
 
+# Suppress ib_insync "Error 162 ... scanner subscription cancelled" —
+# this is expected behavior (reqScannerData auto-cancels) but ib_insync
+# logs it as ERROR, flooding the log with ~95 false errors per session.
+class _IbInsyncScannerFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if 'Error 162' in msg and 'subscription cancelled' in msg:
+            return False
+        return True
+
+
+logging.getLogger('ib_insync.wrapper').addFilter(_IbInsyncScannerFilter())
+
+
 # ══════════════════════════════════════════════════════════
 #  IBKR Connection (single synchronous IB instance)
 # ══════════════════════════════════════════════════════════
@@ -580,111 +594,6 @@ def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
     return valid_items
 
 
-def _run_ibkr_scan(price_min: float = MONITOR_PRICE_MIN,
-                   price_max: float = MONITOR_PRICE_MAX) -> dict:
-    """Run multiple IBKR scanners and merge results (with full enrichment).
-
-    Runs TOP_PERC_GAIN + HOT_BY_VOLUME + MOST_ACTIVE for broad coverage
-    across pre-market, market, and after-hours sessions.
-
-    Returns dict: {symbol: {'price': float, 'pct': float, 'volume': str, ...}}
-    """
-    valid_items = _run_ibkr_scanner_list(price_min, price_max)
-    if not valid_items:
-        return {}
-
-    stocks: dict[str, dict] = {}
-
-    # ── Enrich with historical data ──
-    for sym, stock_contract in valid_items:
-
-        # Known stock with cached avg volume → only 2D needed
-        has_cached_avg = sym in _avg_vol_cache
-        duration = "2 D" if has_cached_avg else "12 D"
-
-        try:
-            bars = ib.reqHistoricalData(
-                stock_contract,
-                endDateTime="",
-                durationStr=duration,
-                barSizeSetting="1 day",
-                whatToShow="TRADES",
-                useRTH=True,
-                timeout=15,
-            )
-            if not bars:
-                continue
-
-            last_bar = bars[-1]
-            volume = last_bar.volume
-            session = _get_market_session()
-
-            price, prev_close, ext_high, ext_low, ext_vwap = \
-                _fetch_extended_hours_price(ib, stock_contract, session, bars)
-
-            pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
-
-            # RVOL: normalized by expected volume at current time of day
-            if has_cached_avg:
-                avg_vol = _avg_vol_cache[sym]
-            elif len(bars) >= 2:
-                prev_volumes = [b.volume for b in bars[:-1]]
-                avg_vol = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 0
-                if avg_vol > 0:
-                    _avg_vol_cache[sym] = avg_vol
-            else:
-                avg_vol = 0
-
-            if avg_vol > 0:
-                expected = avg_vol * _expected_volume_fraction()
-                rvol = round(volume / expected, 1) if expected > 0 else 0.0
-            else:
-                rvol = 0.0
-            vol_str = _format_volume(volume)
-            vwap = round(last_bar.average, 4) if last_bar.average else 0.0
-
-            # Override with extended-hours values when available
-            rth_high = round(last_bar.high, 4)
-            rth_low = round(last_bar.low, 4)
-            if session == 'pre_market' and ext_high is not None:
-                # Pre-market: use only extended-hours data (RTH bar is yesterday)
-                day_high = round(ext_high, 4)
-                day_low = round(ext_low, 4)
-                if ext_vwap is not None:
-                    vwap = round(ext_vwap, 4)
-            elif session == 'after_hours' and ext_high is not None:
-                # After-hours: combine RTH + AH data
-                day_high = round(max(rth_high, ext_high), 4)
-                day_low = round(min(rth_low, ext_low), 4)
-                if ext_vwap is not None:
-                    vwap = round(ext_vwap, 4)
-            else:
-                day_high = rth_high
-                day_low = rth_low
-
-            stocks[sym] = {
-                "price": round(price, 2),
-                "pct": round(pct, 1),
-                "volume": vol_str,
-                "volume_raw": int(volume),
-                "rvol": rvol,
-                "float": "",
-                "vwap": vwap,
-                "prev_close": round(prev_close, 4),
-                "day_high": day_high,
-                "day_low": day_low,
-                "contract": stock_contract,
-            }
-
-        except Exception as e:
-            log.debug(f"Enrich {sym} failed: {e}")
-            continue
-
-    session = _get_market_session()
-    log.info(f"Scanner [{session}]: {len(valid_items)} unique from {len(MONITOR_SCAN_CODES)} scans → {len(stocks)} enriched symbols")
-    return stocks
-
-
 # ══════════════════════════════════════════════════════════
 #  Webull Desktop OCR Scanner
 # ══════════════════════════════════════════════════════════
@@ -720,6 +629,38 @@ def _get_window_name(wid: int) -> str:
     except Exception:
         pass
     return ""
+
+
+def _get_window_full_name(wid: int) -> str:
+    """Get full window title (for matching on restart)."""
+    try:
+        result = subprocess.run(
+            ['xdotool', 'getwindowname', str(wid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _find_window_by_title(title: str) -> int | None:
+    """Find a window by its title. Returns first matching WID or None."""
+    if not title:
+        return None
+    try:
+        result = subprocess.run(
+            ['xdotool', 'search', '--name', title],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # xdotool returns one WID per line; pick the first
+            first_wid = result.stdout.strip().split('\n')[0]
+            return int(first_wid)
+    except Exception:
+        pass
+    return None
 
 
 def add_scanner_source(wid: int, name: str = ""):
@@ -1085,7 +1026,7 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
     """Scan via OCR on all configured scanner sources.
 
     Loops over _scanner_sources, OCR each window, merges results
-    (prefer source with more fields). Returns same dict format as _run_ibkr_scan.
+    (prefer source with more fields). Returns dict: {sym: {price, pct, volume, ...}}.
     Falls back to empty dict if no sources configured or all fail.
     """
     global _scanner_sources
@@ -1098,7 +1039,7 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
         _scanner_sources = valid
 
     if not valid:
-        log.info("No scanner sources configured, will fallback to IBKR scan")
+        log.debug("No scanner sources configured, will fallback to IBKR scan")
         return {}
 
     all_parsed: list[dict] = []
@@ -7792,7 +7733,7 @@ class App:
 
         # VWAP distance warning
         vwap_warning = ""
-        stock_data = self._stocks.get(sym, {})
+        stock_data = self._stock_data.get(sym, {})
         vwap_val = stock_data.get('vwap', 0)
         if vwap_val > 0 and entry_price < vwap_val:
             vwap_dist_pct = (vwap_val - entry_price) / entry_price * 100
@@ -8138,7 +8079,11 @@ class App:
 
     def _save(self):
         with _scanner_sources_lock:
-            scanner_data = [{'wid': s['wid'], 'name': s['name']} for s in _scanner_sources]
+            scanner_data = [
+                {'wid': s['wid'], 'name': s['name'],
+                 'wm_title': _get_window_full_name(s['wid'])}
+                for s in _scanner_sources
+            ]
         with open(STATE_PATH, 'w') as f:
             json.dump({
                 'freq': self.freq.get(),
@@ -8171,8 +8116,17 @@ class App:
             verified = []
             for src in saved_sources:
                 wid = int(src.get('wid', 0))
+                name = src.get('name', '')
+                wm_title = src.get('wm_title', '')
                 if wid and _verify_wid(wid):
-                    verified.append({'wid': wid, 'name': src.get('name', '')})
+                    verified.append({'wid': wid, 'name': name})
+                elif wm_title:
+                    # WID died (app restarted) — try to find window by title
+                    new_wid = _find_window_by_title(wm_title)
+                    if new_wid and _verify_wid(new_wid):
+                        new_name = _get_window_name(new_wid)
+                        verified.append({'wid': new_wid, 'name': new_name})
+                        log.info(f"Scanner source recovered by title: '{wm_title}' → WID={new_wid}")
             with _scanner_sources_lock:
                 _scanner_sources = verified
             self._refresh_scanner_slots()
