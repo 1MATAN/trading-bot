@@ -2942,10 +2942,10 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> tuple[str, str] 
         _hod_last_alert_time[sym] = now
         pct = current.get('pct', 0)
         full = (
-            f"🔺 <b>HOD — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+            f"🔺 <b>שיא יומי — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
             f"קודם ${known_high:.2f}"
         )
-        compact = f"🔺 HOD ${price:.2f} (קודם ${known_high:.2f})"
+        compact = f"🔺 שיא יומי ${price:.2f} (קודם ${known_high:.2f})"
         return full, compact
     else:
         # Not a new high — keep tracker up to date with IBKR data
@@ -2983,10 +2983,10 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
                     info = ratio_map.get(lv_key)
                     ratio_label = f" ({info[0]} {info[1]})" if info else ""
                     full = (
-                        f"🎯 <b>FIB x2 — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                        f"🎯 <b>נגיעת פיבו x2 — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
                         f"רמה ${lv:.4f}{ratio_label}"
                     )
-                    compact = f"🎯 FIB x2 ${lv:.4f}{ratio_label}"
+                    compact = f"🎯 פיבו x2 ${lv:.4f}{ratio_label}"
                     return full, compact
     return None
 
@@ -3027,10 +3027,10 @@ def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> tuple
         _lod_touch_tracker[sym] = count
         if count == 2:
             full = (
-                f"🔻 <b>LOD x2 — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"🔻 <b>נמוך יומי x2 — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
                 f"נמוך ${effective_low:.2f} — תמיכה/שבירה?"
             )
-            compact = f"🔻 LOD x2 נמוך ${effective_low:.2f}"
+            compact = f"🔻 נמוך יומי x2 ${effective_low:.2f}"
             return full, compact
     return None
 
@@ -3068,10 +3068,10 @@ def check_vwap_cross(sym: str, price: float, vwap: float, pct: float) -> tuple[s
     if prev_side == 'below':
         _vwap_last_alert[sym] = time_mod.time()
         full = (
-            f"⚡ <b>VWAP↑ — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-            f"חצה ${vwap:.2f}"
+            f"⚡ <b>חציית VWAP — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+            f"חצה מעל ${vwap:.2f}"
         )
-        compact = f"⚡ VWAP↑ חצה ${vwap:.2f}"
+        compact = f"⚡ חציית VWAP ${vwap:.2f}"
         return full, compact
     else:
         # Cross below — update state silently, no alert
@@ -3121,10 +3121,10 @@ def check_spike(sym: str, price: float, pct: float) -> tuple[str, str] | None:
     if change_pct >= 8.0:
         _spike_alerted[sym] = now
         full = (
-            f"🚀 <b>SPIKE +{change_pct:.1f}% — {sym}</b> ב-{elapsed_min:.1f} דק\n"
+            f"🚀 <b>קפיצה +{change_pct:.1f}% — {sym}</b> ב-{elapsed_min:.1f} דק\n"
             f"${old_price:.2f}→${price:.2f} | יומי {pct:+.1f}%"
         )
-        compact = f"🚀 SPIKE +{change_pct:.1f}% ${old_price:.2f}→${price:.2f}"
+        compact = f"🚀 קפיצה +{change_pct:.1f}% ${old_price:.2f}→${price:.2f}"
         return full, compact
     return None
 
@@ -3166,11 +3166,11 @@ def check_volume_alert(sym: str, price: float, vwap: float,
     flt_tag = f" | פלאט {_format_dollar_short(float_shares * price)}" if float_shares > 0 else ""
 
     full = (
-        f"📊 <b>VOLUME — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+        f"📊 <b>ווליום חריג — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
         f"RVOL {rvol:.1f}x מעל VWAP ${vwap:.2f}{flt_tag}"
         f"{news_line}"
     )
-    compact = f"📊 RVOL {rvol:.1f}x מעל VWAP{' 📰' if news else ''}"
+    compact = f"📊 ווליום RVOL {rvol:.1f}x מעל VWAP{' 📰' if news else ''}"
     return full, compact
 
 
@@ -3209,10 +3209,10 @@ def check_doji_candle(sym: str, price: float, pct: float) -> tuple[str, str] | N
         tfs = ", ".join(tf for tf, _ in breakout_hits)
         doji_h = breakout_hits[0][1]
         full = (
-            f"🔺 <b>DOJI — {sym}</b> [{tfs}] ${price:.2f} ({pct:+.1f}%)\n"
+            f"🔺 <b>פריצת דוג׳י — {sym}</b> [{tfs}] ${price:.2f} ({pct:+.1f}%)\n"
             f"שבר ${doji_h:.4f}"
         )
-        compact = f"🔺 DOJI [{tfs}] שבר ${doji_h:.4f}"
+        compact = f"🔺 פריצת דוג׳י [{tfs}] ${doji_h:.4f}"
         return full, compact
 
     # ── Phase 1: Detect new completed Doji candles → store pending ──
@@ -3332,20 +3332,20 @@ def check_timeframe_high_break(sym: str, price: float, pct: float) -> tuple[str,
         label = _TF_LABELS_HE[tf]
         change_pct = (price - prev_high) / prev_high * 100
         full = (
-            f"📊 <b>TF HIGH — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-            f"שבר גבוה {label} ${prev_high:.2f} ({change_pct:+.1f}%)"
+            f"📊 <b>שבירת גבוה {label} — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+            f"גבוה קודם ${prev_high:.2f} ({change_pct:+.1f}%)"
         )
-        compact = f"📊 שבר {label} ${prev_high:.2f}"
+        compact = f"📊 שבירת גבוה {label} ${prev_high:.2f}"
     else:
         # Multiple timeframes broken simultaneously
         broken.sort(key=lambda x: ['day', 'week', 'month', 'quarter', 'year'].index(x[0]))
         labels = [_TF_LABELS_HE[tf] for tf, _ in broken]
         details = " + ".join(f"{_TF_LABELS_HE[tf]} ${h:.2f}" for tf, h in broken)
         full = (
-            f"📊 <b>TF HIGH — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-            f"שבר {details}"
+            f"📊 <b>שבירת גבוה — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+            f"{details}"
         )
-        compact = f"📊 שבר {'/'.join(labels)} ${price:.2f}"
+        compact = f"📊 שבירת גבוה {'/'.join(labels)} ${price:.2f}"
 
     return full, compact
 
