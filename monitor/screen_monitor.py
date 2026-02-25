@@ -2875,6 +2875,10 @@ _DOJI_COOLDOWN_SEC = 300  # 5 min cooldown per symbol+timeframe
 _doji_alerted: dict[str, float] = {}  # "SYM_5m" → timestamp
 _doji_pending: dict[str, tuple[float, float, str]] = {}  # "SYM_5m" → (doji_high, timestamp, tf_label)
 
+# ── Alert chart cooldown ──
+_ALERT_CHART_COOLDOWN_SEC = 600  # 10 min cooldown per symbol for chart attachment
+_alert_chart_sent: dict[str, float] = {}  # sym → last chart timestamp
+
 # ── Timeframe High Break tracking ──
 _tf_highs_cache: dict[str, dict[str, float]] = {}   # {sym: {day: X, week: Y, month: Z, quarter: Q, year: A}}
 _tf_high_alerted: dict[str, bool] = {}               # {"SYM_day": True, ...} — one alert per TF per symbol per day
@@ -2901,6 +2905,7 @@ def _reset_alerts_if_new_day():
         _vol_alert_sent.clear()
         _doji_alerted.clear()
         _doji_pending.clear()
+        _alert_chart_sent.clear()
         _tf_highs_cache.clear()
         _tf_high_alerted.clear()
         _news_summary_sent.clear()
@@ -3754,6 +3759,192 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         plt.close('all')
         return None
 
+
+def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
+                         current_price: float,
+                         ratio_map: dict | None = None) -> Path | None:
+    """Generate 1-min Japanese candlestick chart (48h) with Fibonacci levels.
+
+    Uses matplotlib Rectangle patches for proper candle bodies and thin
+    wicks — clean Japanese candlestick style.  No VWAP overlay.
+
+    Returns path to saved PNG or None on failure.
+    """
+    from matplotlib.patches import Rectangle
+
+    try:
+        if len(df) < 10:
+            return None
+
+        n_bars = len(df)
+        right_padding = max(15, n_bars // 10)
+
+        fig, ax = plt.subplots(figsize=(18, 9), facecolor='#0e1117')
+        ax.set_facecolor('#0e1117')
+
+        dates = pd.to_datetime(df['date']) if 'date' in df.columns else df.index
+
+        # Adaptive sizing based on bar count
+        if n_bars > 1200:
+            body_w = 0.9
+            wick_w = 0.4
+        elif n_bars > 600:
+            body_w = 0.8
+            wick_w = 0.5
+        elif n_bars > 300:
+            body_w = 0.7
+            wick_w = 0.6
+        else:
+            body_w = 0.6
+            wick_w = 0.7
+
+        # ── Japanese candlesticks via Rectangle patches ──
+        for i, (_, row) in enumerate(df.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            color = '#26a69a' if c >= o else '#ef5350'
+
+            # Wick (thin line from low to high)
+            ax.plot([i, i], [l, h], color=color, linewidth=wick_w,
+                    solid_capstyle='round')
+
+            # Body (filled rectangle)
+            body_bottom = min(o, c)
+            body_height = abs(c - o)
+            if body_height < (h - l) * 0.01:
+                # Doji — thin horizontal line
+                body_height = max(abs(h - l) * 0.02, 0.0001)
+                body_bottom = (o + c) / 2 - body_height / 2
+
+            rect = Rectangle((i - body_w / 2, body_bottom), body_w, body_height,
+                              facecolor=color, edgecolor=color, linewidth=0.3)
+            ax.add_patch(rect)
+
+        # ── Y-axis: tight around price action ──
+        price_low = df['low'].min()
+        price_high = df['high'].max()
+        price_range = price_high - price_low
+        vis_min = max(0, price_low - price_range * 0.08)
+        vis_max = price_high + price_range * 0.08
+
+        # Only show fib levels within the visible price range
+        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
+
+        price_span = vis_max - vis_min
+
+        # ── Fibonacci levels ──
+        _def_clr = '#888888'
+        min_label_gap = price_span * 0.030
+        last_y_r = -999.0
+        last_y_l = -999.0
+
+        for lv in visible_levels:
+            info = ratio_map.get(round(lv, 4)) if ratio_map else None
+            if isinstance(info, tuple):
+                ratio, series = info
+            elif info is not None:
+                ratio, series = info, "S1"
+            else:
+                ratio, series = None, "S1"
+
+            clr = FIB_LEVEL_COLORS.get(ratio, _def_clr) if ratio is not None else _def_clr
+            ax.axhline(y=lv, color=clr, linewidth=0.6, alpha=0.55, linestyle='-',
+                       xmin=0, xmax=n_bars / (n_bars + right_padding))
+
+            lbl = f'{ratio}  ${lv:.4f}' if ratio is not None else f'${lv:.4f}'
+
+            if series == "S2":
+                if abs(lv - last_y_l) < min_label_gap:
+                    continue
+                ax.text(-0.5, lv, f'{lbl} ', color=clr,
+                        fontsize=7, va='center', ha='right', fontweight='bold')
+                last_y_l = lv
+            else:
+                if abs(lv - last_y_r) < min_label_gap:
+                    continue
+                ax.text(n_bars + 1, lv, f' {lbl}', color=clr,
+                        fontsize=7, va='center', ha='left', fontweight='bold')
+                last_y_r = lv
+
+        # ── Current price line (gold, dashed) ──
+        ax.axhline(y=current_price, color='#FFD700', linewidth=1.8,
+                    linestyle='--', alpha=0.9)
+        ax.text(n_bars + right_padding - 1, current_price,
+                f'  ${current_price:.2f}  ',
+                color='#0e1117', fontsize=10, va='center', ha='right',
+                fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3',
+                          facecolor='#FFD700', edgecolor='#FFD700', alpha=0.95))
+
+        # ── X-axis date labels ──
+        tick_step = max(1, n_bars // 12)
+        tick_pos = list(range(0, n_bars, tick_step))
+        tick_lbl = []
+        date_list = list(dates)
+        for pos in tick_pos:
+            d = date_list[pos]
+            tick_lbl.append(d.strftime('%m/%d %H:%M') if hasattr(d, 'strftime') else str(d)[:11])
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels(tick_lbl, color='#888', fontsize=7, rotation=30, ha='right')
+
+        # ── Styling ──
+        ax.set_ylim(vis_min, vis_max)
+        ax.set_xlim(-2, n_bars + right_padding)
+        ax.tick_params(colors='#888', labelsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color('#333')
+        ax.spines['left'].set_color('#333')
+        ax.set_title(f'{sym} — 1min (48h) + Fibonacci  ${current_price:.2f}',
+                     color='white', fontsize=15, fontweight='bold', pad=12)
+        ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
+
+        out = Path(f'/tmp/alert_chart_{sym}.png')
+        fig.savefig(out, dpi=130, bbox_inches='tight',
+                    facecolor='#0e1117', edgecolor='none')
+        plt.close(fig)
+        log.info(f"Alert chart saved: {out}")
+        return out
+
+    except Exception as e:
+        log.error(f"generate_alert_chart {sym}: {e}")
+        plt.close('all')
+        return None
+
+
+def _send_alert_chart(sym: str, price: float) -> None:
+    """Download 1-min bars (48h extended hours), generate chart with Fib, send to group.
+
+    Respects 10-min cooldown per symbol.  Telegram send is non-blocking (queued).
+    """
+    now = time_mod.time()
+    if now - _alert_chart_sent.get(sym, 0) < _ALERT_CHART_COOLDOWN_SEC:
+        return
+
+    # ── 1-min bars, 2 days (extended hours) ──
+    df = _download_intraday(sym, bar_size='1 min', duration='2 D')
+    if df is None or len(df) < 20:
+        return
+
+    # ── Fib levels (uses cached daily data + fib cache) ──
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
+    if cached:
+        _, _, all_levels, ratio_map, *_ = cached
+    else:
+        calc_fib_levels(sym, price)
+        with _fib_cache_lock:
+            cached = _fib_cache.get(sym)
+        if cached:
+            _, _, all_levels, ratio_map, *_ = cached
+        else:
+            all_levels, ratio_map = [], {}
+
+    chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map)
+    if chart_path:
+        caption = f"📐 <b>{sym}</b> — 1 דקה (48h) + פיבונאצ׳י  ${price:.2f}"
+        send_telegram_alert_photo(chart_path, caption)
+        _alert_chart_sent[sym] = now
+        log.info(f"Alert chart sent for {sym}")
 
 
 def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
@@ -6591,6 +6782,9 @@ class ScannerThread(threading.Thread):
                         if fib_txt:
                             msg += "\n" + fib_txt.strip()
                     send_telegram_alert(msg, reply_markup=btn)
+                    # Send 5-min chart with Fib for this symbol
+                    if sp > 0:
+                        _send_alert_chart(sym0, sp)
                 else:
                     # Multiple alerts — grouped by symbol
                     now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
@@ -6620,6 +6814,12 @@ class ScannerThread(threading.Thread):
 
                     header = f"🔔 <b>התראות ({total_alerts})</b> — {now_et} ET\n"
                     send_telegram_alert(header + "\n\n".join(blocks), reply_markup=btn)
+
+                    # Send 5-min chart with Fib for each symbol in batch
+                    for s in batch_syms:
+                        sp = current.get(s, {}).get('price', 0)
+                        if sp > 0:
+                            _send_alert_chart(s, sp)
 
                 status += f"  🔔{total_alerts}"
             else:
