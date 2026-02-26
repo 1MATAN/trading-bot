@@ -2,8 +2,8 @@
 
 Entry (VWAP cross):   price crosses above VWAP + above SMA 9 on 1-hour candles
 Entry (Pullback):     low within 2% of VWAP + close above VWAP + above SMA 9 hourly
-Exit:                 5% trailing stop from highest high since entry
-Safety stop:          -5% from entry price
+Exit:                 ATR-based trailing stop (2.5x ATR) — adaptive to volatility
+Safety stop:          -10% from entry price (wider for sub-$2)
 Tracking window:      90 minutes from first appearance in scan — force close at end
 Gap filter:           20%-50%
 Re-entries:           unlimited
@@ -69,6 +69,7 @@ class _MRSymbolState:
     highest_high: float = 0.0       # trailing stop tracker
     entry_price: float = 0.0        # safety stop reference
     first_scan_time: Optional[datetime] = None  # 90-min tracking
+    entry_time: Optional[datetime] = None       # actual entry time (for timeout)
     last_bar_count: int = 0         # detect new bars
     date_key: str = ""              # daily reset
 
@@ -110,6 +111,29 @@ def _compute_sma9_hourly(bars_1m: list[dict]) -> float:
     return float(sma9.iloc[-1])
 
 
+_MR_ATR_PERIOD = 14
+_MR_ATR_MULTIPLIER = 2.5  # trailing stop = highest_high - 2.5 * ATR
+
+
+def _compute_atr(bars_1m: list[dict], period: int = _MR_ATR_PERIOD) -> float:
+    """Compute ATR (Average True Range) from 1-min bars. Returns 0 if insufficient data."""
+    if len(bars_1m) < period + 1:
+        return 0.0
+
+    highs = np.array([b["high"] for b in bars_1m])
+    lows = np.array([b["low"] for b in bars_1m])
+    closes = np.array([b["close"] for b in bars_1m])
+
+    # True Range = max(H-L, |H-prevC|, |L-prevC|)
+    prev_close = np.roll(closes, 1)
+    prev_close[0] = closes[0]
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+
+    # Simple moving average of TR
+    atr = np.mean(tr[-period:])
+    return float(atr)
+
+
 # ── Strategy class ─────────────────────────────────────────
 
 class MomentumRideLiveStrategy:
@@ -145,6 +169,7 @@ class MomentumRideLiveStrategy:
         state.in_position = False
         state.entry_price = 0.0
         state.highest_high = 0.0
+        state.entry_time = None
 
     def sync_from_portfolio(self, held_positions: dict):
         """Sync strategy state from portfolio after restart.
@@ -197,16 +222,19 @@ class MomentumRideLiveStrategy:
         sym = cand.symbol
         state = self._get_state(sym)
 
-        # ── Record first scan time for 90-min tracking ──
+        # ── Record first scan time for tracking window ──
         if state.first_scan_time is None:
             state.first_scan_time = now_et
 
-        # ── Check 90-min timeout ──
-        tracking_deadline = state.first_scan_time + timedelta(minutes=MR_TRACKING_MINUTES)
-        if now_et > tracking_deadline and state.in_position:
-            return None, MRExitSignal(sym, cand.current_price, "90min_timeout")
-        if now_et > tracking_deadline and not state.in_position:
-            return None, None  # past tracking window, no action
+        # ── Check 90-min timeout (from entry_time if in position, else from first_scan) ──
+        if state.in_position and state.entry_time is not None:
+            entry_deadline = state.entry_time + timedelta(minutes=MR_TRACKING_MINUTES)
+            if now_et > entry_deadline:
+                return None, MRExitSignal(sym, cand.current_price, "90min_timeout")
+        elif not state.in_position:
+            tracking_deadline = state.first_scan_time + timedelta(minutes=MR_TRACKING_MINUTES)
+            if now_et > tracking_deadline:
+                return None, None  # past tracking window, no action
 
         # ── EOD close ──
         if now_et.time() >= _EOD_CLOSE_TIME and state.in_position:
@@ -249,6 +277,7 @@ class MomentumRideLiveStrategy:
         # ── Compute indicators ──
         vwap_series = _compute_running_vwap(bars_1m)
         sma9_val = _compute_sma9_hourly(bars_1m)
+        atr_val = _compute_atr(bars_1m)
 
         if not vwap_series:
             return None, None
@@ -270,18 +299,37 @@ class MomentumRideLiveStrategy:
             if latest_high > state.highest_high:
                 state.highest_high = latest_high
 
-            # Trailing stop: 5% from peak
-            trail_stop = state.highest_high * (1 - MR_LIVE_TRAILING_STOP_PCT)
-            if price <= trail_stop:
-                reason = (f"trailing_stop (peak=${state.highest_high:.4f}, "
-                          f"-{MR_LIVE_TRAILING_STOP_PCT:.0%}=${trail_stop:.4f})")
-                return None, MRExitSignal(sym, price, reason)
+            # Widen safety stop for low-priced stocks (under $2) — 1.5x wider
+            safety_pct = MR_LIVE_SAFETY_STOP_PCT
+            if state.entry_price > 0 and state.entry_price < 2.0:
+                safety_pct *= 1.5
 
-            # Safety stop: -5% from entry
-            safety_stop = state.entry_price * (1 - MR_LIVE_SAFETY_STOP_PCT)
+            # ATR-based trailing stop: highest_high - 2.5 * ATR
+            # Falls back to percentage-based if ATR not available
+            if atr_val > 0:
+                trail_stop = state.highest_high - _MR_ATR_MULTIPLIER * atr_val
+                atr_pct = (_MR_ATR_MULTIPLIER * atr_val / state.highest_high * 100) if state.highest_high > 0 else 0
+                if price <= trail_stop:
+                    reason = (f"trailing_stop_atr (peak=${state.highest_high:.4f}, "
+                              f"ATR=${atr_val:.4f}, {_MR_ATR_MULTIPLIER}x={_MR_ATR_MULTIPLIER*atr_val:.4f}, "
+                              f"stop=${trail_stop:.4f} [{atr_pct:.1f}%])")
+                    return None, MRExitSignal(sym, price, reason)
+            else:
+                # Fallback: percentage-based trailing stop
+                trail_pct = MR_LIVE_TRAILING_STOP_PCT
+                if state.entry_price > 0 and state.entry_price < 2.0:
+                    trail_pct *= 1.5
+                trail_stop = state.highest_high * (1 - trail_pct)
+                if price <= trail_stop:
+                    reason = (f"trailing_stop (peak=${state.highest_high:.4f}, "
+                              f"-{trail_pct:.0%}=${trail_stop:.4f})")
+                    return None, MRExitSignal(sym, price, reason)
+
+            # Safety stop from entry
+            safety_stop = state.entry_price * (1 - safety_pct)
             if price <= safety_stop:
                 reason = (f"safety_stop (entry=${state.entry_price:.4f}, "
-                          f"-{MR_LIVE_SAFETY_STOP_PCT:.0%}=${safety_stop:.4f})")
+                          f"-{safety_pct:.0%}=${safety_stop:.4f})")
                 return None, MRExitSignal(sym, price, reason)
 
         # ── Check entry signals (no position) ──
@@ -310,6 +358,7 @@ class MomentumRideLiveStrategy:
                 state.in_position = True
                 state.entry_price = price
                 state.highest_high = price
+                state.entry_time = now_et
                 # Update VWAP tracking
                 state.prev_below_vwap = not price_above_vwap
                 state.prev_above_vwap = price_above_vwap

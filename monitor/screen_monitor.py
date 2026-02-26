@@ -75,9 +75,17 @@ from config.settings import (
     FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
     BRACKET_FIB_STOP_PCT, BRACKET_TRAILING_PROFIT_PCT, STOP_LIMIT_OFFSET_PCT,
     STARTING_CAPITAL,
-    GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_PCT,
-    MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_PCT,
-    FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_PCT, FT_MIN_FLOAT_TURNOVER_PCT,
+    GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_FIXED,
+    GG_LIVE_MAX_POSITIONS, GG_MAX_HOLD_MINUTES,
+    MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_FIXED,
+    MR_LIVE_MAX_POSITIONS,
+    FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_FIXED, FT_MIN_FLOAT_TURNOVER_PCT,
+    FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES,
+    STRATEGY_MIN_PRICE, FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
+    FIB_DT_MAX_HOLD_MINUTES,
+    STRATEGY_REENTRY_COOLDOWN_SEC, STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC,
+    STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY, STRATEGY_DAILY_LOSS_LIMIT,
+    FIB_DT_WARMUP_SEC,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -4770,9 +4778,12 @@ class VirtualPortfolio:
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
         self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, stop, target, half, other_half, phase}
+        # sym -> {qty, entry_price, stop, target, half, other_half, phase, entry_ts}
         # phase: IN_POSITION | TRAILING
         self.trades: list[dict] = []  # history
+        self._exit_history: list[dict] = []  # {sym, ts, pnl} for cooldown
+        self._daily_realized_pnl: float = 0.0
+        self._daily_pnl_date: str = ""
         self._init_journal()
         self._load_state()
 
@@ -4800,6 +4811,52 @@ class VirtualPortfolio:
                          + ", ".join(self.positions.keys()))
         except Exception as e:
             log.warning(f"FIB DT state load error: {e}")
+
+    def _reset_daily_pnl(self):
+        """Reset daily P&L tracker if new day."""
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        if self._daily_pnl_date != today:
+            self._daily_pnl_date = today
+            self._daily_realized_pnl = 0.0
+            self._exit_history = [e for e in self._exit_history
+                                  if time_mod.time() - e['ts'] < 86400]
+
+    def can_enter(self, sym: str) -> tuple[bool, str]:
+        """Check if entry is allowed (max positions, cooldown, daily loss, min price)."""
+        self._reset_daily_pnl()
+        # Max positions
+        if len(self.positions) >= FIB_DT_MAX_POSITIONS:
+            return False, f"max positions ({FIB_DT_MAX_POSITIONS})"
+        # Daily loss limit
+        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
+            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
+        # Max entries per stock per day
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
+                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
+        # Count current position too
+        if sym in self.positions:
+            today_entries += 1
+        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
+            return False, f"max entries/day for {sym} ({STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY})"
+        # Cooldown
+        now_ts = time_mod.time()
+        for e in reversed(self._exit_history):
+            if e['sym'] == sym:
+                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
+                            else STRATEGY_REENTRY_COOLDOWN_SEC)
+                elapsed = now_ts - e['ts']
+                if elapsed < cooldown:
+                    remaining = int(cooldown - elapsed)
+                    return False, f"cooldown {remaining}s for {sym}"
+                break
+        return True, ""
+
+    def _record_exit(self, sym: str, pnl: float):
+        """Record exit for cooldown/daily tracking."""
+        self._reset_daily_pnl()
+        self._daily_realized_pnl += pnl
+        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
 
     def _init_journal(self):
         """Create CSV journal with header if it doesn't exist."""
@@ -4865,6 +4922,7 @@ class VirtualPortfolio:
             'phase': 'IN_POSITION',
             'high_since_target': 0.0,
             'trailing_synced': False,
+            'entry_ts': time_mod.time(),
         }
 
         self.trades.append({
@@ -4903,31 +4961,38 @@ class VirtualPortfolio:
                 if phase == 'TRAILING':
                     remaining = pos['other_half']
 
-                pnl = (price - pos['entry_price']) * remaining
-                pnl_pct = (price / pos['entry_price'] - 1) * 100
+                # Simulate stop-limit: sell at stop price, not gapped-down market price.
+                # In reality a stop-limit order fires at the stop level during decline.
+                # Only use actual price if it's above stop (normal fill).
+                fill_price = max(price, pos['stop'])
+
+                pnl = (fill_price - pos['entry_price']) * remaining
+                pnl_pct = (fill_price / pos['entry_price'] - 1) * 100
                 old_cash = self.cash
-                self.cash += remaining * price
+                self.cash += remaining * fill_price
 
                 self.trades.append({
                     'sym': sym, 'side': 'SELL', 'qty': remaining,
-                    'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+                    'price': fill_price, 'pnl': pnl, 'time': datetime.now(_ET),
                 })
 
                 net_liq = self._net_liq_internal(current_prices, exclude=sym)
-                self._log_journal(sym, 'SELL', f'STOP ({phase})', remaining, price,
+                self._log_journal(sym, 'SELL', f'STOP ({phase})', remaining, fill_price,
                                   pos['entry_price'], pnl, net_liq)
 
+                slippage_note = f" [stop-limit fill, mkt=${price:.2f}]" if fill_price > price else ""
                 alert = (
                     f"📐 <b>FIB DT [SIM] — STOP HIT {sym}</b>\n"
                     f"  🕐 {self._ts()}\n"
-                    f"  🔴 {remaining}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
+                    f"  🔴 {remaining}sh @ ${fill_price:.2f} (entry ${pos['entry_price']:.2f}){slippage_note}\n"
                     f"  📉 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
                     f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
                     f"  📊 Portfolio: ${net_liq:,.0f}"
                 )
                 alerts.append(alert)
                 closed.append(sym)
-                log.info(f"VIRTUAL STOP: {sym} {remaining}sh @ ${price:.2f} P&L=${pnl:+.2f}")
+                self._record_exit(sym, pnl)
+                log.info(f"VIRTUAL STOP: {sym} {remaining}sh @ ${fill_price:.2f} (mkt=${price:.2f}) P&L=${pnl:+.2f}")
                 continue
 
             # ── UPDATE HIGH (TRAILING phase) ──
@@ -4995,6 +5060,7 @@ class VirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._record_exit(sym, pnl)
         self._save_state()
 
         net_liq = self.net_liq({})
@@ -5093,8 +5159,11 @@ class GGVirtualPortfolio:
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
         self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, vwap_at_entry}
+        # sym -> {qty, entry_price, vwap_at_entry, entry_ts}
         self.trades: list[dict] = []
+        self._exit_history: list[dict] = []
+        self._daily_realized_pnl: float = 0.0
+        self._daily_pnl_date: str = ""
         self._init_journal()
         self._load_state()
 
@@ -5161,6 +5230,42 @@ class GGVirtualPortfolio:
     def _ts() -> str:
         return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
 
+    def _reset_daily_pnl(self):
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        if self._daily_pnl_date != today:
+            self._daily_pnl_date = today
+            self._daily_realized_pnl = 0.0
+            self._exit_history = [e for e in self._exit_history
+                                  if time_mod.time() - e['ts'] < 86400]
+
+    def can_enter(self, sym: str) -> tuple[bool, str]:
+        self._reset_daily_pnl()
+        if len(self.positions) >= GG_LIVE_MAX_POSITIONS:
+            return False, f"max positions ({GG_LIVE_MAX_POSITIONS})"
+        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
+            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
+                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
+        if sym in self.positions:
+            today_entries += 1
+        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
+            return False, f"max entries/day for {sym}"
+        now_ts = time_mod.time()
+        for e in reversed(self._exit_history):
+            if e['sym'] == sym:
+                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
+                            else STRATEGY_REENTRY_COOLDOWN_SEC)
+                if now_ts - e['ts'] < cooldown:
+                    return False, f"cooldown for {sym}"
+                break
+        return True, ""
+
+    def _record_exit(self, sym: str, pnl: float):
+        self._reset_daily_pnl()
+        self._daily_realized_pnl += pnl
+        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
+
     def buy(self, sym: str, qty: int, price: float, vwap: float) -> str | None:
         """Open a GG virtual position. Returns Telegram alert text or None."""
         if qty < 1 or sym in self.positions:
@@ -5176,6 +5281,7 @@ class GGVirtualPortfolio:
             'qty': qty,
             'entry_price': price,
             'vwap_at_entry': vwap,
+            'entry_ts': time_mod.time(),
         }
 
         self.trades.append({
@@ -5217,6 +5323,7 @@ class GGVirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._record_exit(sym, pnl)
         self._save_state()
 
         net = self.net_liq({})
@@ -5233,6 +5340,50 @@ class GGVirtualPortfolio:
             f"  📝 Reason: {reason}"
         )
         log.info(f"GG VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
+        return msg
+
+    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell half the GG position (profit target). Returns Telegram alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos:
+            return None
+
+        total_qty = pos['qty']
+        half = total_qty // 2
+        if half < 1:
+            # Position too small to split — sell all
+            return self.sell(sym, price, reason)
+
+        entry_price = pos['entry_price']
+        pnl = (price - entry_price) * half
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+
+        old_cash = self.cash
+        self.cash += half * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': half,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        # Update position: reduce qty, keep rest
+        pos['qty'] = total_qty - half
+        self._save_state()
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
+
+        remaining = total_qty - half
+        msg = (
+            f"🚀 <b>Gap&Go [GG-SIM] — TARGET HIT {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
+            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
+        )
+        log.info(f"GG TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
         return msg
 
     def net_liq(self, current_prices: dict) -> float:
@@ -5302,8 +5453,11 @@ class MRVirtualPortfolio:
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
         self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, vwap_at_entry, signal_type}
+        # sym -> {qty, entry_price, vwap_at_entry, signal_type, entry_ts}
         self.trades: list[dict] = []
+        self._exit_history: list[dict] = []
+        self._daily_realized_pnl: float = 0.0
+        self._daily_pnl_date: str = ""
         self._init_journal()
         self._load_state()
 
@@ -5370,6 +5524,42 @@ class MRVirtualPortfolio:
     def _ts() -> str:
         return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
 
+    def _reset_daily_pnl(self):
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        if self._daily_pnl_date != today:
+            self._daily_pnl_date = today
+            self._daily_realized_pnl = 0.0
+            self._exit_history = [e for e in self._exit_history
+                                  if time_mod.time() - e['ts'] < 86400]
+
+    def can_enter(self, sym: str) -> tuple[bool, str]:
+        self._reset_daily_pnl()
+        if len(self.positions) >= MR_LIVE_MAX_POSITIONS:
+            return False, f"max positions ({MR_LIVE_MAX_POSITIONS})"
+        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
+            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
+                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
+        if sym in self.positions:
+            today_entries += 1
+        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
+            return False, f"max entries/day for {sym}"
+        now_ts = time_mod.time()
+        for e in reversed(self._exit_history):
+            if e['sym'] == sym:
+                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
+                            else STRATEGY_REENTRY_COOLDOWN_SEC)
+                if now_ts - e['ts'] < cooldown:
+                    return False, f"cooldown for {sym}"
+                break
+        return True, ""
+
+    def _record_exit(self, sym: str, pnl: float):
+        self._reset_daily_pnl()
+        self._daily_realized_pnl += pnl
+        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
+
     def buy(self, sym: str, qty: int, price: float, vwap: float,
             signal_type: str = '') -> str | None:
         """Open an MR virtual position. Returns Telegram alert text or None."""
@@ -5387,6 +5577,7 @@ class MRVirtualPortfolio:
             'entry_price': price,
             'vwap_at_entry': vwap,
             'signal_type': signal_type,
+            'entry_ts': time_mod.time(),
         }
 
         self.trades.append({
@@ -5429,6 +5620,7 @@ class MRVirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._record_exit(sym, pnl)
         self._save_state()
 
         net = self.net_liq({})
@@ -5513,8 +5705,11 @@ class FTVirtualPortfolio:
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
         self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, turnover_at_entry}
+        # sym -> {qty, entry_price, turnover_at_entry, entry_ts}
         self.trades: list[dict] = []
+        self._exit_history: list[dict] = []
+        self._daily_realized_pnl: float = 0.0
+        self._daily_pnl_date: str = ""
         self._init_journal()
         self._load_state()
 
@@ -5581,6 +5776,42 @@ class FTVirtualPortfolio:
     def _ts() -> str:
         return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
 
+    def _reset_daily_pnl(self):
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        if self._daily_pnl_date != today:
+            self._daily_pnl_date = today
+            self._daily_realized_pnl = 0.0
+            self._exit_history = [e for e in self._exit_history
+                                  if time_mod.time() - e['ts'] < 86400]
+
+    def can_enter(self, sym: str) -> tuple[bool, str]:
+        self._reset_daily_pnl()
+        if len(self.positions) >= FT_LIVE_MAX_POSITIONS:
+            return False, f"max positions ({FT_LIVE_MAX_POSITIONS})"
+        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
+            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
+        today = datetime.now(_ET).strftime('%Y-%m-%d')
+        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
+                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
+        if sym in self.positions:
+            today_entries += 1
+        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
+            return False, f"max entries/day for {sym}"
+        now_ts = time_mod.time()
+        for e in reversed(self._exit_history):
+            if e['sym'] == sym:
+                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
+                            else STRATEGY_REENTRY_COOLDOWN_SEC)
+                if now_ts - e['ts'] < cooldown:
+                    return False, f"cooldown for {sym}"
+                break
+        return True, ""
+
+    def _record_exit(self, sym: str, pnl: float):
+        self._reset_daily_pnl()
+        self._daily_realized_pnl += pnl
+        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
+
     def buy(self, sym: str, qty: int, price: float, turnover_pct: float) -> str | None:
         """Open an FT virtual position. Returns Telegram alert text or None."""
         if qty < 1 or sym in self.positions:
@@ -5596,6 +5827,7 @@ class FTVirtualPortfolio:
             'qty': qty,
             'entry_price': price,
             'turnover_at_entry': turnover_pct,
+            'entry_ts': time_mod.time(),
         }
 
         self.trades.append({
@@ -5637,6 +5869,7 @@ class FTVirtualPortfolio:
         })
 
         del self.positions[sym]
+        self._record_exit(sym, pnl)
         self._save_state()
 
         net = self.net_liq({})
@@ -5723,6 +5956,7 @@ class ScannerThread(threading.Thread):
         self.running = False
         self.previous: dict = {}
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
+        self._fib_dt_first_seen: dict[str, float] = {}  # sym → time.time() when first seen (warmup)
         self.count = 0
         self._warmup = True   # suppress alerts on first cycle
         self._warmup_pending: dict[str, dict] = {}  # sym → stock data, enriched during warmup
@@ -5742,7 +5976,7 @@ class ScannerThread(threading.Thread):
         self._gg_portfolio = GGVirtualPortfolio()
         # Sync strategy state from restored portfolio
         if self._gg_portfolio.positions:
-            self._gg_strategy.sync_from_portfolio(set(self._gg_portfolio.positions.keys()))
+            self._gg_strategy.sync_from_portfolio(self._gg_portfolio.positions)
         # ── Momentum Ride Auto-Strategy ──
         self._mr_strategy = MomentumRideLiveStrategy(ib_getter=_get_ibkr)
         self._mr_portfolio = MRVirtualPortfolio()
@@ -6033,6 +6267,90 @@ class ScannerThread(threading.Thread):
         except Exception as e:
             log.debug(f"Account fetch: {e}")
 
+    def _check_timed_exits(self, current: dict):
+        """Force-close positions that exceeded their max hold time."""
+        now_ts = time_mod.time()
+
+        # FIB DT — max hold
+        for sym in list(self._virtual_portfolio.positions.keys()):
+            pos = self._virtual_portfolio.positions[sym]
+            entry_ts = pos.get('entry_ts', 0)
+            if entry_ts > 0 and (now_ts - entry_ts) > FIB_DT_MAX_HOLD_MINUTES * 60:
+                price = current.get(sym, {}).get('price', pos['entry_price'])
+                hold_min = int((now_ts - entry_ts) / 60)
+                remaining = pos['other_half'] if pos['phase'] == 'TRAILING' else pos['qty']
+                pnl = (price - pos['entry_price']) * remaining
+                if pos['phase'] == 'TRAILING':
+                    alert = self._virtual_portfolio.trailing_exit(
+                        sym, price, f"timed_exit ({hold_min}min)")
+                else:
+                    # Force sell via stop-like mechanism
+                    old_cash = self._virtual_portfolio.cash
+                    self._virtual_portfolio.cash += remaining * price
+                    self._virtual_portfolio.trades.append({
+                        'sym': sym, 'side': 'SELL', 'qty': remaining,
+                        'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+                    })
+                    del self._virtual_portfolio.positions[sym]
+                    self._virtual_portfolio._record_exit(sym, pnl)
+                    self._virtual_portfolio._save_state()
+                    pnl_pct = (price / pos['entry_price'] - 1) * 100 if pos['entry_price'] > 0 else 0
+                    net = self._virtual_portfolio.net_liq({})
+                    self._virtual_portfolio._log_journal(
+                        sym, 'SELL', f'TIMED_EXIT ({hold_min}min)', remaining, price,
+                        pos['entry_price'], pnl, net)
+                    alert = (
+                        f"📐 <b>FIB DT [SIM] — TIMED EXIT {sym}</b>\n"
+                        f"  ⏰ Held {hold_min}min (max {FIB_DT_MAX_HOLD_MINUTES})\n"
+                        f"  {'🟢' if pnl >= 0 else '🔴'} {remaining}sh @ ${price:.2f} "
+                        f"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)"
+                    )
+                if alert:
+                    send_telegram(alert)
+                self._fib_dt_strategy.mark_position_closed(sym)
+                log.info(f"FIB DT TIMED EXIT: {sym} after {hold_min}min")
+
+        # GG — max hold
+        for sym in list(self._gg_portfolio.positions.keys()):
+            pos = self._gg_portfolio.positions[sym]
+            entry_ts = pos.get('entry_ts', 0)
+            if entry_ts > 0 and (now_ts - entry_ts) > GG_MAX_HOLD_MINUTES * 60:
+                price = current.get(sym, {}).get('price', pos['entry_price'])
+                hold_min = int((now_ts - entry_ts) / 60)
+                alert = self._gg_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
+                if alert:
+                    send_telegram(alert)
+                self._gg_strategy.mark_position_closed(sym)
+                log.info(f"GG TIMED EXIT: {sym} after {hold_min}min")
+
+        # MR — no separate max hold; handled by 90-min timeout in strategy
+        # But add safety for stuck positions (e.g., 4 hours)
+        _MR_SAFETY_MAX_HOLD_MIN = 240
+        for sym in list(self._mr_portfolio.positions.keys()):
+            pos = self._mr_portfolio.positions[sym]
+            entry_ts = pos.get('entry_ts', 0)
+            if entry_ts > 0 and (now_ts - entry_ts) > _MR_SAFETY_MAX_HOLD_MIN * 60:
+                price = current.get(sym, {}).get('price', pos['entry_price'])
+                hold_min = int((now_ts - entry_ts) / 60)
+                alert = self._mr_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
+                if alert:
+                    send_telegram(alert)
+                self._mr_strategy.mark_position_closed(sym)
+                log.info(f"MR TIMED EXIT: {sym} after {hold_min}min")
+
+        # FT — max hold
+        for sym in list(self._ft_portfolio.positions.keys()):
+            pos = self._ft_portfolio.positions[sym]
+            entry_ts = pos.get('entry_ts', 0)
+            if entry_ts > 0 and (now_ts - entry_ts) > FT_MAX_HOLD_MINUTES * 60:
+                price = current.get(sym, {}).get('price', pos['entry_price'])
+                hold_min = int((now_ts - entry_ts) / 60)
+                alert = self._ft_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
+                if alert:
+                    send_telegram(alert)
+                self._ft_strategy.mark_position_closed(sym)
+                log.info(f"FT TIMED EXIT: {sym} after {hold_min}min")
+
     def _run_fib_dt_cycle(self, current: dict, status: str):
         """Run FIB DT auto-strategy: select best stock by turnover, feed to strategy."""
         try:
@@ -6048,7 +6366,7 @@ class ScannerThread(threading.Thread):
 
                 if pct < 20 or price <= 0 or prev_close <= 0 or not contract:
                     continue
-                if price < 0.20:  # skip sub-$0.20 stocks (too volatile, huge losses)
+                if price < STRATEGY_MIN_PRICE:
                     continue
                 if vwap > 0 and price <= vwap:
                     continue
@@ -6142,8 +6460,27 @@ class ScannerThread(threading.Thread):
                     )
                     continue
 
-                max_pos_value = 500.0  # max $500 per position
-                qty = int(min(self._virtual_portfolio.cash * 0.95, max_pos_value) / entry_price) if entry_price > 0 else 0
+                # Min price filter
+                if entry_price < STRATEGY_MIN_PRICE:
+                    log.info(f"FIB DT: Skipping {req.symbol} — price ${entry_price:.2f} < min ${STRATEGY_MIN_PRICE}")
+                    continue
+                # Warmup: skip entries within first 5 min of seeing a stock
+                now_ts = time_mod.time()
+                first_seen = self._fib_dt_first_seen.get(req.symbol)
+                if first_seen is None:
+                    self._fib_dt_first_seen[req.symbol] = now_ts
+                    log.info(f"FIB DT: First seen {req.symbol} — warmup {FIB_DT_WARMUP_SEC}s")
+                    continue
+                if now_ts - first_seen < FIB_DT_WARMUP_SEC:
+                    log.debug(f"FIB DT: Skipping {req.symbol} — warmup ({now_ts - first_seen:.0f}s < {FIB_DT_WARMUP_SEC}s)")
+                    continue
+                # Risk controls: max positions, cooldown, daily loss
+                can_buy, reason = self._virtual_portfolio.can_enter(req.symbol)
+                if not can_buy:
+                    log.info(f"FIB DT: Skipping {req.symbol} — {reason}")
+                    continue
+
+                qty = int(min(self._virtual_portfolio.cash, FIB_DT_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
                 qty = min(qty, 5000)  # absolute max shares
                 if qty >= 2:
                     alert = self._virtual_portfolio.buy(
@@ -6220,6 +6557,8 @@ class ScannerThread(threading.Thread):
                     continue
                 if prev_close <= 0:
                     continue
+                if price < STRATEGY_MIN_PRICE:
+                    continue
 
                 candidates.append(GGCandidate(
                     symbol=sym,
@@ -6244,19 +6583,39 @@ class ScannerThread(threading.Thread):
             # ── 3. Execute exits first ──
             for exit_sig in exits:
                 price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
-                alert = self._gg_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
-                if alert:
-                    send_telegram(alert)
-                    self._gg_strategy.mark_position_closed(exit_sig.symbol)
-                    _log_daily_event('gg_exit', exit_sig.symbol,
-                                     f"[GG-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
+                if exit_sig.sell_half:
+                    # Profit target: sell half, keep position open
+                    alert = self._gg_portfolio.sell_half(exit_sig.symbol, price, exit_sig.reason)
+                    if alert:
+                        send_telegram(alert)
+                        _log_daily_event('gg_exit', exit_sig.symbol,
+                                         f"[GG-SIM] SELL HALF @ ${price:.4f} ({exit_sig.reason})")
+                else:
+                    alert = self._gg_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
+                    if alert:
+                        send_telegram(alert)
+                        self._gg_strategy.mark_position_closed(exit_sig.symbol)
+                        _log_daily_event('gg_exit', exit_sig.symbol,
+                                         f"[GG-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
 
             # ── 4. Execute entries ──
             for entry in entries:
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
-                qty = int(self._gg_portfolio.cash * GG_LIVE_POSITION_SIZE_PCT / entry_price) if entry_price > 0 else 0
+                # Min price filter
+                if entry_price < STRATEGY_MIN_PRICE:
+                    self._gg_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"GG: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
+                    continue
+                # Risk controls
+                can_buy, reason = self._gg_portfolio.can_enter(entry.symbol)
+                if not can_buy:
+                    self._gg_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"GG: Skipping {entry.symbol} — {reason}")
+                    continue
+
+                qty = int(min(self._gg_portfolio.cash, GG_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
                 if qty >= 1:
                     alert = self._gg_portfolio.buy(entry.symbol, qty, entry_price, entry.vwap)
                     if alert:
@@ -6303,6 +6662,8 @@ class ScannerThread(threading.Thread):
                     continue
                 if prev_close <= 0:
                     continue
+                if price < STRATEGY_MIN_PRICE:
+                    continue
                 # Skip if too far below VWAP
                 vwap = d.get('vwap', 0)
                 if vwap > 0 and price < vwap:
@@ -6344,7 +6705,19 @@ class ScannerThread(threading.Thread):
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
-                qty = int(self._mr_portfolio.cash * MR_LIVE_POSITION_SIZE_PCT / entry_price) if entry_price > 0 else 0
+                # Min price filter
+                if entry_price < STRATEGY_MIN_PRICE:
+                    self._mr_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"MR: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
+                    continue
+                # Risk controls
+                can_buy, reason = self._mr_portfolio.can_enter(entry.symbol)
+                if not can_buy:
+                    self._mr_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"MR: Skipping {entry.symbol} — {reason}")
+                    continue
+
+                qty = int(min(self._mr_portfolio.cash, MR_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
                 if qty >= 1:
                     alert = self._mr_portfolio.buy(
                         entry.symbol, qty, entry_price, entry.vwap,
@@ -6387,6 +6760,8 @@ class ScannerThread(threading.Thread):
                 price = d.get('price', 0)
                 contract = d.get('contract')
                 if price <= 0 or not contract:
+                    continue
+                if price < STRATEGY_MIN_PRICE:
                     continue
 
                 # Skip if too far below VWAP
@@ -6447,8 +6822,19 @@ class ScannerThread(threading.Thread):
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
-                max_pos_value = 500.0  # max $500 per position
-                qty = int(min(self._ft_portfolio.cash * FT_LIVE_POSITION_SIZE_PCT, max_pos_value) / entry_price) if entry_price > 0 else 0
+                # Min price filter
+                if entry_price < STRATEGY_MIN_PRICE:
+                    self._ft_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"FT: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
+                    continue
+                # Risk controls
+                can_buy, reason = self._ft_portfolio.can_enter(entry.symbol)
+                if not can_buy:
+                    self._ft_strategy.mark_position_closed(entry.symbol)
+                    log.info(f"FT: Skipping {entry.symbol} — {reason}")
+                    continue
+
+                qty = int(min(self._ft_portfolio.cash, FT_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
                 qty = min(qty, 5000)  # absolute max shares
                 if qty >= 1:
                     alert = self._ft_portfolio.buy(
@@ -6831,6 +7217,9 @@ class ScannerThread(threading.Thread):
 
         # ── Monitor virtual portfolio positions for stops/targets ──
         self._monitor_virtual_positions(current)
+
+        # ── Force-close positions that exceeded max hold time ──
+        self._check_timed_exits(current)
 
         # ── FIB DT Auto-Strategy ──
         _phase('fib_dt_start')

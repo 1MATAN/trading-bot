@@ -20,6 +20,11 @@ from config.settings import (
     GG_LIVE_GAP_MIN_PCT,
     GG_LIVE_VWAP_PROXIMITY_PCT,
     GG_LIVE_MAX_TRACKED_SYMBOLS,
+    GG_LIVE_SAFETY_STOP_PCT,
+    GG_LIVE_TRAILING_STOP_PCT,
+    GG_LIVE_MIN_HOLD_SEC,
+    GG_LIVE_HA_EXIT_BARS,
+    GG_LIVE_PROFIT_TARGET_PCT,
 )
 
 logger = logging.getLogger("trading_bot.gap_go_live")
@@ -56,6 +61,7 @@ class GGExitSignal:
     symbol: str
     price: float
     reason: str
+    sell_half: bool = False           # True = sell half + move stop to breakeven
 
 
 @dataclass
@@ -66,6 +72,9 @@ class _GGSymbolState:
     date_key: str = ""
     entry_time: datetime | None = None
     consecutive_exit_signals: int = 0
+    entry_price: float = 0.0
+    highest_high: float = 0.0
+    target_hit: bool = False          # True after +5% target → half sold
 
 
 # ── Heikin Ashi ────────────────────────────────────────────
@@ -158,22 +167,39 @@ class GapGoLiveStrategy:
             self._states[symbol] = state
         return state
 
-    def mark_in_position(self, symbol: str):
-        self._get_state(symbol).in_position = True
+    def mark_in_position(self, symbol: str, entry_price: float = 0.0):
+        state = self._get_state(symbol)
+        state.in_position = True
+        if entry_price > 0:
+            state.entry_price = entry_price
+            state.highest_high = entry_price
 
     def mark_position_closed(self, symbol: str):
         state = self._get_state(symbol)
         state.in_position = False
         state.entry_time = None
+        state.entry_price = 0.0
+        state.highest_high = 0.0
         state.consecutive_exit_signals = 0
+        state.target_hit = False
 
-    def sync_from_portfolio(self, held_symbols: set):
-        """Sync strategy state from portfolio after restart."""
-        for sym in held_symbols:
+    def sync_from_portfolio(self, held_positions: dict):
+        """Sync strategy state from portfolio after restart.
+
+        Args:
+            held_positions: {sym: {'entry_price': float, ...}} or set of symbols
+        """
+        if isinstance(held_positions, set):
+            held_positions = {s: {} for s in held_positions}
+        for sym, pos in held_positions.items():
             state = self._get_state(sym)
             state.in_position = True
             state.first_entry_done = True
-            logger.info(f"GG strategy sync: {sym} marked in_position")
+            entry_price = pos.get('entry_price', 0) if isinstance(pos, dict) else 0
+            if entry_price > 0:
+                state.entry_price = entry_price
+                state.highest_high = entry_price
+            logger.info(f"GG strategy sync: {sym} marked in_position @ ${entry_price:.4f}")
 
     def process_cycle(
         self, candidates: list[GGCandidate]
@@ -271,8 +297,47 @@ class GapGoLiveStrategy:
         if now_et >= _EOD_CLOSE_TIME and state.in_position:
             return None, GGExitSignal(sym, price, "eod_close")
 
-        # ── Check exit (both HA red, 2-bar confirmation + 3-min hold) ──
+        # ── Check exit (price stops → profit target → HA) ──
         if state.in_position:
+            # Update highest high for trailing stop
+            if price > state.highest_high:
+                state.highest_high = price
+
+            # Safety stop: max loss from entry (always active)
+            if state.entry_price > 0:
+                safety_stop = state.entry_price * (1 - GG_LIVE_SAFETY_STOP_PCT)
+                if price <= safety_stop:
+                    return None, GGExitSignal(
+                        sym, price,
+                        f"safety_stop (entry=${state.entry_price:.4f}, "
+                        f"-{GG_LIVE_SAFETY_STOP_PCT:.0%}=${safety_stop:.4f})")
+
+            # Trailing stop: from highest high
+            if state.highest_high > 0:
+                trail_stop = state.highest_high * (1 - GG_LIVE_TRAILING_STOP_PCT)
+                if price <= trail_stop:
+                    return None, GGExitSignal(
+                        sym, price,
+                        f"trailing_stop (peak=${state.highest_high:.4f}, "
+                        f"-{GG_LIVE_TRAILING_STOP_PCT:.0%}=${trail_stop:.4f})")
+
+            # Breakeven stop: after target hit, exit if price drops back to entry
+            if state.target_hit and state.entry_price > 0 and price <= state.entry_price:
+                return None, GGExitSignal(
+                    sym, price,
+                    f"breakeven_stop (entry=${state.entry_price:.4f})")
+
+            # Profit target: sell half at +5%, move stop to breakeven
+            if (not state.target_hit and state.entry_price > 0
+                    and price >= state.entry_price * (1 + GG_LIVE_PROFIT_TARGET_PCT)):
+                state.target_hit = True
+                pct = GG_LIVE_PROFIT_TARGET_PCT * 100
+                return None, GGExitSignal(
+                    sym, price,
+                    f"profit_target (+{pct:.0f}%, entry=${state.entry_price:.4f})",
+                    sell_half=True)
+
+            # HA exit: both HA red, 3-bar confirmation + minimum 10 min hold
             ha_1m_red = not latest_1m["is_green"]
             ha_5m_red = not latest_5m["is_green"]
             if ha_1m_red and ha_5m_red:
@@ -280,11 +345,13 @@ class GapGoLiveStrategy:
             else:
                 state.consecutive_exit_signals = 0
 
-            # Require 2 consecutive red signals + minimum 3 minute hold
             min_hold_ok = (state.entry_time is None or
-                           (datetime.now(_ET) - state.entry_time).total_seconds() >= 180)
-            if state.consecutive_exit_signals >= 2 and min_hold_ok:
-                return None, GGExitSignal(sym, price, "ha_exit (2x 1m+5m red)")
+                           (datetime.now(_ET) - state.entry_time).total_seconds()
+                           >= GG_LIVE_MIN_HOLD_SEC)
+            if state.consecutive_exit_signals >= GG_LIVE_HA_EXIT_BARS and min_hold_ok:
+                return None, GGExitSignal(
+                    sym, price,
+                    f"ha_exit ({GG_LIVE_HA_EXIT_BARS}x 1m+5m red)")
 
         # ── Check entry ──
         if not state.in_position and _ENTRY_OK_TIME <= now_et < _EOD_CLOSE_TIME:
@@ -306,6 +373,8 @@ class GapGoLiveStrategy:
             state.in_position = True
             state.first_entry_done = True
             state.entry_time = datetime.now(_ET)
+            state.entry_price = price
+            state.highest_high = price
             state.consecutive_exit_signals = 0
             entry = GGEntrySignal(
                 symbol=sym,

@@ -285,14 +285,22 @@ GG_ENTRY_AFTER_MINUTES = 5        # enter after 9:35
 # ── Gap and Go LIVE ───────────────────────────────────
 GG_LIVE_GAP_MIN_PCT = 15.0
 GG_LIVE_INITIAL_CASH = 3000.0
-GG_LIVE_POSITION_SIZE_PCT = 0.95
+GG_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
 GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
 GG_LIVE_MAX_TRACKED_SYMBOLS = 8
+GG_LIVE_MAX_POSITIONS = 3              # max open positions
+GG_LIVE_SAFETY_STOP_PCT = 0.08         # 8% max loss from entry
+GG_LIVE_TRAILING_STOP_PCT = 0.06       # 6% trailing from highest high
+GG_LIVE_MIN_HOLD_SEC = 600             # 10 min minimum hold before HA exit allowed
+GG_LIVE_HA_EXIT_BARS = 3              # 3 consecutive HA red bars required for exit
+GG_LIVE_PROFIT_TARGET_PCT = 0.05      # +5% → sell half, move stop to breakeven
+GG_MAX_HOLD_MINUTES = 120              # 2 hours max hold
 
 # ── Momentum Ride LIVE ───────────────────────────────
 MR_LIVE_INITIAL_CASH = 3000.0
-MR_LIVE_POSITION_SIZE_PCT = 0.95
+MR_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
 MR_LIVE_MAX_TRACKED_SYMBOLS = 5
+MR_LIVE_MAX_POSITIONS = 3              # max open positions
 MR_TRAILING_STOP_PCT = 0.12            # 12% trailing from highest high (was 8%, too tight on 20-50% gap stocks)
 MR_SAFETY_STOP_PCT = 0.10             # 10% below entry (was 8%)
 MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
@@ -301,9 +309,22 @@ MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
 
 # ── Float Turnover (FT) Robot ──────────────────────────
 FT_LIVE_INITIAL_CASH = 3000.0
-FT_LIVE_POSITION_SIZE_PCT = 0.95
-FT_LIVE_MAX_TRACKED_SYMBOLS = 20       # was 50 — reduce to avoid churning
+FT_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
+FT_LIVE_MAX_TRACKED_SYMBOLS = 5        # was 20 — concentrate on top turnover
+FT_LIVE_MAX_POSITIONS = 3              # max open positions
 FT_MIN_FLOAT_TURNOVER_PCT = 15.0     # minimum % of float traded
+FT_MAX_HOLD_MINUTES = 60              # 1 hour max hold
+
+# ── Strategy-Wide Risk Controls ──────────────────────
+STRATEGY_MIN_PRICE = 0.50              # skip stocks under $0.50 (huge spreads)
+FIB_DT_POSITION_SIZE_FIXED = 500       # $500 per position (FIB DT cap)
+FIB_DT_MAX_POSITIONS = 3              # max open positions for FIB DT
+FIB_DT_MAX_HOLD_MINUTES = 180         # 3 hours max hold
+FIB_DT_WARMUP_SEC = 300               # 5 min warmup: skip entries for stocks seen < 5 min ago
+STRATEGY_REENTRY_COOLDOWN_SEC = 600              # 10 min after exit before re-entry
+STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC = 1800  # 30 min after a losing exit
+STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY = 2       # max 2 entries per stock per day
+STRATEGY_DAILY_LOSS_LIMIT = 300.0      # $300 max realized loss per strategy per day
 
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20

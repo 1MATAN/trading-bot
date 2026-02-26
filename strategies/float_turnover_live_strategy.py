@@ -1,7 +1,7 @@
-"""Float Turnover Live Strategy — 5-sec bars, real-time entry/exit.
+"""Float Turnover Live Strategy — 30-sec bars, real-time entry/exit.
 
-Entry (not in position): latest 5s bar low >= previous 5s bar low (held support)
-Exit  (in position):     price <= prev bar low * 0.99  (stop = 1% below prev low)
+Entry (not in position): latest 30s bar low >= previous 30s bar low (held support)
+Exit  (in position):     price <= prev bar low * 0.95  (stop = 5% below prev low)
 Re-entry:                same as entry
 EOD close at 19:55 ET.
 
@@ -20,7 +20,7 @@ logger = logging.getLogger("trading_bot.float_turnover_live")
 _ET = ZoneInfo("US/Eastern")
 
 _EOD_CLOSE_TIME = time(19, 55)  # force close
-_FT_STOP_PCT = 0.03  # 3% below previous bar low (was 1%, too tight → whipsaws)
+_FT_STOP_PCT = 0.05  # 5% below previous bar low (was 3%, too tight on pennies)
 _FT_REENTRY_COOLDOWN_SEC = 60  # seconds before re-entry on same stock
 
 
@@ -62,12 +62,12 @@ class _FTSymbolState:
 # ── Strategy class ─────────────────────────────────────────
 
 class FloatTurnoverLiveStrategy:
-    """Float Turnover live strategy — 5-second bars, real-time.
+    """Float Turnover live strategy — 30-second bars, real-time.
 
     Each cycle:
-      1. Request 5-sec bars from IBKR for each tracked symbol
+      1. Request 30-sec bars from IBKR for each tracked symbol
       2. Entry: latest bar low >= previous bar low (support held)
-      3. Exit: price drops to 1% below previous bar low (stop hit)
+      3. Exit: price drops to 5% below previous bar low (stop hit)
     """
 
     def __init__(self, ib_getter):
@@ -140,7 +140,7 @@ class FloatTurnoverLiveStrategy:
     def _process_symbol(
         self, ib, cand: FTCandidate, now_et: datetime
     ) -> tuple[Optional[FTEntrySignal], Optional[FTExitSignal]]:
-        """Process a single symbol: fetch 5-sec bars, check entry/stop."""
+        """Process a single symbol: fetch 30-sec bars, check entry/stop."""
         sym = cand.symbol
         state = self._get_state(sym)
 
@@ -148,12 +148,12 @@ class FloatTurnoverLiveStrategy:
         if now_et.time() >= _EOD_CLOSE_TIME and state.in_position:
             return None, FTExitSignal(sym, cand.price, "eod_close")
 
-        # ── Fetch 5-sec bars from IBKR ──
+        # ── Fetch 30-sec bars from IBKR ──
         bars = ib.reqHistoricalData(
             cand.contract,
             endDateTime="",
-            durationStr="1800 S",
-            barSizeSetting="5 secs",
+            durationStr="3600 S",
+            barSizeSetting="30 secs",
             whatToShow="TRADES",
             useRTH=False,
             formatDate=2,
@@ -167,7 +167,7 @@ class FloatTurnoverLiveStrategy:
             return None, None
         state.last_bar_count = len(bars)
 
-        # Latest bar and previous bar (5-sec each)
+        # Latest bar and previous bar (30-sec each)
         latest = bars[-1]
         prev = bars[-2]
 
@@ -175,7 +175,7 @@ class FloatTurnoverLiveStrategy:
         prev_low = float(prev.low)
         price = float(latest.close)
 
-        # Stop level: 1% below previous bar's low
+        # Stop level: 5% below previous bar's low
         stop_price = prev_low * (1 - _FT_STOP_PCT)
 
         # ── Check exit signals (position open) ──
