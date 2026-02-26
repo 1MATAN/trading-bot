@@ -561,6 +561,31 @@ def _format_volume(volume: float) -> str:
     return str(int(volume))
 
 
+def _et_to_israel(date_str: str) -> str:
+    """Convert ET date string to Israel time. '2026-02-26 08:22 ET' → '26/02 15:22'."""
+    if not date_str:
+        return ''
+    try:
+        from zoneinfo import ZoneInfo
+        clean = date_str.replace(' ET', '').strip()
+        # Try datetime with time
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+            try:
+                et_dt = datetime.strptime(clean, fmt)
+                et_dt = et_dt.replace(tzinfo=ZoneInfo('US/Eastern'))
+                il_dt = et_dt.astimezone(ZoneInfo('Asia/Jerusalem'))
+                return il_dt.strftime('%d/%m %H:%M')
+            except ValueError:
+                continue
+        # Date only — no time conversion needed
+        if len(clean) == 10:  # '2026-02-26'
+            dt = datetime.strptime(clean, '%Y-%m-%d')
+            return dt.strftime('%d/%m')
+    except Exception:
+        pass
+    return date_str
+
+
 def _format_dollar_short(val: float) -> str:
     """Format dollar value as short Hebrew string: $3.16 מליון, $456 אלף."""
     if val >= 1_000_000:
@@ -3929,7 +3954,6 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                          alert_title: str = "",
                          stock_info: dict | None = None,
                          ma_rows: list[dict] | None = None,
-                         news_items: list[dict] | None = None,
                          fib_anchor: tuple | None = None) -> Path | None:
     """Generate 1-min Japanese candlestick chart (48h) with Fibonacci levels.
 
@@ -3938,7 +3962,6 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
     alert_title: shown as the chart title (alert reason + stock info).
     stock_info: dict with vol, float, inst_own, insider_own etc.
     ma_rows: list of {tf, period, sma, ema} for MA confluence overlay.
-    news_items: list of news dicts to render on chart overlay.
     fib_anchor: (anchor_low, anchor_high, anchor_date) for fib origin display.
 
     Returns path to saved PNG or None on failure.
@@ -4169,20 +4192,6 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
             a_low_s = f"${a_low:.2f}" if a_low >= 1 else f"${a_low:.4f}"
             a_high_s = f"${a_high:.2f}" if a_high >= 1 else f"${a_high:.4f}"
             right_lines.append((f"Fib: {a_low_s} -> {a_high_s} ({date_str})", '#FFD700'))
-
-        # ── News headlines ──
-        if news_items:
-            right_lines.append(('', '#333'))  # separator
-            for n in news_items[:3]:
-                # Prefer English for chart (monospace font can't render Hebrew)
-                title = n.get('title_en') or n.get('title_he') or ''
-                if not title:
-                    continue
-                ndate = n.get('date', '')
-                if len(title) > 50:
-                    title = title[:47] + '...'
-                line = f"{ndate}  {title}" if ndate else title
-                right_lines.append((line, '#e0e0e0'))
 
         # Render right overlay (top-right, right-aligned)
         if right_lines:
@@ -4574,9 +4583,6 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
     except Exception as e:
         log.debug(f"MA calc for unified report {sym}: {e}")
 
-    # ── News items for chart overlay ──
-    news_items = enrich.get('news', [])
-
     # ── Fib anchor tuple for chart overlay ──
     fib_anchor = None
     if anchor_low and anchor_high:
@@ -4586,7 +4592,6 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
     chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map,
                                       alert_title=alert_reason,
                                       stock_info=si, ma_rows=ma_data,
-                                      news_items=news_items,
                                       fib_anchor=fib_anchor)
     if not chart_path:
         return
@@ -4650,11 +4655,12 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
     if fin_parts:
         caption_lines.append(f"💰 {' | '.join(fin_parts)}")
 
-    # Lines 7-8: News (up to 2 headlines)
+    # News headlines (up to 3, Hebrew, Israel timezone)
+    news_items = enrich.get('news', [])
     if news_items:
         headlines_he = []
         headlines_en = []
-        for n in news_items[:2]:
+        for n in news_items[:3]:
             title_he = n.get('title_he', '')
             title_en = n.get('title_en', '')
             ndate = n.get('date', '')
@@ -4670,8 +4676,10 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
             except Exception:
                 for d, t in headlines_en:
                     headlines_he.append((d, t))
-        for ndate, title in headlines_he[:2]:
-            prefix = f"{ndate} — " if ndate else ""
+        for ndate, title in headlines_he[:3]:
+            # Convert ET → Israel time
+            il_date = _et_to_israel(ndate)
+            prefix = f"{il_date} — " if il_date else ""
             caption_lines.append(f"📰 {prefix}{title}")
 
     # Line 9: Fib anchor
