@@ -5115,7 +5115,8 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
 
 
 def _send_unified_report(sym: str, stock: dict, enriched: dict,
-                          alert_reason: str = "") -> None:
+                          alert_reason: str = "",
+                          alert_tags: list[str] | None = None) -> None:
     """Send a single photo message with intraday chart + complete Hebrew caption.
 
     Replaces the old two-message flow (_send_stock_report text + _send_alert_chart image).
@@ -5214,8 +5215,9 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
 
     caption_lines = []
 
-    # Line 1: Header
-    caption_lines.append(f"🆕 <b>{sym}</b> ${price:.2f} {pct:+.1f}%")
+    # Line 1: Header with alert trigger reason
+    tags_str = " + ".join(alert_tags) if alert_tags else "חדשה"
+    caption_lines.append(f"🆕 <b>{sym}</b> ${price:.2f} {pct:+.1f}% | {tags_str}")
 
     # Line 2: Float + Short
     float_dol = _format_dollar_short(float_shares * price) if float_shares > 0 and price > 0 else ''
@@ -8519,8 +8521,17 @@ class ScannerThread(threading.Thread):
         if not is_baseline and current and not self._warmup:
             # Grouped alert collection: {sym: [compact_line, ...]}
             batch_by_sym: dict[str, list[str]] = {}
+            batch_tags: dict[str, list[str]] = {}   # Hebrew tags per symbol
             batch_full_texts: list[str] = []   # full texts for GUI display
             batch_syms: list[str] = []         # ordered unique symbols
+
+            _ALERT_TAG_HE = {
+                'HOD Break': 'שיא יומי', 'FIB Touch': 'נגיעת פיבו',
+                'FIB Support': 'תמיכת פיבו', 'LOD Touch': 'נמוך יומי',
+                'VWAP Cross': 'חציית VWAP', 'Spike': 'קפיצה',
+                'Volume': 'ווליום חריג', 'Doji': 'פריצת דוג׳י',
+                'TF High': 'שבירת גבוה',
+            }
 
             def _collect(sym, result, sound_type, counter_name):
                 if result is None:
@@ -8528,6 +8539,7 @@ class ScannerThread(threading.Thread):
                 full, compact = result
                 batch_full_texts.append(full)
                 batch_by_sym.setdefault(sym, []).append(compact)
+                batch_tags.setdefault(sym, []).append(_ALERT_TAG_HE.get(counter_name, counter_name))
                 # play_alert_sound(sound_type)  # disabled — Telegram alerts only
                 _daily_alert_counts[counter_name] = _daily_alert_counts.get(counter_name, 0) + 1
                 _alerts_per_stock.setdefault(sym, {})
@@ -8588,8 +8600,10 @@ class ScannerThread(threading.Thread):
                         # Multiple alerts — join compact lines
                         reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
                     enrich_s = _enrichment.get(s, {})
+                    tags = batch_tags.get(s, [])
                     _send_unified_report(s, sd_s, enrich_s,
-                                         alert_reason=reason)
+                                         alert_reason=reason,
+                                         alert_tags=tags)
 
                 status += f"  🔔{total_alerts}"
             else:
