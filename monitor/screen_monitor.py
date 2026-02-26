@@ -2883,6 +2883,12 @@ _DOJI_COOLDOWN_SEC = 300  # 5 min cooldown per symbol+timeframe
 _doji_alerted: dict[str, float] = {}  # "SYM_5m" → timestamp
 _doji_pending: dict[str, tuple[float, float, str]] = {}  # "SYM_5m" → (doji_high, timestamp, tf_label)
 
+# ── Fib bounce (synthetic 1-min bars) ──
+_fib_bar_forming: dict[str, dict] = {}      # sym → {minute, open, high, low, close}
+_fib_bar_completed: dict[str, dict] = {}    # sym → last completed bar {open, high, low, close}
+_fib_bounce_cooldown: dict[str, float] = {} # "SYM_0.1234" → timestamp
+_FIB_BOUNCE_COOLDOWN_SEC = 600              # 10 min cooldown per symbol+level
+
 # ── Alert chart cooldown ──
 _ALERT_CHART_COOLDOWN_SEC = 600  # 10 min cooldown per symbol for chart attachment
 _alert_chart_sent: dict[str, float] = {}  # sym → last chart timestamp
@@ -2902,6 +2908,9 @@ def _reset_alerts_if_new_day():
         _hod_break_alerted.clear()
         _hod_last_alert_time.clear()
         _fib_touch_tracker.clear()
+        _fib_bar_forming.clear()
+        _fib_bar_completed.clear()
+        _fib_bounce_cooldown.clear()
         _lod_touch_tracker.clear()
         _lod_was_near.clear()
         _vwap_side.clear()
@@ -2982,10 +2991,56 @@ def check_hod_break(sym: str, current: dict, previous: dict) -> tuple[str, str] 
         return None
 
 
+def _update_fib_bar(sym: str, price: float) -> dict | None:
+    """Update synthetic 1-min bar from snapshot prices.
+
+    Returns the last *completed* bar (previous minute) or None.
+    """
+    now = time_mod.time()
+    current_minute = int(now // 60)
+
+    forming = _fib_bar_forming.get(sym)
+    if forming and forming['minute'] == current_minute:
+        # Same minute — update OHLC
+        forming['high'] = max(forming['high'], price)
+        forming['low'] = min(forming['low'], price)
+        forming['close'] = price
+    else:
+        # New minute — promote forming bar to completed, start fresh
+        if forming:
+            _fib_bar_completed[sym] = {
+                'open': forming['open'],
+                'high': forming['high'],
+                'low': forming['low'],
+                'close': forming['close'],
+            }
+        _fib_bar_forming[sym] = {
+            'minute': current_minute,
+            'open': price,
+            'high': price,
+            'low': price,
+            'close': price,
+        }
+
+    return _fib_bar_completed.get(sym)
+
+
 def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str] | None:
-    """Alert on 2nd+ touch of a Fibonacci level (≥20% only, 0.8% proximity)."""
+    """Alert on fib bounce/rejection using synthetic 1-min bar close.
+
+    Support bounce: bar.low touched fib level (within 0.5%) + bar.close > level.
+    Resistance rejection: bar.high touched fib level (within 0.5%) + bar.close < level.
+    10-min cooldown per symbol+level.
+    """
     if pct < ALERT_MIN_PCT or price <= 0:
         return None
+
+    # Update synthetic bar and get last completed bar
+    bar = _update_fib_bar(sym, price)
+    if not bar:
+        return None
+
+    # Ensure fib levels are cached
     with _fib_cache_lock:
         has_cache = sym in _fib_cache
     if not has_cache:
@@ -2996,26 +3051,45 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
         return None
 
     _, _, all_levels, ratio_map, *_ = cached
-    if sym not in _fib_touch_tracker:
-        _fib_touch_tracker[sym] = {}
+    now = time_mod.time()
 
-    threshold = price * 0.008  # 0.8%
+    bar_high = bar['high']
+    bar_low = bar['low']
+    bar_close = bar['close']
 
     for lv in all_levels:
-        if abs(price - lv) <= threshold:
-            lv_key = round(lv, 4)
-            count = _fib_touch_tracker[sym].get(lv_key, 0)
-            if count < 2:
-                _fib_touch_tracker[sym][lv_key] = count + 1
-                if count + 1 == 2:
-                    info = ratio_map.get(lv_key)
-                    ratio_label = f" ({info[0]} {info[1]})" if info else ""
-                    full = (
-                        f"🎯 <b>נגיעת פיבו x2 — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-                        f"רמה ${lv:.4f}{ratio_label}"
-                    )
-                    compact = f"🎯 פיבו x2 ${lv:.4f}{ratio_label}"
-                    return full, compact
+        lv_key = round(lv, 4)
+        cooldown_key = f"{sym}_{lv_key}"
+
+        # Cooldown check
+        if now - _fib_bounce_cooldown.get(cooldown_key, 0) < _FIB_BOUNCE_COOLDOWN_SEC:
+            continue
+
+        threshold = lv * 0.005  # 0.5% proximity
+
+        info = ratio_map.get(lv_key)
+        ratio_label = f" ({info[0]} {info[1]})" if info else ""
+
+        # Support bounce: wick touched from above, closed above
+        if abs(bar_low - lv) <= threshold and bar_close > lv:
+            _fib_bounce_cooldown[cooldown_key] = now
+            full = (
+                f"🎯 <b>באונס מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"רמה ${lv:.4f}{ratio_label} | נסגר מעל"
+            )
+            compact = f"🎯 באונס ${lv:.4f}{ratio_label}"
+            return full, compact
+
+        # Resistance rejection: wick touched from below, closed below
+        if abs(bar_high - lv) <= threshold and bar_close < lv:
+            _fib_bounce_cooldown[cooldown_key] = now
+            full = (
+                f"🎯 <b>דחייה מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"רמה ${lv:.4f}{ratio_label} | נסגר מתחת"
+            )
+            compact = f"🎯 דחייה ${lv:.4f}{ratio_label}"
+            return full, compact
+
     return None
 
 
@@ -3770,11 +3844,17 @@ def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
 
 def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                          current_price: float,
-                         ratio_map: dict | None = None) -> Path | None:
+                         ratio_map: dict | None = None,
+                         alert_title: str = "",
+                         stock_info: dict | None = None,
+                         ma_rows: list[dict] | None = None) -> Path | None:
     """Generate 1-min Japanese candlestick chart (48h) with Fibonacci levels.
 
     Uses matplotlib Rectangle patches for proper candle bodies and thin
-    wicks — clean Japanese candlestick style.  No VWAP overlay.
+    wicks — clean Japanese candlestick style.
+    alert_title: shown as the chart title (alert reason + stock info).
+    stock_info: dict with vol, float, inst_own, insider_own etc.
+    ma_rows: list of {tf, period, sma, ema} for MA confluence overlay.
 
     Returns path to saved PNG or None on failure.
     """
@@ -3827,15 +3907,21 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                               facecolor=color, edgecolor=color, linewidth=0.3)
             ax.add_patch(rect)
 
-        # ── Y-axis: tight around price action ──
-        price_low = df['low'].min()
-        price_high = df['high'].max()
-        price_range = price_high - price_low
-        vis_min = max(0, price_low - price_range * 0.08)
-        vis_max = price_high + price_range * 0.08
+        # ── Relevant fib levels: nearest 5 below + 5 above current price ──
+        fibs_below = sorted([lv for lv in all_levels if lv <= current_price])[-5:]
+        fibs_above = sorted([lv for lv in all_levels if lv > current_price])[:5]
+        relevant_fibs = fibs_below + fibs_above
 
-        # Only show fib levels within the visible price range
-        visible_levels = [lv for lv in all_levels if vis_min <= lv <= vis_max]
+        # ── Y-axis: current price EXACTLY at vertical center ──
+        price_low = df['low'].min()
+        fib_top = fibs_above[min(2, len(fibs_above) - 1)] if fibs_above else current_price * 1.15
+        dist_below = current_price - price_low
+        dist_above = fib_top - current_price
+        half_range = max(dist_below, dist_above, current_price * 0.08) * 1.10
+        vis_min = max(0, current_price - half_range)
+        vis_max = current_price + half_range
+
+        visible_levels = [lv for lv in relevant_fibs if vis_min <= lv <= vis_max]
 
         price_span = vis_max - vis_min
 
@@ -3902,9 +3988,212 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_color('#333')
         ax.spines['left'].set_color('#333')
-        ax.set_title(f'{sym} — 1min (48h) + Fibonacci  ${current_price:.2f}',
-                     color='white', fontsize=15, fontweight='bold', pad=12)
+        # ── Title: 3 lines — English sym/price, Hebrew alert, stock info ──
+        # Line 1: SYM $price (pure English — no bidi issues)
+        title_line1 = f'{sym}  ${current_price:.2f}'
+
+        # Line 2: Hebrew alert type + detail (bidi per segment)
+        title_line2 = ''
+        if alert_title:
+            clean = re.sub(r'<[^>]+>', '', alert_title).strip()
+            clean = re.sub(
+                r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff'
+                r'\ufe00-\ufe0f\u200d\u20e3]', '', clean).strip()
+            alert_lines = clean.split('\n')
+            # Process each line: apply bidi to Hebrew segments only
+            bidi_parts = []
+            for aline in alert_lines[:2]:  # max 2 lines from alert
+                aline = aline.strip()
+                if not aline:
+                    continue
+                # Split on ' — ' to separate Hebrew from SYM/price
+                if ' — ' in aline:
+                    segments = aline.split(' — ')
+                    bidi_segs = []
+                    for seg in segments:
+                        seg = seg.strip()
+                        # Skip segments that are just the symbol+price (already in line1)
+                        if sym in seg:
+                            continue
+                        # Apply bidi to segments containing Hebrew chars
+                        if re.search(r'[\u0590-\u05FF]', seg):
+                            bidi_segs.append(bidi_display(seg))
+                        else:
+                            bidi_segs.append(seg)
+                    if bidi_segs:
+                        bidi_parts.append(' — '.join(bidi_segs))
+                else:
+                    # Whole line — apply bidi if has Hebrew
+                    if re.search(r'[\u0590-\u05FF]', aline):
+                        bidi_parts.append(bidi_display(aline))
+                    else:
+                        bidi_parts.append(aline)
+            title_line2 = ' | '.join(bidi_parts)
+
+        # Add daily % to title if available
+        si = stock_info or {}
+        if si.get('pct'):
+            title_line1 += f'  ({si["pct"]:+.1f}%)'
+
+        # Compose title (2 lines — details moved to overlay)
+        parts = [title_line1]
+        if title_line2:
+            parts.append(title_line2)
+        chart_title = '\n'.join(parts)
+        ax.set_title(chart_title, color='white', fontsize=13, fontweight='bold', pad=12)
         ax.grid(axis='y', color='#222', linewidth=0.3, alpha=0.5)
+
+        # ── RIGHT overlay: fundamentals (top-right) ──
+        right_lines = []
+        if si.get('float_str') and si['float_str'] != '-':
+            flt = f"Float: {si['float_str']}"
+            if si.get('float_dollar'):
+                flt += f"  ({si['float_dollar']})"
+            right_lines.append((flt, '#cccccc'))
+        if si.get('vol_shares'):
+            vol = f"Vol: {si['vol_shares']}"
+            if si.get('vol_dollar'):
+                vol += f"  ({si['vol_dollar']})"
+            # RVOL
+            rvol = si.get('rvol', 0)
+            if rvol and rvol >= 1.5:
+                vol += f"  x{rvol:.1f}"
+            right_lines.append((vol, '#cccccc'))
+        # Float Turnover
+        ft_pct = si.get('float_turnover', 0)
+        if ft_pct and ft_pct > 0:
+            ft_clr = '#ff4444' if ft_pct >= 100 else '#ff9800' if ft_pct >= 50 else '#cccccc'
+            right_lines.append((f"Turnover: {ft_pct:.0f}% of float", ft_clr))
+        if si.get('short') and si['short'] != '-':
+            right_lines.append((f"Short: {si['short']}", '#ff6666'))
+        if si.get('cash') and si['cash'] != '-':
+            right_lines.append((f"Cash: {si['cash']}/sh", '#88cc88'))
+        inst_parts = []
+        if si.get('inst_own') and si['inst_own'] != '-':
+            inst_parts.append(f"Inst: {si['inst_own']}")
+        if si.get('insider_own') and si['insider_own'] != '-':
+            inst_parts.append(f"Insider: {si['insider_own']}")
+        if inst_parts:
+            right_lines.append((' | '.join(inst_parts), '#aaaaaa'))
+
+        # Render right overlay (top-right, right-aligned)
+        if right_lines:
+            y_pos_r = 0.97
+            line_height = 0.027
+            for text, color in right_lines:
+                ax.text(0.99, y_pos_r, text,
+                        transform=ax.transAxes, fontsize=7.5, color=color,
+                        verticalalignment='top', horizontalalignment='right',
+                        fontfamily='monospace',
+                        bbox=dict(boxstyle='square,pad=0.15', facecolor='#0e1117',
+                                  edgecolor='none', alpha=0.80))
+                y_pos_r -= line_height
+
+        # ── LEFT overlay: VWAP + fib table (top-left) ──
+        left_lines = []
+
+        # VWAP (green = price above, red = price below)
+        vwap_val = si.get('vwap', 0)
+        if vwap_val and vwap_val > 0:
+            vwap_pct = (current_price - vwap_val) / vwap_val * 100
+            vp = f"${vwap_val:.2f}" if vwap_val >= 1 else f"${vwap_val:.4f}"
+            vwap_clr = '#26a69a' if current_price > vwap_val else '#ef5350'
+            left_lines.append((f"VWAP {vp}  {vwap_pct:+.1f}%", vwap_clr))
+            left_lines.append(('', '#333'))
+
+        # ── Build MA lookup for confluence labels ──
+        # Filter: skip 1m (too noisy) and only keep significant periods per TF
+        _TF_KEEP = {'5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', 'D': 'D'}
+        _TF_ORDER = {'5m': 0, '15m': 1, '30m': 2, '1h': 3, 'D': 4}
+        _MIN_PERIOD = {'5m': 20, '15m': 9, '30m': 9, '1h': 9, 'D': 9}
+        ma_vals: list[tuple[float, str, str, int]] = []  # (value, tf, type, period)
+        if ma_rows:
+            for r in ma_rows:
+                tf_s = _TF_KEEP.get(r['tf'])
+                if not tf_s:
+                    continue
+                # Skip small periods on short timeframes
+                if r['period'] < _MIN_PERIOD.get(tf_s, 9):
+                    continue
+                for ma_type, key in [('S', 'sma'), ('E', 'ema')]:
+                    val = r.get(key)
+                    if val and val > 0:
+                        ma_vals.append((val, tf_s, ma_type, r['period']))
+
+        # ── Fib table: above (descending) + price + below ──
+        above_sorted = sorted([lv for lv in relevant_fibs if lv > current_price], reverse=True)[:10]
+        below_sorted = sorted([lv for lv in relevant_fibs if lv <= current_price], reverse=True)[:5]
+
+        # Build anchor list for MA bucketing
+        anchors = sorted(set(above_sorted + below_sorted + [current_price]), reverse=True)
+        fib_lo = below_sorted[-1] if below_sorted else current_price
+        fib_hi = above_sorted[0] if above_sorted else current_price
+        # Bucket MAs between adjacent anchors
+        buckets: dict[float, list[tuple[str, str, int]]] = {a: [] for a in anchors}
+        for val, tf_s, ma_type, period in ma_vals:
+            if val > fib_hi or val < fib_lo:
+                continue
+            # Find nearest anchor above
+            best = None
+            for a in anchors:
+                if a >= val:
+                    best = a
+                else:
+                    break
+            if best is not None and best != current_price:
+                buckets[best].append((tf_s, ma_type, period))
+
+        def _compact_ma(items):
+            from collections import OrderedDict
+            by_tf = OrderedDict()
+            for tf_s, mt, p in sorted(items, key=lambda x: (_TF_ORDER.get(x[0], 9), x[2])):
+                by_tf.setdefault(tf_s, []).append(f"{mt}{p}")
+            return ', '.join(f"{t}-{' '.join(ms)}" for t, ms in by_tf.items())
+
+        def _fib_color(lv):
+            info = ratio_map.get(round(lv, 4)) if ratio_map else None
+            r = info[0] if isinstance(info, tuple) else info
+            return FIB_LEVEL_COLORS.get(r, '#888888') if r is not None else '#888888'
+
+        def _fib_label(lv):
+            info = ratio_map.get(round(lv, 4)) if ratio_map else None
+            r = info[0] if isinstance(info, tuple) else None
+            s = info[1] if isinstance(info, tuple) else 'S1'
+            pct = (lv - current_price) / current_price * 100
+            p = f"${lv:.2f}" if lv >= 1 else f"${lv:.4f}"
+            prefix = f"{r} " if r is not None else ""
+            suffix = f" {s}" if s == "S2" else ""
+            lbl = f"●  {prefix}{p}  {pct:+.1f}%{suffix}"
+            # Append MA confluence
+            ma_items = buckets.get(lv, [])
+            if ma_items:
+                lbl += f"  {_compact_ma(ma_items)}"
+            return lbl
+
+        for lv in above_sorted:
+            left_lines.append((_fib_label(lv), _fib_color(lv)))
+
+        # Current price separator
+        p_str = f"${current_price:.2f}" if current_price >= 1 else f"${current_price:.4f}"
+        left_lines.append((f"━━  {p_str}  ━━", '#FFD700'))
+
+        for lv in below_sorted:
+            left_lines.append((_fib_label(lv), _fib_color(lv)))
+
+        # Render left overlay (top-left, stacked vertically)
+        if left_lines:
+            y_pos = 0.97
+            line_height = 0.027
+            for text, color in left_lines:
+                if not text:
+                    y_pos -= line_height * 0.5  # half-space for separator
+                    continue
+                ax.text(0.01, y_pos, text,
+                        transform=ax.transAxes, fontsize=7.5, color=color,
+                        verticalalignment='top', fontfamily='monospace',
+                        bbox=dict(boxstyle='square,pad=0.15', facecolor='#0e1117',
+                                  edgecolor='none', alpha=0.80))
+                y_pos -= line_height
 
         out = Path(f'/tmp/alert_chart_{sym}.png')
         fig.savefig(out, dpi=130, bbox_inches='tight',
@@ -3949,26 +4238,84 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
         else:
             all_levels, ratio_map = [], {}
 
-    chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map)
+    # ── Build stock_info for chart overlay ──
+    enrich = _enrichment.get(sym, {})
+    sd = stock_data or {}
+    vol_raw = sd.get('volume_raw', 0)
+    dol_vol = vol_raw * price if vol_raw and price else 0
+    float_str = enrich.get('float', '-')
+    float_shares = _parse_float_to_shares(float_str)
+    # RVOL
+    rvol = sd.get('rvol', 0)
+    # Float turnover %
+    ft_pct = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+    si = {
+        'float_str': float_str,
+        'float_dollar': _format_dollar_short(float_shares * price) if float_shares > 0 and price > 0 else '',
+        'vol_shares': _format_shares_short(vol_raw) if vol_raw > 0 else '',
+        'vol_dollar': _format_dollar_short(dol_vol) if dol_vol > 0 else '',
+        'vol_str': _format_dollar_short(dol_vol) if dol_vol > 0 else (_format_shares_short(vol_raw) if vol_raw > 0 else ''),
+        'short': enrich.get('short', '-'),
+        'cash': enrich.get('cash', '-'),
+        'inst_own': enrich.get('inst_own', '-'),
+        'insider_own': enrich.get('insider_own', '-'),
+        'vwap': sd.get('vwap', 0),
+        'pct': sd.get('pct', 0),
+        'rvol': rvol,
+        'float_turnover': ft_pct,
+    }
+    # Replace Hebrew with English for chart rendering (monospace font)
+    for key in ('float_dollar', 'vol_shares', 'vol_dollar', 'vol_str'):
+        v = si.get(key, '')
+        if v:
+            si[key] = v.replace('מליון', 'M').replace('אלף', 'K')
+
+    # ── Compute MAs from 1-min bars (resample to higher timeframes) ──
+    ma_data = None
+    try:
+        if df is not None and len(df) > 20 and 'date' in df.columns:
+            df_ts = df.copy()
+            df_ts.index = pd.to_datetime(df_ts['date'])
+            ma_frames = {'1m': df}
+            for tf_key, rule in [('5m', '5min'), ('15m', '15min'),
+                                 ('30m', '30min'), ('1h', '1h')]:
+                resampled = df_ts.resample(rule).agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+                }).dropna()
+                if len(resampled) > 0:
+                    ma_frames[tf_key] = resampled
+            ma_frames['D'] = _daily_cache.get(sym)
+            ma_data = _calc_ma_table(price, ma_frames)
+    except Exception as e:
+        log.debug(f"MA calc for chart {sym}: {e}")
+
+    chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map,
+                                      alert_title=alert_reason,
+                                      stock_info=si, ma_rows=ma_data)
     if chart_path:
-        # ── Build rich caption: reason + news ──
-        caption = f"📐 <b>{sym}</b> — 1 דקה (48h) + פיבונאצ׳י  ${price:.2f}"
-        if alert_reason:
-            # Strip HTML tags for cleaner caption under photo
-            clean_reason = re.sub(r'<[^>]+>', '', alert_reason).strip()
-            if clean_reason:
-                caption += f"\n{clean_reason}"
-        # Append latest news headlines
+        # ── Caption: only news headlines (alert reason is in the chart title) ──
+        caption = ""
         enrich = _enrichment.get(sym, {})
         news_items = enrich.get('news', [])
         if news_items:
-            headlines = []
+            headlines_he = []
+            headlines_en = []  # fallback: translate untranslated headlines
             for n in news_items[:3]:
-                title = n.get('title_he', n.get('title_en', ''))
-                if title:
-                    headlines.append(title)
-            if headlines:
-                caption += "\n📰 " + "\n📰 ".join(headlines)
+                title_he = n.get('title_he', '')
+                title_en = n.get('title_en', '')
+                if title_he:
+                    headlines_he.append(title_he)
+                elif title_en:
+                    headlines_en.append(title_en)
+            # Translate any English-only headlines to Hebrew
+            if headlines_en:
+                try:
+                    translated = _batch_translate(headlines_en)
+                    headlines_he.extend(translated)
+                except Exception:
+                    headlines_he.extend(headlines_en)  # fallback to English
+            if headlines_he:
+                caption = "📰 " + "\n📰 ".join(headlines_he)
 
         # Telegram photo caption limit: 1024 chars
         if len(caption) > 1024:
