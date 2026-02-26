@@ -13,6 +13,7 @@ from datetime import time
 from enum import Enum
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from ib_insync import Contract
 
@@ -29,6 +30,11 @@ from config.settings import (
     FIB_DT_LIVE_MIN_BOUNCE_BARS,
     FIB_DT_LIVE_PREFERRED_RATIOS,
     FIB_DT_LIVE_TRAILING_BARS,
+    FIB_DT_LIVE_MIN_TARGET_PCT,
+    FIB_DT_LIVE_ATR_STOP_MULT,
+    FIB_DT_LIVE_ATR_STOP_MIN_PCT,
+    FIB_DT_LIVE_ATR_STOP_MAX_PCT,
+    FIB_DT_LIVE_MAX_BAR_RANGE_PCT,
     FIB_LOOKBACK_YEARS,
 )
 from scanner.gap_scanner import GapSignal
@@ -153,6 +159,42 @@ def _get_fib_price_info(dual: DualFibSeries, current_price: float) -> dict[float
     return info
 
 
+_ATR_PERIOD = 14
+
+
+def _compute_atr_from_15s(df: pd.DataFrame) -> float:
+    """Resample 15-sec bars → 1-min, then compute ATR(14). Returns 0.0 if insufficient data."""
+    if len(df) < 56:  # need ≥56 × 15s bars to get ≥14 × 1-min bars
+        return 0.0
+
+    ohlc = df.resample("1min").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    if len(ohlc) < _ATR_PERIOD + 1:
+        return 0.0
+
+    highs = ohlc["high"].values
+    lows = ohlc["low"].values
+    closes = ohlc["close"].values
+
+    prev_close = np.roll(closes, 1)
+    prev_close[0] = closes[0]
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+
+    return float(np.mean(tr[-_ATR_PERIOD:]))
+
+
+def _check_bar_range_filter(df: pd.DataFrame) -> bool:
+    """Return True if stock passes bar-range filter (avg range ≤ threshold). False = reject."""
+    tail = df.tail(10)
+    if len(tail) < 5:
+        return True  # not enough data, allow
+    closes = tail["close"].values
+    ranges = (tail["high"].values - tail["low"].values) / np.where(closes > 0, closes, 1.0)
+    avg_range = float(np.mean(ranges))
+    if avg_range > FIB_DT_LIVE_MAX_BAR_RANGE_PCT:
+        return False
+    return True
+
+
 # ── Main Strategy ──────────────────────────────────────────
 
 class FibDTLiveStrategy:
@@ -273,6 +315,14 @@ class FibDTLiveStrategy:
         if len(df) < 10:
             return None
 
+        # Bar-range filter — reject wide-spread / illiquid stocks early
+        if not _check_bar_range_filter(df):
+            logger.debug(f"[{symbol}] rejected: avg bar range > {FIB_DT_LIVE_MAX_BAR_RANGE_PCT:.0%}")
+            return None
+
+        # ATR for adaptive stop
+        atr = _compute_atr_from_15s(df)
+
         # Only process NEW bars since last cycle
         new_bar_count = len(df)
         start_idx = max(0, st.last_bar_count)
@@ -343,14 +393,22 @@ class FibDTLiveStrategy:
                                 continue
 
                             # DOUBLE TOUCH — generate entry request
-                            stop_price = round(fp * (1 - FIB_DT_LIVE_STOP_PCT), 4)
+                            if atr > 0:
+                                atr_stop = fp - atr * FIB_DT_LIVE_ATR_STOP_MULT
+                                stop_floor = fp * (1 - FIB_DT_LIVE_ATR_STOP_MAX_PCT)
+                                stop_ceil = fp * (1 - FIB_DT_LIVE_ATR_STOP_MIN_PCT)
+                                stop_price = round(max(stop_floor, min(stop_ceil, atr_stop)), 4)
+                                stop_tag = f"ATR({atr:.4f})"
+                            else:
+                                stop_price = round(fp * (1 - FIB_DT_LIVE_STOP_PCT), 4)
+                                stop_tag = "fixed"
                             target_price = self._find_target(st.fib_prices, idx, bar_close)
 
                             logger.info(
                                 f"[{symbol}] DOUBLE-TOUCH: fib=${fp:.4f} ratio={ratio} "
                                 f"(touch1=bar{ts.first_touch_bar}, touch2=bar{i}, "
                                 f"gap={bars_since_first} bars) -> "
-                                f"stop=${stop_price:.4f}, target=${target_price:.4f}"
+                                f"stop=${stop_price:.4f} [{stop_tag}], target=${target_price:.4f}"
                             )
 
                             # Reset this level
@@ -409,15 +467,16 @@ class FibDTLiveStrategy:
         return None
 
     def _find_target(self, fib_prices: list[float], fib_idx: int, entry_price: float) -> float:
-        """Find the Nth fib level above entry price."""
+        """Find the Nth fib level above entry price, enforcing minimum target distance."""
+        min_target = round(entry_price * (1 + FIB_DT_LIVE_MIN_TARGET_PCT), 4)
         levels_above = 0
         for fp in fib_prices:
             if fp > entry_price:
                 levels_above += 1
                 if levels_above >= FIB_DT_LIVE_TARGET_LEVELS:
-                    return fp
-        # Fallback: 5% above entry
-        return round(entry_price * 1.05, 4)
+                    return max(fp, min_target)
+        # Fallback: 5% above entry (or min target, whichever is higher)
+        return max(round(entry_price * 1.05, 4), min_target)
 
     async def _init_symbol_state(
         self, signal: GapSignal, today: str
@@ -632,6 +691,14 @@ class FibDTLiveStrategySync:
         if len(df) < 10:
             return None
 
+        # Bar-range filter — reject wide-spread / illiquid stocks early
+        if not _check_bar_range_filter(df):
+            logger.debug(f"[{symbol}] rejected: avg bar range > {FIB_DT_LIVE_MAX_BAR_RANGE_PCT:.0%}")
+            return None
+
+        # ATR for adaptive stop
+        atr = _compute_atr_from_15s(df)
+
         new_bar_count = len(df)
         start_idx = max(0, st.last_bar_count)
         if new_bar_count <= st.last_bar_count:
@@ -696,14 +763,22 @@ class FibDTLiveStrategySync:
                                 ts.first_touch_bar = -1
                                 continue
 
-                            stop_price = round(fp * (1 - FIB_DT_LIVE_STOP_PCT), 4)
+                            if atr > 0:
+                                atr_stop = fp - atr * FIB_DT_LIVE_ATR_STOP_MULT
+                                stop_floor = fp * (1 - FIB_DT_LIVE_ATR_STOP_MAX_PCT)
+                                stop_ceil = fp * (1 - FIB_DT_LIVE_ATR_STOP_MIN_PCT)
+                                stop_price = round(max(stop_floor, min(stop_ceil, atr_stop)), 4)
+                                stop_tag = f"ATR({atr:.4f})"
+                            else:
+                                stop_price = round(fp * (1 - FIB_DT_LIVE_STOP_PCT), 4)
+                                stop_tag = "fixed"
                             target_price = self._find_target(st.fib_prices, idx, bar_close)
 
                             logger.info(
                                 f"[{symbol}] DOUBLE-TOUCH: fib=${fp:.4f} ratio={ratio} "
                                 f"(touch1=bar{ts.first_touch_bar}, touch2=bar{i}, "
                                 f"gap={bars_since_first} bars) -> "
-                                f"stop=${stop_price:.4f}, target=${target_price:.4f}"
+                                f"stop=${stop_price:.4f} [{stop_tag}], target=${target_price:.4f}"
                             )
 
                             ts.phase = "IDLE"
@@ -769,14 +844,16 @@ class FibDTLiveStrategySync:
         return None
 
     def _find_target(self, fib_prices: list[float], fib_idx: int, entry_price: float) -> float:
-        """Find the Nth fib level above entry price."""
+        """Find the Nth fib level above entry price, enforcing minimum target distance."""
+        min_target = round(entry_price * (1 + FIB_DT_LIVE_MIN_TARGET_PCT), 4)
         levels_above = 0
         for fp in fib_prices:
             if fp > entry_price:
                 levels_above += 1
                 if levels_above >= FIB_DT_LIVE_TARGET_LEVELS:
-                    return fp
-        return round(entry_price * 1.05, 4)
+                    return max(fp, min_target)
+        # Fallback: 5% above entry (or min target, whichever is higher)
+        return max(round(entry_price * 1.05, 4), min_target)
 
     def _init_symbol_state(
         self, signal: GapSignal, today: str

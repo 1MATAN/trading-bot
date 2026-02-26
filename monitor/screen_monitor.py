@@ -77,12 +77,15 @@ from config.settings import (
     STARTING_CAPITAL,
     GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_FIXED,
     GG_LIVE_MAX_POSITIONS, GG_MAX_HOLD_MINUTES,
+    GG_LIVE_RVOL_MIN, GG_LIVE_REQUIRE_NEWS,
     MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_FIXED,
-    MR_LIVE_MAX_POSITIONS,
+    MR_LIVE_MAX_POSITIONS, MR_LIVE_RVOL_MIN, MR_LIVE_REQUIRE_NEWS,
     FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_FIXED, FT_MIN_FLOAT_TURNOVER_PCT,
     FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES,
+    FT_LIVE_GAP_MIN_PCT, FT_LIVE_RVOL_MIN, FT_LIVE_REQUIRE_NEWS,
     STRATEGY_MIN_PRICE, FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
     FIB_DT_MAX_HOLD_MINUTES,
+    FIB_DT_GAP_MIN_PCT, FIB_DT_GAP_MAX_PCT, FIB_DT_RVOL_MIN, FIB_DT_REQUIRE_NEWS,
     STRATEGY_REENTRY_COOLDOWN_SEC, STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC,
     STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY, STRATEGY_DAILY_LOSS_LIMIT,
     FIB_DT_WARMUP_SEC,
@@ -603,6 +606,69 @@ def _get_spy_daily_change() -> float:
         log.debug(f"SPY daily change fetch failed: {e}")
 
     return _spy_cache['pct']
+
+
+# ── Robot helpers: news + SMA9 checks ──
+def _stock_has_news(sym: str) -> bool:
+    """Check if stock has news from enrichment (Finviz/IBKR)."""
+    enrich = _enrichment.get(sym, {})
+    return bool(enrich.get('news'))
+
+
+# SMA9 check cache: {sym: (timestamp, above_both)}
+_sma9_cache: dict[str, tuple[float, bool]] = {}
+_SMA9_CACHE_TTL = 300  # 5 minutes
+
+
+def _check_above_sma9(sym: str, price: float, contract) -> bool:
+    """Check if price is above SMA9 on both 5-min and 4-hour timeframes.
+
+    Uses IBKR historical data with 5-minute cache per symbol.
+    Returns True if can't fetch data (fail-open).
+    """
+    now = time_mod.time()
+    if sym in _sma9_cache:
+        ts, above = _sma9_cache[sym]
+        if now - ts < _SMA9_CACHE_TTL:
+            return above
+
+    ib = _get_ibkr()
+    if not ib:
+        return True  # fail-open
+
+    try:
+        # 5-min SMA9
+        bars_5m = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='1 D',
+            barSizeSetting='5 mins', whatToShow='TRADES',
+            useRTH=False, timeout=10,
+        )
+        if not bars_5m or len(bars_5m) < 9:
+            _sma9_cache[sym] = (now, True)
+            return True
+        sma9_5m = sum(b.close for b in bars_5m[-9:]) / 9
+
+        # 4-hour SMA9
+        bars_4h = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='5 D',
+            barSizeSetting='4 hours', whatToShow='TRADES',
+            useRTH=False, timeout=10,
+        )
+        if not bars_4h or len(bars_4h) < 9:
+            _sma9_cache[sym] = (now, True)
+            return True
+        sma9_4h = sum(b.close for b in bars_4h[-9:]) / 9
+
+        above = price > sma9_5m and price > sma9_4h
+        if not above:
+            log.debug(f"SMA9 filter: {sym} ${price:.4f} — "
+                      f"SMA9(5m)=${sma9_5m:.4f} SMA9(4h)=${sma9_4h:.4f}")
+        _sma9_cache[sym] = (now, above)
+        return above
+    except Exception as e:
+        log.debug(f"SMA9 check failed for {sym}: {e}")
+        _sma9_cache[sym] = (now, True)
+        return True
 
 
 # Alert filter: dollar volume >= $60K OR RVOL >= 3.0
@@ -6750,11 +6816,20 @@ class ScannerThread(threading.Thread):
                 prev_close = d.get('prev_close', 0)
                 contract = d.get('contract')
 
-                if pct < 20 or price <= 0 or prev_close <= 0 or not contract:
+                if pct < FIB_DT_GAP_MIN_PCT or pct > FIB_DT_GAP_MAX_PCT:
+                    continue
+                if price <= 0 or prev_close <= 0 or not contract:
                     continue
                 if price < STRATEGY_MIN_PRICE:
                     continue
                 if vwap > 0 and price <= vwap:
+                    continue
+                # RVOL filter
+                rvol = d.get('rvol', 0)
+                if rvol < FIB_DT_RVOL_MIN:
+                    continue
+                # News filter
+                if FIB_DT_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
 
                 # Get float from enrichment cache (optional — no filter)
@@ -6772,13 +6847,21 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by turnover descending
+            # Sort by turnover descending, limit to TOP 3
             candidates.sort(key=lambda x: x[1], reverse=True)
+            candidates = candidates[:3]
 
-            # Log ranking (top 5)
-            top5 = candidates[:5]
+            # SMA9 filter (only on final candidates to limit IBKR calls)
+            candidates = [
+                c for c in candidates
+                if _check_above_sma9(c[0], c[2]['price'], c[2]['contract'])
+            ]
+            if not candidates:
+                return
+
+            # Log ranking
             ranking_str = " | ".join(
-                f"{s} {t:.2f}x" for s, t, _, _ in top5
+                f"{s} {t:.2f}x" for s, t, _, _ in candidates
             )
             log.info(f"FIB DT candidates ({len(candidates)}): {ranking_str}")
 
@@ -6929,9 +7012,9 @@ class ScannerThread(threading.Thread):
                 pos['trailing_synced'] = True
 
     def _run_gap_go_cycle(self, current: dict):
-        """Run Gap and Go auto-strategy: find gappers >= 15%, check HA + VWAP signals."""
+        """Run Gap and Go auto-strategy: find gappers >= 30%, check HA + VWAP signals."""
         try:
-            # ── 1. Build candidate list (>= 15% gap, has contract) ──
+            # ── 1. Build candidate list (>= 30% gap, RVOL >= 2.5, news) ──
             candidates = []
             for sym, d in current.items():
                 pct = d.get('pct', 0)
@@ -6945,6 +7028,13 @@ class ScannerThread(threading.Thread):
                     continue
                 if price < STRATEGY_MIN_PRICE:
                     continue
+                # RVOL filter
+                rvol = d.get('rvol', 0)
+                if rvol < GG_LIVE_RVOL_MIN:
+                    continue
+                # News filter
+                if GG_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
+                    continue
 
                 candidates.append(GGCandidate(
                     symbol=sym,
@@ -6957,11 +7047,20 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by gap % descending
+            # Sort by gap % descending, limit to TOP 3
             candidates.sort(key=lambda c: c.gap_pct, reverse=True)
+            candidates = candidates[:3]
+
+            # SMA9 filter (only on final candidates to limit IBKR calls)
+            candidates = [
+                c for c in candidates
+                if _check_above_sma9(c.symbol, c.current_price, c.contract)
+            ]
+            if not candidates:
+                return
 
             log.info(f"GG candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates[:5]))
+                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._gg_strategy.process_cycle(candidates)
@@ -7036,7 +7135,7 @@ class ScannerThread(threading.Thread):
     def _run_momentum_ride_cycle(self, current: dict):
         """Run Momentum Ride auto-strategy: VWAP cross/pullback + SMA9 hourly, 5% trailing stop."""
         try:
-            # ── 1. Build candidate list (20-50% gap, has contract, near/above VWAP) ──
+            # ── 1. Build candidate list (35-150% gap, RVOL >= 2.0, news, near/above VWAP) ──
             candidates = []
             for sym, d in current.items():
                 pct = d.get('pct', 0)
@@ -7055,6 +7154,13 @@ class ScannerThread(threading.Thread):
                 if vwap > 0 and price < vwap:
                     if round((vwap - price) / price * 100, 1) > ALERT_VWAP_MAX_BELOW_PCT:
                         continue
+                # RVOL filter
+                rvol = d.get('rvol', 0)
+                if rvol < MR_LIVE_RVOL_MIN:
+                    continue
+                # News filter
+                if MR_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
+                    continue
 
                 candidates.append(MRCandidate(
                     symbol=sym,
@@ -7067,11 +7173,20 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by gap % descending
+            # Sort by gap % descending, limit to TOP 3
             candidates.sort(key=lambda c: c.gap_pct, reverse=True)
+            candidates = candidates[:3]
+
+            # SMA9 filter (only on final candidates to limit IBKR calls)
+            candidates = [
+                c for c in candidates
+                if _check_above_sma9(c.symbol, c.current_price, c.contract)
+            ]
+            if not candidates:
+                return
 
             log.info(f"MR candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates[:5]))
+                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._mr_strategy.process_cycle(candidates)
@@ -7140,7 +7255,7 @@ class ScannerThread(threading.Thread):
     def _run_float_turnover_cycle(self, current: dict):
         """Run Float Turnover auto-strategy: 1-min bar high/low logic on high-turnover stocks."""
         try:
-            # ── 1. Build candidate list (≥15% float turnover, has contract, near/above VWAP) ──
+            # ── 1. Build candidate list (≥25% turnover + 30% gap + RVOL 3x + news) ──
             candidates = []
             for sym, d in current.items():
                 price = d.get('price', 0)
@@ -7148,6 +7263,17 @@ class ScannerThread(threading.Thread):
                 if price <= 0 or not contract:
                     continue
                 if price < STRATEGY_MIN_PRICE:
+                    continue
+                # Gap % filter (directional confirmation)
+                pct = d.get('pct', 0)
+                if pct < FT_LIVE_GAP_MIN_PCT:
+                    continue
+                # RVOL filter
+                rvol = d.get('rvol', 0)
+                if rvol < FT_LIVE_RVOL_MIN:
+                    continue
+                # News filter
+                if FT_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
 
                 # Skip if too far below VWAP
@@ -7184,11 +7310,20 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by turnover descending
+            # Sort by turnover descending, limit to TOP 3
             candidates.sort(key=lambda c: c.turnover_pct, reverse=True)
+            candidates = candidates[:3]
+
+            # SMA9 filter (only on final candidates to limit IBKR calls)
+            candidates = [
+                c for c in candidates
+                if _check_above_sma9(c.symbol, c.price, c.contract)
+            ]
+            if not candidates:
+                return
 
             log.info(f"FT candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}%" for c in candidates[:5]))
+                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}%" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._ft_strategy.process_cycle(candidates)

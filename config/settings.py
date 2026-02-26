@@ -233,8 +233,10 @@ FIB_DT_TARGET_LEVELS = 3           # exit 50% at 3rd fib level above
 FIB_DT_PROXIMITY_PCT = 0.008       # 0.8% proximity to fib level
 FIB_DT_MIN_BOUNCE_BARS = 3         # min bars between first and second touch
 FIB_DT_MAX_ENTRIES_PER_DAY = 3     # max entries per gap day
-FIB_DT_GAP_MIN_PCT = 20.0             # skip gaps < 20% (not enough momentum)
-FIB_DT_GAP_MAX_PCT = 50.0             # skip gaps > 50% (poor performance)
+FIB_DT_GAP_MIN_PCT = 30.0             # skip gaps < 30% (focus on extreme movers)
+FIB_DT_GAP_MAX_PCT = 80.0             # skip gaps > 80%
+FIB_DT_RVOL_MIN = 2.0                 # minimum relative volume
+FIB_DT_REQUIRE_NEWS = True            # require news catalyst
 FIB_DT_MIN_GAP_VOLUME = 10_000        # minimum gap-day volume (filter illiquid)
 FIB_DT_ENTRY_WINDOW_START = "08:00"   # no entries before 8 AM ET (pre-market noise)
 FIB_DT_ENTRY_WINDOW_END = "12:00"     # no entries after 12 PM ET
@@ -249,23 +251,30 @@ FIB_DT_LIVE_BAR_DURATION = "1 D"         # request full day of bars
 FIB_DT_LIVE_MAX_SYMBOLS = 5              # max symbols to track
 FIB_DT_LIVE_MAX_ENTRIES_PER_DAY = 3      # max entries per day
 FIB_DT_LIVE_ENTRY_START = "08:00"        # no entries before 8 AM ET
-FIB_DT_LIVE_ENTRY_END = "12:00"          # no entries after 12 PM ET
+FIB_DT_LIVE_ENTRY_END = "14:00"          # no entries after 2 PM ET
 FIB_DT_LIVE_GAP_MIN_PCT = 10.0           # minimum gap %
 FIB_DT_LIVE_GAP_MAX_PCT = 25.0           # maximum gap %
 FIB_DT_LIVE_FLOAT_MAX = 500_000_000      # max float 500M shares
 FIB_DT_LIVE_STOP_PCT = 0.06              # 6% below fib level (was 3%, too tight on pennies)
 FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
 FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
-FIB_DT_LIVE_MIN_BOUNCE_BARS = 3          # min bars between touches
-FIB_DT_LIVE_TRAILING_BARS = 3            # bars without new high before trailing exit (3 × 15s = 45s)
+FIB_DT_LIVE_MIN_BOUNCE_BARS = 6          # min bars between touches (6 × 15s = 90s)
+FIB_DT_LIVE_TRAILING_BARS = 6            # bars without new high before trailing exit (6 × 15s = 90s)
 FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
+FIB_DT_LIVE_MIN_TARGET_PCT = 0.04        # 4% minimum target distance
+FIB_DT_LIVE_ATR_STOP_MULT = 2.0          # stop = fib - ATR * 2
+FIB_DT_LIVE_ATR_STOP_MIN_PCT = 0.03      # clamp min 3% below fib
+FIB_DT_LIVE_ATR_STOP_MAX_PCT = 0.10      # clamp max 10% below fib
+FIB_DT_LIVE_MAX_BAR_RANGE_PCT = 0.03     # skip if avg bar range > 3% (spread proxy)
 
 # ── Momentum Ride Backtest ──────────────────────────────
 MR_STOP_EXTRA_PCT = 0.02             # 2% below nearest fib level
 MR_VWAP_MAX_DISTANCE_PCT = 0.15      # max 15% above VWAP (skip stretched)
 MR_TRACKING_MINUTES = 90             # track stock for 90 min from first scan
-MR_GAP_MIN_PCT = 20.0                # minimum gap %
-MR_GAP_MAX_PCT = 50.0                # maximum gap %
+MR_GAP_MIN_PCT = 35.0                # minimum gap % (focus on extreme movers)
+MR_GAP_MAX_PCT = 150.0               # maximum gap % (allow big winners)
+MR_LIVE_RVOL_MIN = 2.0               # minimum relative volume
+MR_LIVE_REQUIRE_NEWS = True           # require news catalyst
 MR_MIN_GAP_VOLUME = 10_000           # minimum gap-day volume
 MR_EXIT_BARS_IN_MINUTE = 3           # exit after 3 of 4 15s bars with no new high
 
@@ -283,7 +292,9 @@ GG_TRAIL_PCT = 0.05               # 5% trailing (last 25%)
 GG_ENTRY_AFTER_MINUTES = 5        # enter after 9:35
 
 # ── Gap and Go LIVE ───────────────────────────────────
-GG_LIVE_GAP_MIN_PCT = 15.0
+GG_LIVE_GAP_MIN_PCT = 30.0
+GG_LIVE_RVOL_MIN = 2.5                # minimum relative volume (strong momentum)
+GG_LIVE_REQUIRE_NEWS = True            # require news catalyst
 GG_LIVE_INITIAL_CASH = 3000.0
 GG_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
 GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
@@ -312,7 +323,10 @@ FT_LIVE_INITIAL_CASH = 3000.0
 FT_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
 FT_LIVE_MAX_TRACKED_SYMBOLS = 5        # was 20 — concentrate on top turnover
 FT_LIVE_MAX_POSITIONS = 3              # max open positions
-FT_MIN_FLOAT_TURNOVER_PCT = 15.0     # minimum % of float traded
+FT_MIN_FLOAT_TURNOVER_PCT = 25.0     # minimum % of float traded (was 15%)
+FT_LIVE_GAP_MIN_PCT = 30.0           # minimum gap % (directional filter)
+FT_LIVE_RVOL_MIN = 3.0               # minimum relative volume (extreme volume)
+FT_LIVE_REQUIRE_NEWS = True           # require news catalyst
 FT_MAX_HOLD_MINUTES = 60              # 1 hour max hold
 
 # ── Strategy-Wide Risk Controls ──────────────────────
