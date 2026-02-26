@@ -3065,7 +3065,7 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
         if now - _fib_bounce_cooldown.get(cooldown_key, 0) < _FIB_BOUNCE_COOLDOWN_SEC:
             continue
 
-        threshold = lv * 0.005  # 0.5% proximity
+        threshold = lv * 0.008  # 0.8% proximity (synthetic bars miss extremes)
 
         info = ratio_map.get(lv_key)
         ratio_label = f" ({info[0]} {info[1]})" if info else ""
