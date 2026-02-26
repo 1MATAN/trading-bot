@@ -8734,6 +8734,8 @@ class App:
             host=IBKR_HOST, port=IBKR_PORT,
             on_account=self._on_account_data,
             on_order_result=self._on_order_result,
+            telegram_fn=send_telegram,
+            market_session_fn=_get_market_session,
         )
         self._order_thread.start()
 

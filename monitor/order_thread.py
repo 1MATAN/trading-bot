@@ -94,7 +94,8 @@ class OrderThread(threading.Thread):
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7497,
-                 on_account=None, on_order_result=None, on_live_price=None):
+                 on_account=None, on_order_result=None, on_live_price=None,
+                 telegram_fn=None, market_session_fn=None):
         """
         Parameters
         ----------
@@ -102,6 +103,8 @@ class OrderThread(threading.Thread):
         on_account : callable(net_liq, buying_power, positions) or None
         on_order_result : callable(msg, success) or None
         on_live_price : callable(sym, price) or None — called on each price tick
+        telegram_fn : callable(text) or None — send Telegram message (avoids circular import)
+        market_session_fn : callable() -> str or None — returns market session (avoids circular import)
         """
         super().__init__(daemon=True, name="OrderThread")
         self._host = host
@@ -109,6 +112,8 @@ class OrderThread(threading.Thread):
         self.on_account = on_account
         self.on_order_result = on_order_result
         self.on_live_price = on_live_price
+        self._telegram_fn = telegram_fn
+        self._market_session_fn = market_session_fn
 
         self._queue: queue.Queue = queue.Queue()
         self._running = False
@@ -476,8 +481,7 @@ class OrderThread(threading.Thread):
                     ib.sleep(1)  # wait for cancellations to process
                     log.info(f"Cancelled {cancelled} open order(s) for {sym}")
 
-            from monitor.screen_monitor import _get_market_session
-            session = _get_market_session()
+            session = self._market_session_fn() if self._market_session_fn else 'market'
             outside_rth = session != 'market'
 
             # Place stop-loss for BUY orders (STP LMT — triggers outside RTH)
@@ -737,10 +741,9 @@ class OrderThread(threading.Thread):
             self.on_order_result(msg, success)
 
     def _telegram(self, text: str):
-        """Send Telegram notification (import lazily to avoid circular deps)."""
-        try:
-            # Import send_telegram from the monitor module
-            from monitor.screen_monitor import send_telegram
-            send_telegram(text)
-        except Exception as e:
-            log.debug(f"Telegram send failed: {e}")
+        """Send Telegram notification via callback (no circular import)."""
+        if self._telegram_fn:
+            try:
+                self._telegram_fn(text)
+            except Exception as e:
+                log.debug(f"Telegram send failed: {e}")
