@@ -2811,6 +2811,542 @@ def _check_news_summary(current: dict):
 
 
 # ══════════════════════════════════════════════════════════
+#  Trade Journal — Telegram entry after each trade close
+# ══════════════════════════════════════════════════════════
+
+_IL_TZ = ZoneInfo('Asia/Jerusalem')
+
+# Persistent unified journal — never resets, survives weekly portfolio resets
+_JOURNAL_JSON_PATH = DATA_DIR / "trade_journal.json"
+_JOURNAL_HTML_PATH = Path.home() / "Desktop" / "יומן.html"
+
+# Robot emoji map for HTML
+_ROBOT_EMOJI = {'FIB DT': '📐', 'Gap&Go': '🚀', 'MR': '📈', 'FT': '🔄'}
+
+
+def _load_journal_trades() -> list[dict]:
+    """Load trade list from JSON (persistent data store)."""
+    if _JOURNAL_JSON_PATH.exists():
+        try:
+            return json.loads(_JOURNAL_JSON_PATH.read_text(encoding='utf-8'))
+        except Exception:
+            return []
+    return []
+
+
+def _save_journal_trades(trades: list[dict]):
+    """Save trade list to JSON."""
+    _JOURNAL_JSON_PATH.write_text(
+        json.dumps(trades, ensure_ascii=False, indent=1), encoding='utf-8')
+
+
+def _generate_journal_html(trades: list[dict]):
+    """Regenerate the HTML journal file on Desktop from trade data.
+
+    Includes per-robot tabs + summary stats + collapsible logic details.
+    """
+    _TAB_DEFS = [
+        ('all', '📒 הכל'),
+        ('FIB DT', '📐 FIB DT'),
+        ('Gap&Go', '🚀 Gap&Go'),
+        ('MR', '📈 MR'),
+        ('FT', '🔄 FT'),
+    ]
+
+    def _stats_for(tlist):
+        pnl = sum(t.get('pnl', 0) for t in tlist)
+        w = [t for t in tlist if t.get('pnl', 0) > 0]
+        l = [t for t in tlist if t.get('pnl', 0) < 0]
+        n = len(tlist)
+        wr = (len(w) / n * 100) if n else 0
+        aw = (sum(t['pnl'] for t in w) / len(w)) if w else 0
+        al = (sum(t['pnl'] for t in l) / len(l)) if l else 0
+        return pnl, n, len(w), len(l), wr, aw, al
+
+    def _build_rows(tlist):
+        rows = ''
+        for i, t in enumerate(reversed(tlist)):
+            pv = t.get('pnl', 0)
+            pp = t.get('pnl_pct', 0)
+            rc = '#4caf50' if pv >= 0 else '#f44336'
+            em = _ROBOT_EMOJI.get(t.get('robot', ''), '')
+            sh = 'מכירה חלקית' if t.get('side') == 'SELL_HALF' else 'מכירה'
+            bg = '#1a1a2e' if i % 2 == 0 else '#16213e'
+            logic = t.get('logic', '').replace('\n', '<br>')
+            det = ''
+            if logic:
+                det = (
+                    f'<tr class="detail-row" style="background:{bg}">'
+                    f'<td colspan="11" style="padding:8px 16px;font-size:13px;'
+                    f'color:#aaa;border-top:none">{logic}</td></tr>'
+                )
+            rows += (
+                f'<tr style="background:{bg}">'
+                f'<td>{t.get("date","")}</td>'
+                f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+                f'<td>{sh}</td>'
+                f'<td>{t.get("qty","")}</td>'
+                f'<td>${t.get("entry_price",0):.2f}</td>'
+                f'<td>${t.get("exit_price",0):.2f}</td>'
+                f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
+                f'<td style="color:{rc}">{pp:+.1f}%</td>'
+                f'<td>{t.get("entry_time","")}</td>'
+                f'<td>{t.get("exit_time","")}</td>'
+                f'<td class="notes">'
+                f'<b>כניסה:</b> {t.get("entry_note","")}<br>'
+                f'<b>יציאה:</b> {t.get("exit_note","")}</td>'
+                f'</tr>\n{det}'
+            )
+        return rows
+
+    def _build_stats_cards(pnl, n, w, l, wr, aw, al, robot_name=None):
+        pc = '#4caf50' if pnl >= 0 else '#f44336'
+        cards = (
+            f'<div class="stats-bar">'
+            f'<div class="stat-card main">'
+            f'<div class="stat-label">{"סה\"כ" if not robot_name else robot_name}</div>'
+            f'<div class="stat-value" style="color:{pc}">${pnl:+,.2f}</div>'
+            f'<div class="stat-sub">{n} עסקאות</div></div>'
+            f'<div class="stat-card">'
+            f'<div class="stat-label">אחוז הצלחה</div>'
+            f'<div class="stat-value">{wr:.0f}%</div>'
+            f'<div class="stat-sub">{w}W / {l}L</div></div>'
+            f'<div class="stat-card">'
+            f'<div class="stat-label">ממוצע רווח</div>'
+            f'<div class="stat-value" style="color:#4caf50">${aw:+,.2f}</div></div>'
+            f'<div class="stat-card">'
+            f'<div class="stat-label">ממוצע הפסד</div>'
+            f'<div class="stat-value" style="color:#f44336">${al:+,.2f}</div></div>'
+            f'</div>'
+        )
+        return cards
+
+    # ── Build tab content ──
+    tab_buttons = ''
+    tab_panels = ''
+    for tab_id, tab_label in _TAB_DEFS:
+        active = ' active' if tab_id == 'all' else ''
+        tab_buttons += (
+            f'<button class="tab-btn{active}" '
+            f'onclick="switchTab(\'{tab_id}\')">{tab_label}</button>\n'
+        )
+        tlist = trades if tab_id == 'all' else [t for t in trades if t.get('robot') == tab_id]
+        pnl, n, w, l, wr, aw, al = _stats_for(tlist)
+        rn = None if tab_id == 'all' else f'{_ROBOT_EMOJI.get(tab_id,"")} {tab_id}'
+        stats = _build_stats_cards(pnl, n, w, l, wr, aw, al, rn)
+
+        # For "all" tab, add per-robot mini cards
+        if tab_id == 'all':
+            for rname in ['FIB DT', 'Gap&Go', 'MR', 'FT']:
+                rt = [t for t in trades if t.get('robot') == rname]
+                if not rt:
+                    continue
+                rp = sum(t.get('pnl', 0) for t in rt)
+                rw = sum(1 for t in rt if t.get('pnl', 0) > 0)
+                rwp = (rw / len(rt) * 100) if rt else 0
+                rcol = '#4caf50' if rp >= 0 else '#f44336'
+                stats += (
+                    f'<div class="stats-bar" style="margin-top:-8px">'
+                    f'<div class="stat-card">'
+                    f'<div class="stat-label">{_ROBOT_EMOJI.get(rname,"")} {rname}</div>'
+                    f'<div class="stat-value" style="color:{rcol};font-size:20px">'
+                    f'${rp:+,.2f}</div>'
+                    f'<div class="stat-sub">{len(rt)} עסקאות | {rwp:.0f}% הצלחה</div>'
+                    f'</div></div>'
+                )
+
+        rows = _build_rows(tlist)
+        display = 'block' if tab_id == 'all' else 'none'
+
+        # Robot column only in "all" tab
+        robot_th = '<th>רובוט</th>' if tab_id == 'all' else ''
+
+        tab_panels += f'''
+<div id="tab-{tab_id}" class="tab-panel" style="display:{display}">
+{stats}
+<table>
+<thead><tr>
+    <th>תאריך</th>
+    <th>סימבול</th>
+    <th>סוג</th>
+    <th>כמות</th>
+    <th>כניסה</th>
+    <th>יציאה</th>
+    <th>רווח/הפסד</th>
+    <th>%</th>
+    <th>שעת כניסה</th>
+    <th>שעת יציאה</th>
+    <th>הערות</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div>
+'''
+
+    html = f'''<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="30">
+<title>📒 יומן עסקאות</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{
+    background: #0a0a1a;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', Tahoma, sans-serif;
+    padding: 20px;
+    direction: rtl;
+}}
+h1 {{
+    text-align: center;
+    color: #ffd700;
+    margin-bottom: 16px;
+    font-size: 28px;
+}}
+.tabs {{
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}}
+.tab-btn {{
+    background: #16213e;
+    color: #aaa;
+    border: 1px solid #333;
+    border-radius: 8px 8px 0 0;
+    padding: 10px 24px;
+    font-size: 15px;
+    cursor: pointer;
+    transition: all 0.2s;
+}}
+.tab-btn:hover {{ background: #1e3a5f; color: #fff; }}
+.tab-btn.active {{
+    background: #1a1a3e;
+    color: #ffd700;
+    border-bottom: 3px solid #ffd700;
+    font-weight: bold;
+}}
+.stats-bar {{
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}}
+.stat-card {{
+    background: #16213e;
+    border-radius: 12px;
+    padding: 14px 20px;
+    text-align: center;
+    min-width: 140px;
+    border: 1px solid #1a1a3e;
+}}
+.stat-card.main {{
+    border: 2px solid #ffd700;
+    min-width: 160px;
+}}
+.stat-label {{ color: #888; font-size: 13px; margin-bottom: 4px; }}
+.stat-value {{ font-size: 22px; font-weight: bold; }}
+.stat-sub {{ color: #666; font-size: 12px; margin-top: 4px; }}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+    font-size: 14px;
+}}
+thead th {{
+    background: #1a1a3e;
+    color: #ffd700;
+    padding: 10px 8px;
+    text-align: right;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    border-bottom: 2px solid #333;
+}}
+tbody td {{
+    padding: 9px 8px;
+    border-bottom: 1px solid #1a1a2e;
+    vertical-align: top;
+}}
+.notes {{
+    font-size: 12px;
+    color: #aaa;
+    max-width: 250px;
+}}
+.detail-row td {{ line-height: 1.6; }}
+tr:hover {{ background: #1e3a5f !important; }}
+.footer {{
+    text-align: center;
+    color: #444;
+    margin-top: 20px;
+    font-size: 12px;
+}}
+</style>
+</head>
+<body>
+<h1>📒 יומן עסקאות — רובוטים</h1>
+
+<div class="tabs">
+{tab_buttons}
+</div>
+
+{tab_panels}
+
+<div class="footer">עודכן לאחרונה: {datetime.now(_IL_TZ).strftime("%d/%m/%Y %H:%M:%S")} 🇮🇱</div>
+
+<script>
+function switchTab(id) {{
+    document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + id).style.display = 'block';
+    event.target.classList.add('active');
+}}
+</script>
+</body>
+</html>'''
+
+    try:
+        _JOURNAL_HTML_PATH.write_text(html, encoding='utf-8')
+    except Exception as e:
+        log.warning(f"Journal HTML write error: {e}")
+
+
+def _build_trade_logic_detail(robot_name: str, prefix: str, sym: str,
+                               entry_price: float, qty: int) -> str:
+    """Build detailed Hebrew logic breakdown for trade journal.
+
+    Shows the complete robot decision flow: scan → filters → signal → risk → timeline.
+    """
+    lines: list[str] = []
+    enrich = _enrichment.get(sym, {})
+
+    # ── 1. Scan data (from last known current data) ──
+    # Try to reconstruct from enrichment + daily events
+    float_str = enrich.get('float', '-')
+    short_str = enrich.get('short', '-')
+    market_cap = enrich.get('market_cap', '-')
+    company = enrich.get('company', '-')
+
+    lines.append("📊 <b>פירוט לוגיקה:</b>")
+
+    # Company
+    if company and company != '-':
+        lines.append(f"🏢 {company}")
+
+    # ── 2. Fundamentals ──
+    fund_parts = []
+    if float_str != '-':
+        fund_parts.append(f"Float: {float_str}")
+    if short_str != '-':
+        fund_parts.append(f"Short: {short_str}")
+    if market_cap != '-':
+        fund_parts.append(f"MCap: {market_cap}")
+    eps = enrich.get('eps', '-')
+    if eps != '-':
+        fund_parts.append(f"EPS: {eps}")
+    cash_ps = enrich.get('cash', '-')
+    if cash_ps != '-':
+        fund_parts.append(f"Cash: {cash_ps}")
+    if fund_parts:
+        lines.append(f"📋 {' | '.join(fund_parts)}")
+
+    # ── 3. News headlines ──
+    news = enrich.get('news', [])
+    if news:
+        for n in news[:2]:
+            title = n.get('title_he') or n.get('title_en', '')
+            if title:
+                lines.append(f"📰 {title[:70]}")
+    else:
+        lines.append("📰 ללא חדשות")
+
+    # ── 4. Robot thresholds (what this robot requires) ──
+    thresh = ''
+    if robot_name == 'FIB DT':
+        thresh = (
+            f"🤖 חוקי רובוט: גאפ {FIB_DT_GAP_MIN_PCT:.0f}-{FIB_DT_GAP_MAX_PCT:.0f}% | "
+            f"RVOL≥{FIB_DT_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
+            f"חדשות: {'כן' if FIB_DT_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
+            f"💰 גודל: ${FIB_DT_POSITION_SIZE_FIXED}/פוז | מקס {FIB_DT_MAX_POSITIONS} פוז | "
+            f"warmup {FIB_DT_WARMUP_SEC}s | מקס החזקה {FIB_DT_MAX_HOLD_MINUTES} דק"
+        )
+    elif robot_name == 'Gap&Go':
+        thresh = (
+            f"🤖 חוקי רובוט: גאפ≥{GG_LIVE_GAP_MIN_PCT:.0f}% | "
+            f"RVOL≥{GG_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
+            f"חדשות: {'כן' if GG_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
+            f"💰 גודל: ${GG_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {GG_LIVE_MAX_POSITIONS} פוז | "
+            f"מקס החזקה {GG_MAX_HOLD_MINUTES} דק"
+        )
+    elif robot_name == 'MR':
+        thresh = (
+            f"🤖 חוקי רובוט: גאפ {MR_GAP_MIN_PCT:.0f}-{MR_GAP_MAX_PCT:.0f}% | "
+            f"RVOL≥{MR_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
+            f"חדשות: {'כן' if MR_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
+            f"💰 גודל: ${MR_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {MR_LIVE_MAX_POSITIONS} פוז | "
+            f"טרגט +{MR_LIVE_PROFIT_TARGET_PCT*100:.0f}%"
+        )
+    elif robot_name == 'FT':
+        thresh = (
+            f"🤖 חוקי רובוט: turnover≥{FT_MIN_FLOAT_TURNOVER_PCT:.0f}% | "
+            f"גאפ≥{FT_LIVE_GAP_MIN_PCT:.0f}% | RVOL≥{FT_LIVE_RVOL_MIN}x | "
+            f"חדשות: {'כן' if FT_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
+            f"💰 גודל: ${FT_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {FT_LIVE_MAX_POSITIONS} פוז | "
+            f"טרגט +{FT_LIVE_PROFIT_TARGET_PCT*100:.0f}% | מקס {FT_MAX_HOLD_MINUTES} דק"
+        )
+    if thresh:
+        lines.append(thresh)
+
+    # ── 5. Position sizing detail ──
+    cost = qty * entry_price
+    lines.append(f"📐 פוזיציה: {qty}sh × ${entry_price:.2f} = ${cost:,.0f}")
+
+    # ── 6. Timeline — all events for this stock from _daily_events ──
+    sym_events = [e for e in _daily_events
+                  if e['symbol'] == sym and e['type'].startswith(prefix)]
+    if sym_events:
+        lines.append("⏱️ <b>ציר זמן:</b>")
+        for ev in sym_events[-10:]:  # last 10 events max
+            t = ev.get('time', '')
+            etype = ev.get('type', '').replace(prefix, '')
+            detail = ev.get('detail', '')
+            # Hebrew labels for event types
+            type_he = {
+                'track': '🔍 מעקב',
+                'signal': '⚡ אות',
+                'entry': '← כניסה',
+                'exit': '→ יציאה',
+                'close': '→ סגירה',
+            }.get(etype, etype)
+            short = detail[:65] + '…' if len(detail) > 65 else detail
+            lines.append(f"  {t} {type_he}: {short}")
+
+    # ── 7. Risk controls reminder ──
+    lines.append(
+        f"🛡️ ניהול סיכון: cooldown {STRATEGY_REENTRY_COOLDOWN_SEC//60} דק | "
+        f"הפסד {STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC//60} דק | "
+        f"מקס {STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY}/יום/מניה | "
+        f"לימיט ${STRATEGY_DAILY_LOSS_LIMIT:.0f}/יום"
+    )
+
+    return "\n".join(lines)
+
+
+def _send_trade_journal_entry(robot_emoji: str, robot_name: str,
+                               sym: str, reason: str, qty: int,
+                               price: float, entry_price: float,
+                               pnl: float, net_liq: float, cash: float,
+                               trades: list[dict]):
+    """Send a Hebrew trade journal entry to Telegram and append to persistent CSV.
+
+    Format: two-row journal (buy + sell) in Israel timezone with notes,
+    followed by full robot logic breakdown (scan → filters → signal → exit).
+    The CSV journal (trade_journal_all.csv) never resets — tracks all-time results.
+    """
+    # Find entry time from trades list (last BUY for this symbol)
+    entry_time_str = ''
+    entry_time_csv = ''
+    for t in reversed(trades):
+        if t.get('sym') == sym and t.get('side') == 'BUY':
+            entry_dt = t['time']
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.replace(tzinfo=_ET)
+            il_entry = entry_dt.astimezone(_IL_TZ)
+            entry_time_str = il_entry.strftime('%d/%m %H:%M')
+            entry_time_csv = il_entry.strftime('%H:%M:%S')
+            break
+
+    # Exit time = now in Israel TZ
+    exit_dt = datetime.now(_ET).astimezone(_IL_TZ)
+    exit_time_str = exit_dt.strftime('%d/%m %H:%M')
+    exit_time_csv = exit_dt.strftime('%H:%M:%S')
+    date_str = exit_dt.strftime('%d/%m/%Y')
+    date_csv = exit_dt.strftime('%Y-%m-%d')
+
+    # Find entry reason from _daily_events
+    prefix_map = {'FIB DT': 'fib_dt_', 'Gap&Go': 'gg_', 'MR': 'mr_', 'FT': 'ft_'}
+    prefix = prefix_map.get(robot_name, '')
+    entry_reason = ''
+    for ev in reversed(_daily_events):
+        if ev['type'] == f'{prefix}entry' and ev['symbol'] == sym:
+            entry_reason = ev.get('detail', '')
+            break
+
+    # Clean up entry reason — extract parenthetical reason if present
+    if '(' in entry_reason and entry_reason.endswith(')'):
+        entry_note = entry_reason[entry_reason.rfind('(') + 1:-1]
+    elif entry_reason:
+        entry_note = entry_reason[:60]
+    else:
+        entry_note = '-'
+
+    # Clean up exit reason
+    exit_note = reason.replace('TRAILING', 'trailing').replace('TARGET_HALF', 'target_half')
+    if len(exit_note) > 60:
+        exit_note = exit_note[:57] + '…'
+
+    pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+    pnl_icon = '🟢' if pnl >= 0 else '🔴'
+    sell_label = 'מכירה חלקית' if 'HALF' in reason.upper() or 'half' in reason else 'מכירה'
+
+    # ── Build detailed logic breakdown ──
+    logic_detail = _build_trade_logic_detail(robot_name, prefix, sym,
+                                              entry_price, qty)
+    # Plain-text version for Telegram (with HTML tags)
+    logic_for_tg = logic_detail
+    # Clean version for HTML journal (strip Telegram HTML bold tags)
+    logic_for_html = logic_detail.replace('<b>', '').replace('</b>', '')
+
+    # ── Append to persistent JSON + regenerate HTML ──
+    side_val = 'SELL_HALF' if 'HALF' in reason.upper() or 'half' in reason else 'SELL'
+    trade_record = {
+        'date': date_str,
+        'entry_time': entry_time_str.split(' ', 1)[-1] if ' ' in entry_time_str else entry_time_str,
+        'exit_time': exit_time_str.split(' ', 1)[-1] if ' ' in exit_time_str else exit_time_str,
+        'robot': robot_name,
+        'symbol': sym,
+        'side': side_val,
+        'qty': qty,
+        'entry_price': round(entry_price, 4),
+        'exit_price': round(price, 4),
+        'pnl': round(pnl, 2),
+        'pnl_pct': round(pnl_pct, 1),
+        'cash_after': round(cash, 2),
+        'nlv_after': round(net_liq, 2),
+        'entry_note': entry_note,
+        'exit_note': exit_note,
+        'logic': logic_for_html,
+    }
+    try:
+        all_trades = _load_journal_trades()
+        all_trades.append(trade_record)
+        _save_journal_trades(all_trades)
+        _generate_journal_html(all_trades)
+    except Exception as e:
+        log.warning(f"Persistent journal write error: {e}")
+
+    # ── Send Telegram message ──
+    msg = (
+        f"📒 <b>יומן — {robot_emoji} {robot_name} | {sym}</b>\n"
+        f"📅 {date_str}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"  {entry_time_str}  ←  קנייה  {qty}sh  @  ${entry_price:.2f}\n"
+        f"  {exit_time_str}  →  {sell_label}  {qty}sh  @  ${price:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{pnl_icon} רווח/הפסד: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+        f"💵 קופה: ${cash:,.0f} | NLV: ${net_liq:,.0f}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📝 כניסה: {entry_note}\n"
+        f"📝 יציאה: {exit_note}\n"
+        f"\n{logic_for_tg}"
+    )
+    send_telegram(msg)
+
+
+# ══════════════════════════════════════════════════════════
 #  Session Summaries (pre-market / market / after-hours)
 # ══════════════════════════════════════════════════════════
 
@@ -5542,6 +6078,10 @@ class VirtualPortfolio:
                 ])
         except Exception as e:
             log.warning(f"Journal write error: {e}")
+        if side != 'BUY':
+            _send_trade_journal_entry('📐', 'FIB DT', sym, reason, qty,
+                                      price, entry_price, pnl, net_liq,
+                                      self.cash, self.trades)
 
     @staticmethod
     def _ts() -> str:
@@ -5879,6 +6419,10 @@ class GGVirtualPortfolio:
                 ])
         except Exception as e:
             log.warning(f"GG journal write error: {e}")
+        if side != 'BUY':
+            _send_trade_journal_entry('🚀', 'Gap&Go', sym, reason, qty,
+                                      price, entry_price, pnl, net_liq_val,
+                                      self.cash, self.trades)
 
     @staticmethod
     def _ts() -> str:
@@ -6173,6 +6717,10 @@ class MRVirtualPortfolio:
                 ])
         except Exception as e:
             log.warning(f"MR journal write error: {e}")
+        if side != 'BUY':
+            _send_trade_journal_entry('📈', 'MR', sym, reason, qty,
+                                      price, entry_price, pnl, net_liq_val,
+                                      self.cash, self.trades)
 
     @staticmethod
     def _ts() -> str:
@@ -6468,6 +7016,10 @@ class FTVirtualPortfolio:
                 ])
         except Exception as e:
             log.warning(f"FT journal write error: {e}")
+        if side != 'BUY':
+            _send_trade_journal_entry('🔄', 'FT', sym, reason, qty,
+                                      price, entry_price, pnl, net_liq_val,
+                                      self.cash, self.trades)
 
     @staticmethod
     def _ts() -> str:
