@@ -3919,10 +3919,12 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         return None
 
 
-def _send_alert_chart(sym: str, price: float) -> None:
+def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
+                      stock_data: dict | None = None) -> None:
     """Download 1-min bars (48h extended hours), generate chart with Fib, send to group.
 
     Respects 10-min cooldown per symbol.  Telegram send is non-blocking (queued).
+    Caption includes: alert reason + recent news headlines.
     """
     now = time_mod.time()
     if now - _alert_chart_sent.get(sym, 0) < _ALERT_CHART_COOLDOWN_SEC:
@@ -3949,7 +3951,29 @@ def _send_alert_chart(sym: str, price: float) -> None:
 
     chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map)
     if chart_path:
+        # ── Build rich caption: reason + news ──
         caption = f"📐 <b>{sym}</b> — 1 דקה (48h) + פיבונאצ׳י  ${price:.2f}"
+        if alert_reason:
+            # Strip HTML tags for cleaner caption under photo
+            clean_reason = re.sub(r'<[^>]+>', '', alert_reason).strip()
+            if clean_reason:
+                caption += f"\n{clean_reason}"
+        # Append latest news headlines
+        enrich = _enrichment.get(sym, {})
+        news_items = enrich.get('news', [])
+        if news_items:
+            headlines = []
+            for n in news_items[:3]:
+                title = n.get('title_he', n.get('title_en', ''))
+                if title:
+                    headlines.append(title)
+            if headlines:
+                caption += "\n📰 " + "\n📰 ".join(headlines)
+
+        # Telegram photo caption limit: 1024 chars
+        if len(caption) > 1024:
+            caption = caption[:1020] + "..."
+
         send_telegram_alert_photo(chart_path, caption)
         _alert_chart_sent[sym] = now
         log.info(f"Alert chart sent for {sym}")
@@ -7168,9 +7192,9 @@ class ScannerThread(threading.Thread):
                         if fib_txt:
                             msg += "\n" + fib_txt.strip()
                     send_telegram_alert(msg, reply_markup=btn)
-                    # Send 5-min chart with Fib for this symbol
+                    # Send 1-min chart with Fib + alert reason + news
                     if sp > 0:
-                        _send_alert_chart(sym0, sp)
+                        _send_alert_chart(sym0, sp, alert_reason=batch_full_texts[0])
                 else:
                     # Multiple alerts — grouped by symbol
                     now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
@@ -7201,11 +7225,14 @@ class ScannerThread(threading.Thread):
                     header = f"🔔 <b>התראות ({total_alerts})</b> — {now_et} ET\n"
                     send_telegram_alert(header + "\n\n".join(blocks), reply_markup=btn)
 
-                    # Send 5-min chart with Fib for each symbol in batch
+                    # Send 1-min chart with Fib + alert reasons + news per symbol
                     for s in batch_syms:
                         sp = current.get(s, {}).get('price', 0)
                         if sp > 0:
-                            _send_alert_chart(s, sp)
+                            # Compact alert lines for this symbol
+                            sym_alerts = batch_by_sym.get(s, [])
+                            reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
+                            _send_alert_chart(s, sp, alert_reason=reason)
 
                 status += f"  🔔{total_alerts}"
             else:
