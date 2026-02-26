@@ -61,7 +61,13 @@ def find_anchor_candle(daily_df: pd.DataFrame) -> Optional[tuple[float, float, s
     anchor_row = df.loc[min_idx]
     anchor_low = float(anchor_row["low"])
     anchor_high = float(anchor_row["high"])
-    anchor_date = str(min_idx)[:10] if hasattr(min_idx, 'strftime') else str(min_idx)[:10]
+    # Use 'date' column if available (ib_insync DataFrames have RangeIndex)
+    if 'date' in df.columns:
+        anchor_date = str(anchor_row['date'])[:10]
+    elif hasattr(min_idx, 'strftime'):
+        anchor_date = str(min_idx)[:10]
+    else:
+        anchor_date = str(min_idx)[:10]
 
     if anchor_high <= anchor_low:
         anchor_high = anchor_low * 1.01  # tiny fallback range

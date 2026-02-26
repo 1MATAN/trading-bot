@@ -3928,7 +3928,9 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
                          ratio_map: dict | None = None,
                          alert_title: str = "",
                          stock_info: dict | None = None,
-                         ma_rows: list[dict] | None = None) -> Path | None:
+                         ma_rows: list[dict] | None = None,
+                         news_items: list[dict] | None = None,
+                         fib_anchor: tuple | None = None) -> Path | None:
     """Generate 1-min Japanese candlestick chart (48h) with Fibonacci levels.
 
     Uses matplotlib Rectangle patches for proper candle bodies and thin
@@ -3936,6 +3938,8 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
     alert_title: shown as the chart title (alert reason + stock info).
     stock_info: dict with vol, float, inst_own, insider_own etc.
     ma_rows: list of {tf, period, sma, ema} for MA confluence overlay.
+    news_items: list of news dicts to render on chart overlay.
+    fib_anchor: (anchor_low, anchor_high, anchor_date) for fib origin display.
 
     Returns path to saved PNG or None on failure.
     """
@@ -4157,11 +4161,37 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         if inst_parts:
             right_lines.append((' | '.join(inst_parts), '#aaaaaa'))
 
+        # ── Fib anchor info ──
+        if fib_anchor:
+            a_low, a_high, a_date = fib_anchor
+            date_str = a_date if isinstance(a_date, str) else str(a_date)[:10]
+            right_lines.append(('', '#333'))  # separator
+            a_low_s = f"${a_low:.2f}" if a_low >= 1 else f"${a_low:.4f}"
+            a_high_s = f"${a_high:.2f}" if a_high >= 1 else f"${a_high:.4f}"
+            right_lines.append((f"Fib: {a_low_s} -> {a_high_s} ({date_str})", '#FFD700'))
+
+        # ── News headlines ──
+        if news_items:
+            right_lines.append(('', '#333'))  # separator
+            for n in news_items[:3]:
+                # Prefer English for chart (monospace font can't render Hebrew)
+                title = n.get('title_en') or n.get('title_he') or ''
+                if not title:
+                    continue
+                ndate = n.get('date', '')
+                if len(title) > 50:
+                    title = title[:47] + '...'
+                line = f"{ndate}  {title}" if ndate else title
+                right_lines.append((line, '#e0e0e0'))
+
         # Render right overlay (top-right, right-aligned)
         if right_lines:
             y_pos_r = 0.97
             line_height = 0.027
             for text, color in right_lines:
+                if not text:
+                    y_pos_r -= line_height * 0.5  # half-space for separator
+                    continue
                 ax.text(0.99, y_pos_r, text,
                         transform=ax.transAxes, fontsize=7.5, color=color,
                         verticalalignment='top', horizontalalignment='right',
@@ -4287,135 +4317,6 @@ def generate_alert_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
         log.error(f"generate_alert_chart {sym}: {e}")
         plt.close('all')
         return None
-
-
-def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
-                      stock_data: dict | None = None) -> None:
-    """Download 1-min bars (48h extended hours), generate chart with Fib, send to group.
-
-    No cooldown — each alert sends a fresh chart.
-    Caption: stock name + price + 3 latest news headlines in Hebrew.
-    """
-    now = time_mod.time()
-
-    # ── 1-min bars, 2 days (extended hours) ──
-    df = _download_intraday(sym, bar_size='1 min', duration='2 D')
-    if df is None or len(df) < 20:
-        return
-
-    # ── Fib levels (uses cached daily data + fib cache) ──
-    with _fib_cache_lock:
-        cached = _fib_cache.get(sym)
-    if cached:
-        _, _, all_levels, ratio_map, *_ = cached
-    else:
-        calc_fib_levels(sym, price)
-        with _fib_cache_lock:
-            cached = _fib_cache.get(sym)
-        if cached:
-            _, _, all_levels, ratio_map, *_ = cached
-        else:
-            all_levels, ratio_map = [], {}
-
-    # ── Build stock_info for chart overlay ──
-    enrich = _enrichment.get(sym, {})
-    sd = stock_data or {}
-    vol_raw = sd.get('volume_raw', 0)
-    dol_vol = vol_raw * price if vol_raw and price else 0
-    float_str = enrich.get('float', '-')
-    float_shares = _parse_float_to_shares(float_str)
-    # RVOL
-    rvol = sd.get('rvol', 0)
-    # Float turnover %
-    ft_pct = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
-    si = {
-        'float_str': float_str,
-        'float_dollar': _format_dollar_short(float_shares * price) if float_shares > 0 and price > 0 else '',
-        'vol_shares': _format_shares_short(vol_raw) if vol_raw > 0 else '',
-        'vol_dollar': _format_dollar_short(dol_vol) if dol_vol > 0 else '',
-        'vol_str': _format_dollar_short(dol_vol) if dol_vol > 0 else (_format_shares_short(vol_raw) if vol_raw > 0 else ''),
-        'short': enrich.get('short', '-'),
-        'cash': enrich.get('cash', '-'),
-        'inst_own': enrich.get('inst_own', '-'),
-        'insider_own': enrich.get('insider_own', '-'),
-        'vwap': sd.get('vwap', 0),
-        'pct': sd.get('pct', 0),
-        'rvol': rvol,
-        'float_turnover': ft_pct,
-    }
-    # Replace Hebrew with English for chart rendering (monospace font)
-    for key in ('float_dollar', 'vol_shares', 'vol_dollar', 'vol_str'):
-        v = si.get(key, '')
-        if v:
-            si[key] = v.replace('מליון', 'M').replace('אלף', 'K')
-
-    # ── Compute MAs from 1-min bars (resample to higher timeframes) ──
-    ma_data = None
-    try:
-        if df is not None and len(df) > 20 and 'date' in df.columns:
-            df_ts = df.copy()
-            df_ts.index = pd.to_datetime(df_ts['date'])
-            ma_frames = {'1m': df}
-            for tf_key, rule in [('5m', '5min'), ('15m', '15min'),
-                                 ('30m', '30min'), ('1h', '1h')]:
-                resampled = df_ts.resample(rule).agg({
-                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
-                }).dropna()
-                if len(resampled) > 0:
-                    ma_frames[tf_key] = resampled
-            ma_frames['D'] = _daily_cache.get(sym)
-            ma_data = _calc_ma_table(price, ma_frames)
-    except Exception as e:
-        log.debug(f"MA calc for chart {sym}: {e}")
-
-    chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map,
-                                      alert_title=alert_reason,
-                                      stock_info=si, ma_rows=ma_data)
-    if chart_path:
-        # ── Caption: stock name + alert reason + 3 news headlines ──
-        sd = stock_data or {}
-        pct = sd.get('pct', 0)
-
-        # Start with stock header
-        caption = f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)"
-
-        # Alert reason — strip HTML, skip lines that duplicate stock header
-        if alert_reason:
-            reason_clean = re.sub(r'<[^>]+>', '', alert_reason).strip()
-            lines = reason_clean.split('\n')
-            # Remove first line if it's just the stock name+price (already in header)
-            if lines and sym in lines[0] and '$' in lines[0]:
-                lines = lines[1:]
-            if lines:
-                caption += "\n" + "\n".join(l.strip() for l in lines if l.strip())
-
-        enrich = _enrichment.get(sym, {})
-        news_items = enrich.get('news', [])
-        if news_items:
-            headlines_he = []
-            headlines_en = []
-            for n in news_items[:3]:
-                title_he = n.get('title_he', '')
-                title_en = n.get('title_en', '')
-                if title_he:
-                    headlines_he.append(title_he)
-                elif title_en:
-                    headlines_en.append(title_en)
-            if headlines_en:
-                try:
-                    translated = _batch_translate(headlines_en)
-                    headlines_he.extend(translated)
-                except Exception:
-                    headlines_he.extend(headlines_en)
-            if headlines_he:
-                caption += "\n📰 " + "\n📰 ".join(headlines_he[:3])
-
-        if len(caption) > 1024:
-            caption = caption[:1020] + "..."
-
-        send_telegram_alert_photo(chart_path, caption)
-        _alert_chart_sent[sym] = now
-        log.info(f"Alert chart sent for {sym}")
 
 
 def _find_closest_resist(price: float, ma_rows: list[dict]) -> str:
@@ -4594,16 +4495,223 @@ def _build_stock_report(sym: str, stock: dict, enriched: dict) -> tuple[str, Pat
     return text, chart_path
 
 
-def _send_stock_report(sym: str, stock: dict, enriched: dict):
-    """Send comprehensive Telegram report for a newly discovered stock."""
-    text, chart_path = _build_stock_report(sym, stock, enriched)
-    send_telegram_alert(text)
-    if chart_path:
-        send_telegram_alert_photo(chart_path, f"📐 {sym} — Daily + Fibonacci ${stock['price']:.2f}")
-    # GUI alert disabled — Telegram alerts only
-    # if _gui_alert_cb:
-    #     flt = enriched.get('float', '-')
-    #     _gui_alert_cb(f"📋 REPORT — {sym} ${stock['price']:.2f} {stock['pct']:+.1f}% Float:{flt}")
+def _send_unified_report(sym: str, stock: dict, enriched: dict,
+                          alert_reason: str = "") -> None:
+    """Send a single photo message with intraday chart + complete Hebrew caption.
+
+    Replaces the old two-message flow (_send_stock_report text + _send_alert_chart image).
+    The chart includes fib levels, news headlines, fib anchor info as overlays.
+    Caption is a compact Hebrew summary with all key details (≤1024 chars).
+    """
+    price = stock.get('price', 0)
+    if price <= 0:
+        return
+
+    # ── 1-min bars, 2 days (extended hours) ──
+    df = _download_intraday(sym, bar_size='1 min', duration='2 D')
+    if df is None or len(df) < 20:
+        return
+
+    # ── Fib levels (uses cached daily data + fib cache) ──
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
+    if cached:
+        anchor_low, anchor_high, all_levels, ratio_map, anchor_date = cached
+    else:
+        calc_fib_levels(sym, price)
+        with _fib_cache_lock:
+            cached = _fib_cache.get(sym)
+        if cached:
+            anchor_low, anchor_high, all_levels, ratio_map, anchor_date = cached
+        else:
+            anchor_low, anchor_high, all_levels, ratio_map, anchor_date = 0, 0, [], {}, ''
+
+    # ── Build stock_info for chart overlay ──
+    enrich = enriched or _enrichment.get(sym, {})
+    vol_raw = stock.get('volume_raw', 0)
+    dol_vol = vol_raw * price if vol_raw and price else 0
+    float_str = enrich.get('float', '-')
+    float_shares = _parse_float_to_shares(float_str)
+    rvol = stock.get('rvol', 0)
+    ft_pct = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+    si = {
+        'float_str': float_str,
+        'float_dollar': _format_dollar_short(float_shares * price) if float_shares > 0 and price > 0 else '',
+        'vol_shares': _format_shares_short(vol_raw) if vol_raw > 0 else '',
+        'vol_dollar': _format_dollar_short(dol_vol) if dol_vol > 0 else '',
+        'vol_str': _format_dollar_short(dol_vol) if dol_vol > 0 else (_format_shares_short(vol_raw) if vol_raw > 0 else ''),
+        'short': enrich.get('short', '-'),
+        'cash': enrich.get('cash', '-'),
+        'inst_own': enrich.get('inst_own', '-'),
+        'insider_own': enrich.get('insider_own', '-'),
+        'vwap': stock.get('vwap', 0),
+        'pct': stock.get('pct', 0),
+        'rvol': rvol,
+        'float_turnover': ft_pct,
+    }
+    # Replace Hebrew with English for chart rendering (monospace font)
+    for key in ('float_dollar', 'vol_shares', 'vol_dollar', 'vol_str'):
+        v = si.get(key, '')
+        if v:
+            si[key] = v.replace('מליון', 'M').replace('אלף', 'K')
+
+    # ── Compute MAs from 1-min bars (resample to higher timeframes) ──
+    ma_data = None
+    try:
+        if df is not None and len(df) > 20 and 'date' in df.columns:
+            df_ts = df.copy()
+            df_ts.index = pd.to_datetime(df_ts['date'])
+            ma_frames = {'1m': df}
+            for tf_key, rule in [('5m', '5min'), ('15m', '15min'),
+                                 ('30m', '30min'), ('1h', '1h')]:
+                resampled = df_ts.resample(rule).agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+                }).dropna()
+                if len(resampled) > 0:
+                    ma_frames[tf_key] = resampled
+            ma_frames['D'] = _daily_cache.get(sym)
+            ma_data = _calc_ma_table(price, ma_frames)
+    except Exception as e:
+        log.debug(f"MA calc for unified report {sym}: {e}")
+
+    # ── News items for chart overlay ──
+    news_items = enrich.get('news', [])
+
+    # ── Fib anchor tuple for chart overlay ──
+    fib_anchor = None
+    if anchor_low and anchor_high:
+        fib_anchor = (anchor_low, anchor_high, anchor_date)
+
+    # ── Generate chart ──
+    chart_path = generate_alert_chart(sym, df, all_levels, price, ratio_map,
+                                      alert_title=alert_reason,
+                                      stock_info=si, ma_rows=ma_data,
+                                      news_items=news_items,
+                                      fib_anchor=fib_anchor)
+    if not chart_path:
+        return
+
+    # ── Build compact Hebrew caption (≤1024 chars) ──
+    pct = stock.get('pct', 0)
+    vol_shares_str = _format_shares_short(vol_raw) if vol_raw > 0 else '-'
+    dol_vol_str = _format_dollar_short(dol_vol) if dol_vol > 0 else '-'
+    rvol_tag = f"פי {rvol:.1f}" if rvol > 0 else ""
+
+    caption_lines = []
+
+    # Line 1: Header
+    caption_lines.append(f"🆕 <b>{sym}</b> ${price:.2f} {pct:+.1f}%")
+
+    # Line 2: Float + Short
+    float_dol = _format_dollar_short(float_shares * price) if float_shares > 0 and price > 0 else ''
+    flt_part = f"פלאט {float_str}"
+    if float_dol:
+        flt_part += f" ({float_dol})"
+    short_str = enrich.get('short', '-')
+    if short_str and short_str != '-':
+        flt_part += f" | שורט {short_str}"
+    caption_lines.append(f"📊 {flt_part}")
+
+    # Line 3: Volume + RVOL + Turnover
+    vol_part = f"ווליום {dol_vol_str}"
+    if rvol_tag:
+        vol_part += f" ({rvol_tag})"
+    if ft_pct >= 20:
+        vol_part += f" | סיבוב x{ft_pct / 100:.2f}"
+    caption_lines.append(f"📈 {vol_part}")
+
+    # Line 4: VWAP
+    vwap = stock.get('vwap', 0)
+    if vwap > 0:
+        vwap_pct = (price - vwap) / vwap * 100
+        vwap_icon = "🟢" if price > vwap else "🔴"
+        vp = f"${vwap:.2f}" if vwap >= 1 else f"${vwap:.4f}"
+        caption_lines.append(f"{vwap_icon} VWAP {vp} ({vwap_pct:+.1f}%)")
+
+    # Line 5: Company | Sector | Country
+    company = enrich.get('company', '')
+    sector = enrich.get('sector', '')
+    country = enrich.get('country', '')
+    co_parts = [p for p in [company, sector, country] if p and p != '-']
+    if co_parts:
+        caption_lines.append(f"🏢 {' | '.join(co_parts)}")
+
+    # Line 6: MCap + EPS + Cash
+    mcap = enrich.get('market_cap', '-')
+    eps = enrich.get('eps', '-')
+    cash = enrich.get('cash', '-')
+    fin_parts = []
+    if mcap and mcap != '-':
+        fin_parts.append(f"MCap {mcap}")
+    if eps and eps != '-':
+        fin_parts.append(f"EPS {eps}")
+    if cash and cash != '-':
+        fin_parts.append(f"Cash ${cash}")
+    if fin_parts:
+        caption_lines.append(f"💰 {' | '.join(fin_parts)}")
+
+    # Lines 7-8: News (up to 2 headlines)
+    if news_items:
+        headlines_he = []
+        headlines_en = []
+        for n in news_items[:2]:
+            title_he = n.get('title_he', '')
+            title_en = n.get('title_en', '')
+            ndate = n.get('date', '')
+            if title_he:
+                headlines_he.append((ndate, title_he))
+            elif title_en:
+                headlines_en.append((ndate, title_en))
+        if headlines_en:
+            try:
+                translated = _batch_translate([t for _, t in headlines_en])
+                for i, tr in enumerate(translated):
+                    headlines_he.append((headlines_en[i][0], tr))
+            except Exception:
+                for d, t in headlines_en:
+                    headlines_he.append((d, t))
+        for ndate, title in headlines_he[:2]:
+            prefix = f"{ndate} — " if ndate else ""
+            caption_lines.append(f"📰 {prefix}{title}")
+
+    # Line 9: Fib anchor
+    if fib_anchor:
+        a_low, a_high, a_date = fib_anchor
+        a_low_s = f"${a_low:.2f}" if a_low >= 1 else f"${a_low:.4f}"
+        a_high_s = f"${a_high:.2f}" if a_high >= 1 else f"${a_high:.4f}"
+        date_str = a_date if isinstance(a_date, str) else str(a_date)[:10]
+        caption_lines.append(f"📐 פיבו: {a_low_s}→{a_high_s} ({date_str})")
+
+    # Line 10: Fib supports/resistances (nearest 2 each)
+    fibs_below = sorted([lv for lv in all_levels if lv <= price], reverse=True)[:2]
+    fibs_above = sorted([lv for lv in all_levels if lv > price])[:2]
+    if fibs_below or fibs_above:
+        s_parts = ' '.join(f"${lv:.2f}" if lv >= 1 else f"${lv:.4f}" for lv in fibs_below) if fibs_below else '-'
+        r_parts = ' '.join(f"${lv:.2f}" if lv >= 1 else f"${lv:.4f}" for lv in fibs_above) if fibs_above else '-'
+        caption_lines.append(f"🎯 S: {s_parts} | R: {r_parts}")
+
+    # Line 11: Closest resist MA
+    if ma_data:
+        resist_str = _find_closest_resist(price, ma_data)
+        if resist_str:
+            caption_lines.append(f"📉 Resist: {resist_str}")
+
+    # IBKR tradeability warning
+    contract = stock.get('contract')
+    if not contract or not getattr(contract, 'conId', 0):
+        caption_lines.append("⛔ לא נסחרת באינטראקטיב ברוקרס!")
+
+    caption = "\n".join(caption_lines)
+    if len(caption) > 1024:
+        # Trim news lines first, then truncate
+        while len(caption) > 1024 and len(caption_lines) > 5:
+            caption_lines.pop(-2)  # remove before last line
+            caption = "\n".join(caption_lines)
+        if len(caption) > 1024:
+            caption = caption[:1020] + "..."
+
+    send_telegram_alert_photo(chart_path, caption)
+    log.info(f"Unified report sent for {sym}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -7581,7 +7689,7 @@ class ScannerThread(threading.Thread):
             passes_vol_filter = report_dol_vol >= _MIN_DOLLAR_VOL_ALERT or report_rvol >= _MIN_RVOL_ALERT
 
             if above_vwap and has_news and passes_vol_filter and not self._warmup:
-                _send_stock_report(sym, d, enrich)
+                _send_unified_report(sym, d, enrich)
                 self._reports_sent.add(sym)
                 global _daily_reports_sent
                 _daily_reports_sent += 1
@@ -7686,8 +7794,9 @@ class ScannerThread(threading.Thread):
                     else:
                         # Multiple alerts — join compact lines
                         reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
-                    _send_alert_chart(s, sp, alert_reason=reason,
-                                      stock_data=sd_s)
+                    enrich_s = _enrichment.get(s, {})
+                    _send_unified_report(s, sd_s, enrich_s,
+                                         alert_reason=reason)
 
                 status += f"  🔔{total_alerts}"
             else:
@@ -7776,7 +7885,7 @@ class ScannerThread(threading.Thread):
                 d = current.get(sym, saved_d)  # prefer fresh data, fallback to saved
                 enrich = _enrichment.get(sym, {})
                 if d and enrich:
-                    _send_stock_report(sym, d, enrich)
+                    _send_unified_report(sym, d, enrich)
                     self._reports_sent.add(sym)
                     _daily_reports_sent += 1
                     log.info(f"Sent deferred report for {sym} (was warmup)")
