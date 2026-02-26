@@ -112,7 +112,7 @@ def _compute_sma9_hourly(bars_1m: list[dict]) -> float:
 
 
 _MR_ATR_PERIOD = 14
-_MR_ATR_MULTIPLIER = 2.5  # trailing stop = highest_high - 2.5 * ATR
+_MR_ATR_MULTIPLIER = 3.5  # trailing stop = highest_high - 3.5 * ATR (was 2.5, too tight on volatile pennies)
 
 
 def _compute_atr(bars_1m: list[dict], period: int = _MR_ATR_PERIOD) -> float:

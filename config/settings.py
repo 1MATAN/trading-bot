@@ -301,7 +301,7 @@ GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
 GG_LIVE_MAX_TRACKED_SYMBOLS = 8
 GG_LIVE_MAX_POSITIONS = 3              # max open positions
 GG_LIVE_SAFETY_STOP_PCT = 0.08         # 8% max loss from entry
-GG_LIVE_TRAILING_STOP_PCT = 0.06       # 6% trailing from highest high
+GG_LIVE_TRAILING_STOP_PCT = 0.10       # 10% trailing from highest high (was 6%, shaken out by normal pullbacks)
 GG_LIVE_MIN_HOLD_SEC = 600             # 10 min minimum hold before HA exit allowed
 GG_LIVE_HA_EXIT_BARS = 3              # 3 consecutive HA red bars required for exit
 GG_LIVE_PROFIT_TARGET_PCT = 0.05      # +5% → sell half, move stop to breakeven
@@ -317,6 +317,7 @@ MR_SAFETY_STOP_PCT = 0.10             # 10% below entry (was 8%)
 MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
 MR_LIVE_SAFETY_STOP_PCT = MR_SAFETY_STOP_PCT
 MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
+MR_LIVE_PROFIT_TARGET_PCT = 0.10      # +10% → sell half, move stop to breakeven
 
 # ── Float Turnover (FT) Robot ──────────────────────────
 FT_LIVE_INITIAL_CASH = 3000.0
@@ -327,7 +328,8 @@ FT_MIN_FLOAT_TURNOVER_PCT = 25.0     # minimum % of float traded (was 15%)
 FT_LIVE_GAP_MIN_PCT = 30.0           # minimum gap % (directional filter)
 FT_LIVE_RVOL_MIN = 3.0               # minimum relative volume (extreme volume)
 FT_LIVE_REQUIRE_NEWS = True           # require news catalyst
-FT_MAX_HOLD_MINUTES = 60              # 1 hour max hold
+FT_MAX_HOLD_MINUTES = 180             # 3 hours max hold (was 60min, killed winners mid-move)
+FT_LIVE_PROFIT_TARGET_PCT = 0.08      # +8% → sell half, move stop to breakeven
 
 # ── Strategy-Wide Risk Controls ──────────────────────
 STRATEGY_MIN_PRICE = 0.50              # skip stocks under $0.50 (huge spreads)

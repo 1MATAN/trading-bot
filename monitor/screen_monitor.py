@@ -79,9 +79,9 @@ from config.settings import (
     GG_LIVE_MAX_POSITIONS, GG_MAX_HOLD_MINUTES,
     GG_LIVE_RVOL_MIN, GG_LIVE_REQUIRE_NEWS,
     MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_FIXED,
-    MR_LIVE_MAX_POSITIONS, MR_LIVE_RVOL_MIN, MR_LIVE_REQUIRE_NEWS,
+    MR_LIVE_MAX_POSITIONS, MR_LIVE_RVOL_MIN, MR_LIVE_REQUIRE_NEWS, MR_LIVE_PROFIT_TARGET_PCT,
     FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_FIXED, FT_MIN_FLOAT_TURNOVER_PCT,
-    FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES,
+    FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES, FT_LIVE_PROFIT_TARGET_PCT,
     FT_LIVE_GAP_MIN_PCT, FT_LIVE_RVOL_MIN, FT_LIVE_REQUIRE_NEWS,
     STRATEGY_MIN_PRICE, FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
     FIB_DT_MAX_HOLD_MINUTES,
@@ -2991,6 +2991,12 @@ _fib_bar_completed: dict[str, dict] = {}    # sym → last completed bar {open, 
 _fib_bounce_cooldown: dict[str, float] = {} # "SYM_0.1234" → timestamp
 _FIB_BOUNCE_COOLDOWN_SEC = 600              # 10 min cooldown per symbol+level
 
+# ── Fib support confirmation (2-bar hold) ──
+_fib_support_candidates: dict[str, list[tuple[float, float, float]]] = {}
+# {sym: [(fib_level, bar_close, timestamp), ...]}
+_fib_support_cooldown: dict[str, float] = {}  # "SYM_0.1234" → timestamp
+_FIB_SUPPORT_COOLDOWN_SEC = 600  # 10 min per sym+level
+
 # ── Alert chart cooldown ──
 _ALERT_CHART_COOLDOWN_SEC = 600  # 10 min cooldown per symbol for chart attachment
 _alert_chart_sent: dict[str, float] = {}  # sym → last chart timestamp
@@ -3013,6 +3019,8 @@ def _reset_alerts_if_new_day():
         _fib_bar_forming.clear()
         _fib_bar_completed.clear()
         _fib_bounce_cooldown.clear()
+        _fib_support_candidates.clear()
+        _fib_support_cooldown.clear()
         _lod_touch_tracker.clear()
         _lod_was_near.clear()
         _vwap_side.clear()
@@ -3197,6 +3205,72 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
             return full, compact
 
     return None
+
+
+def check_fib_support_hold(sym: str, price: float, pct: float) -> tuple[str, str] | None:
+    """Alert when price holds above a fib level for 2 consecutive 1-min bars.
+
+    Bar N closes within 1.5% above a fib level → candidate.
+    Bar N+1 low stays above that level → support confirmed → alert.
+    10-min cooldown per symbol+level.
+    """
+    if pct < ALERT_MIN_PCT or price <= 0:
+        return None
+
+    bar = _update_fib_bar(sym, price)
+    if not bar:
+        return None
+
+    with _fib_cache_lock:
+        cached = _fib_cache.get(sym)
+    if not cached:
+        return None
+
+    _, _, all_levels, ratio_map, *_ = cached
+    now = time_mod.time()
+    bar_low = bar['low']
+    bar_close = bar['close']
+
+    # ── Phase 1: confirm previous candidates ──
+    prev_candidates = _fib_support_candidates.pop(sym, [])
+    result = None
+    for lv, _prev_close, _ts in prev_candidates:
+        lv_key = round(lv, 4)
+        cooldown_key = f"{sym}_{lv_key}"
+        if now - _fib_support_cooldown.get(cooldown_key, 0) < _FIB_SUPPORT_COOLDOWN_SEC:
+            continue
+        if bar_low > lv:
+            # Support confirmed — current bar didn't break below
+            _fib_support_cooldown[cooldown_key] = now
+            info = ratio_map.get(lv_key)
+            ratio_label = f" ({info[0]} {info[1]})" if info else ""
+            log.debug(f"Fib support hold {sym}: ${lv:.4f}{ratio_label} "
+                      f"bar L=${bar_low:.4f} C=${bar_close:.4f}")
+            full = (
+                f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"\U0001f6e1 תמיכת פיבו — רמה ${lv:.4f}{ratio_label} | החזיק 2 נרות"
+            )
+            compact = f"\U0001f6e1 תמיכה {sym} ${lv:.4f}{ratio_label}"
+            result = (full, compact)
+            break  # one alert per cycle
+
+    # ── Phase 2: record new candidates from current bar ──
+    new_candidates: list[tuple[float, float, float]] = []
+    for lv in all_levels:
+        lv_key = round(lv, 4)
+        cooldown_key = f"{sym}_{lv_key}"
+        if now - _fib_support_cooldown.get(cooldown_key, 0) < _FIB_SUPPORT_COOLDOWN_SEC:
+            continue
+        if lv <= 0:
+            continue
+        pct_above = (bar_close - lv) / lv
+        if 0 < pct_above <= 0.015:
+            new_candidates.append((lv, bar_close, now))
+
+    if new_candidates:
+        _fib_support_candidates[sym] = new_candidates
+
+    return result
 
 
 def check_lod_touch(sym: str, price: float, day_low: float, pct: float) -> tuple[str, str] | None:
@@ -6219,6 +6293,49 @@ class MRVirtualPortfolio:
         log.info(f"MR VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
         return msg
 
+    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell half the MR position (profit target). Returns Telegram alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos:
+            return None
+
+        total_qty = pos['qty']
+        half = total_qty // 2
+        if half < 1:
+            return self.sell(sym, price, reason)
+
+        entry_price = pos['entry_price']
+        pnl = (price - entry_price) * half
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+
+        old_cash = self.cash
+        self.cash += half * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': half,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        pos['qty'] = total_qty - half
+        pos['target_hit'] = True
+        self._save_state()
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
+
+        remaining = total_qty - half
+        msg = (
+            f"📈 <b>Momentum Ride [MR-SIM] — TARGET HIT {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
+            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
+        )
+        log.info(f"MR TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
+        return msg
+
     def net_liq(self, current_prices: dict) -> float:
         val = self.cash
         for sym, pos in self.positions.items():
@@ -6466,6 +6583,49 @@ class FTVirtualPortfolio:
             f"  📝 Reason: {reason}"
         )
         log.info(f"FT VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
+        return msg
+
+    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
+        """Sell half the FT position (profit target). Returns Telegram alert text or None."""
+        pos = self.positions.get(sym)
+        if not pos:
+            return None
+
+        total_qty = pos['qty']
+        half = total_qty // 2
+        if half < 1:
+            return self.sell(sym, price, reason)
+
+        entry_price = pos['entry_price']
+        pnl = (price - entry_price) * half
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+
+        old_cash = self.cash
+        self.cash += half * price
+
+        self.trades.append({
+            'sym': sym, 'side': 'SELL', 'qty': half,
+            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
+        })
+
+        pos['qty'] = total_qty - half
+        pos['target_hit'] = True
+        self._save_state()
+
+        net = self.net_liq({})
+        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
+
+        remaining = total_qty - half
+        msg = (
+            f"🔄 <b>Float Turnover [FT-SIM] — TARGET HIT {sym}</b>\n"
+            f"  🕐 {self._ts()}\n"
+            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
+            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
+            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
+            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
+        )
+        log.info(f"FT TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
         return msg
 
     def net_liq(self, current_prices: dict) -> float:
@@ -7119,10 +7279,8 @@ class ScannerThread(threading.Thread):
         """Monitor virtual portfolio positions for stop/target hits.
 
         Uses real-time prices from current scan data.
+        Checks: FIB DT stops/targets, MR/FT profit targets + breakeven stops.
         """
-        if not self._virtual_portfolio.positions:
-            return
-
         # Build current prices from scan data
         current_prices = {}
         for sym, d in current.items():
@@ -7130,17 +7288,76 @@ class ScannerThread(threading.Thread):
             if px > 0:
                 current_prices[sym] = px
 
-        # Check stops and targets
-        alerts = self._virtual_portfolio.check_stops_and_targets(current_prices)
-        for alert in alerts:
-            send_telegram(alert)  # private chat, not group
+        # ── FIB DT: check stops and targets ──
+        if self._virtual_portfolio.positions:
+            alerts = self._virtual_portfolio.check_stops_and_targets(current_prices)
+            for alert in alerts:
+                send_telegram(alert)
 
-        # Sync strategy state for positions entering TRAILING (once only)
-        for sym in list(self._virtual_portfolio.positions.keys()):
-            pos = self._virtual_portfolio.positions[sym]
-            if pos['phase'] == 'TRAILING' and not pos.get('trailing_synced'):
-                self._fib_dt_strategy.mark_trailing(sym)
-                pos['trailing_synced'] = True
+            # Sync strategy state for positions entering TRAILING (once only)
+            for sym in list(self._virtual_portfolio.positions.keys()):
+                pos = self._virtual_portfolio.positions[sym]
+                if pos['phase'] == 'TRAILING' and not pos.get('trailing_synced'):
+                    self._fib_dt_strategy.mark_trailing(sym)
+                    pos['trailing_synced'] = True
+
+        # ── MR: profit target (+10%) → sell half + breakeven stop ──
+        for sym in list(self._mr_portfolio.positions.keys()):
+            pos = self._mr_portfolio.positions.get(sym)
+            if not pos:
+                continue
+            price = current_prices.get(sym, 0)
+            if price <= 0:
+                continue
+            entry_price = pos.get('entry_price', 0)
+            if entry_price <= 0:
+                continue
+
+            # Breakeven stop: after target hit, exit if price drops to entry
+            if pos.get('target_hit') and price <= entry_price:
+                alert = self._mr_portfolio.sell(sym, price,
+                    f"breakeven_stop (entry=${entry_price:.4f})")
+                if alert:
+                    send_telegram(alert)
+                    self._mr_strategy.mark_position_closed(sym)
+                continue
+
+            # Profit target: sell half at +10%
+            if not pos.get('target_hit') and price >= entry_price * (1 + MR_LIVE_PROFIT_TARGET_PCT):
+                pct = MR_LIVE_PROFIT_TARGET_PCT * 100
+                alert = self._mr_portfolio.sell_half(sym, price,
+                    f"profit_target (+{pct:.0f}%, entry=${entry_price:.4f})")
+                if alert:
+                    send_telegram(alert)
+
+        # ── FT: profit target (+8%) → sell half + breakeven stop ──
+        for sym in list(self._ft_portfolio.positions.keys()):
+            pos = self._ft_portfolio.positions.get(sym)
+            if not pos:
+                continue
+            price = current_prices.get(sym, 0)
+            if price <= 0:
+                continue
+            entry_price = pos.get('entry_price', 0)
+            if entry_price <= 0:
+                continue
+
+            # Breakeven stop: after target hit, exit if price drops to entry
+            if pos.get('target_hit') and price <= entry_price:
+                alert = self._ft_portfolio.sell(sym, price,
+                    f"breakeven_stop (entry=${entry_price:.4f})")
+                if alert:
+                    send_telegram(alert)
+                    self._ft_strategy.mark_position_closed(sym)
+                continue
+
+            # Profit target: sell half at +8%
+            if not pos.get('target_hit') and price >= entry_price * (1 + FT_LIVE_PROFIT_TARGET_PCT):
+                pct = FT_LIVE_PROFIT_TARGET_PCT * 100
+                alert = self._ft_portfolio.sell_half(sym, price,
+                    f"profit_target (+{pct:.0f}%, entry=${entry_price:.4f})")
+                if alert:
+                    send_telegram(alert)
 
     def _run_gap_go_cycle(self, current: dict):
         """Run Gap and Go auto-strategy: find gappers >= 30%, check HA + VWAP signals."""
@@ -7216,6 +7433,11 @@ class ScannerThread(threading.Thread):
 
             # ── 4. Execute entries ──
             for entry in entries:
+                # Duplicate-entry guard: skip if already holding this symbol
+                if entry.symbol in self._gg_portfolio.positions:
+                    self._gg_strategy.mark_position_closed(entry.symbol)
+                    continue
+
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
@@ -7334,6 +7556,11 @@ class ScannerThread(threading.Thread):
 
             # ── 4. Execute entries ──
             for entry in entries:
+                # Duplicate-entry guard: skip if already holding this symbol
+                if entry.symbol in self._mr_portfolio.positions:
+                    self._mr_strategy.mark_position_closed(entry.symbol)
+                    continue
+
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
@@ -7471,6 +7698,11 @@ class ScannerThread(threading.Thread):
 
             # ── 4. Execute entries ──
             for entry in entries:
+                # Duplicate-entry guard: skip if already holding this symbol
+                if entry.symbol in self._ft_portfolio.positions:
+                    self._ft_strategy.mark_position_closed(entry.symbol)
+                    continue
+
                 scan_price = current.get(entry.symbol, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
@@ -7776,6 +8008,7 @@ class ScannerThread(threading.Thread):
 
                 _collect(sym, check_hod_break(sym, d, prev_d), 'hod', 'HOD Break')
                 _collect(sym, check_fib_second_touch(sym, price, pct), 'fib', 'FIB Touch')
+                _collect(sym, check_fib_support_hold(sym, price, pct), 'fib', 'FIB Support')
                 day_low = d.get('day_low', 0)
                 _collect(sym, check_lod_touch(sym, price, day_low, pct), 'lod', 'LOD Touch')
                 _collect(sym, check_vwap_cross(sym, price, vwap, pct), 'vwap', 'VWAP Cross')
