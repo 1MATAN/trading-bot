@@ -4295,10 +4295,15 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
                                       alert_title=alert_reason,
                                       stock_info=si, ma_rows=ma_data)
     if chart_path:
-        # ── Caption: stock name + price + 3 news headlines in Hebrew ──
+        # ── Caption: alert reason + stock name + 3 news headlines ──
         sd = stock_data or {}
         pct = sd.get('pct', 0)
+
+        # Alert reason (strip HTML tags)
+        reason_clean = re.sub(r'<[^>]+>', '', alert_reason).strip() if alert_reason else ''
         caption = f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)"
+        if reason_clean:
+            caption += f"\n{reason_clean}"
 
         enrich = _enrichment.get(sym, {})
         news_items = enrich.get('news', [])
