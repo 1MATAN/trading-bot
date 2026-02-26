@@ -27,6 +27,21 @@ log = logging.getLogger("monitor.orders")
 
 _ET = ZoneInfo("US/Eastern")
 
+
+class _IbInsyncStartupFilter(logging.Filter):
+    """Suppress noisy ib_insync startup logs (ghost positions, old executions)."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if 'updatePortfolio' in msg and 'position=0.0' in msg:
+            return False
+        if 'execDetails' in msg or 'commissionReport' in msg:
+            return False
+        return True
+
+
+logging.getLogger('ib_insync.wrapper').addFilter(_IbInsyncStartupFilter())
+logging.getLogger('ib_insync.ib').addFilter(_IbInsyncStartupFilter())
+
 _CONNECT_TIMEOUT = 10
 _ACCOUNT_POLL_INTERVAL = 5   # seconds between account data refreshes
 _ACCOUNT_FETCH_TIMEOUT = 8   # max seconds for a single account data fetch
@@ -353,9 +368,9 @@ class OrderThread(threading.Thread):
 
             if positions:
                 pos_str = ", ".join(f"{s} {p[0]}@${p[1]:.2f}" for s, p in positions.items())
-                log.info(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: {pos_str}")
+                log.debug(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: {pos_str}")
             else:
-                log.info(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: (none)")
+                log.debug(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: (none)")
 
             if self.on_account:
                 self.on_account(net_liq, buying_power, positions)

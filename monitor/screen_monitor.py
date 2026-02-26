@@ -126,15 +126,26 @@ log = logging.getLogger("monitor")
 # Suppress ib_insync "Error 162 ... scanner subscription cancelled" —
 # this is expected behavior (reqScannerData auto-cancels) but ib_insync
 # logs it as ERROR, flooding the log with ~95 false errors per session.
-class _IbInsyncScannerFilter(logging.Filter):
+class _IbInsyncNoiseFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
+        # Suppress "Error 162 ... subscription cancelled" — expected from reqScannerData
         if 'Error 162' in msg and 'subscription cancelled' in msg:
+            return False
+        # Suppress updatePortfolio for closed positions (position=0.0) — ghost entries
+        if 'updatePortfolio' in msg and 'position=0.0' in msg:
+            return False
+        # Suppress position callbacks for zero-size positions (old closed trades)
+        if msg.startswith('position') and 'position=0.0' in msg:
+            return False
+        # Suppress "Warning 2104/2106/2158 ... connection is OK" — startup noise
+        if 'connection is OK' in msg and ('Warning 210' in msg or 'Warning 2158' in msg):
             return False
         return True
 
 
-logging.getLogger('ib_insync.wrapper').addFilter(_IbInsyncScannerFilter())
+logging.getLogger('ib_insync.wrapper').addFilter(_IbInsyncNoiseFilter())
+logging.getLogger('ib_insync.ib').addFilter(_IbInsyncNoiseFilter())
 
 
 # ══════════════════════════════════════════════════════════
@@ -5563,8 +5574,9 @@ class VirtualPortfolio:
             lines.append(f"  📋 Open positions: {len(self.positions)}")
             for sym, pos in self.positions.items():
                 px = current_prices.get(sym, pos['entry_price'])
-                sym_pnl = (px - pos['entry_price']) * pos.get('qty', pos.get('other_half', 0))
-                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+                qty = pos.get('qty', pos.get('other_half', 0))
+                sym_pnl = (px - pos['entry_price']) * qty
+                lines.append(f"    • {sym}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
         if self.trades:
             today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
             lines.append(f"  📝 Trades today: {len(today_trades)}")
@@ -6417,6 +6429,9 @@ class ScannerThread(threading.Thread):
         # ── FIB DT Auto-Strategy ──
         self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
         self._virtual_portfolio = VirtualPortfolio()
+        # Sync strategy state from restored portfolio
+        if self._virtual_portfolio.positions:
+            self._fib_dt_strategy.sync_from_portfolio(self._virtual_portfolio.positions)
         self._fib_dt_current_sym: str | None = None  # best turnover symbol
         # Cache scanner contracts for FIB DT (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}

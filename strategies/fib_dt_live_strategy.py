@@ -616,6 +616,26 @@ class FibDTLiveStrategySync:
                 ts.first_touch_bar = -1
             logger.info(f"[{symbol}] -> SCANNING (position closed)")
 
+    def sync_from_portfolio(self, held_positions: dict):
+        """Sync strategy state from portfolio after restart.
+
+        Args:
+            held_positions: {sym: {'entry_price': float, 'phase': str, ...}}
+        """
+        for sym, pos in held_positions.items():
+            st = self._states.get(sym)
+            if not st:
+                continue
+            phase_str = pos.get('phase', 'IN_POSITION')
+            if phase_str == 'TRAILING':
+                st.phase = DTSymbolPhase.TRAILING
+                st.prev_bar_high = 0.0
+                st.trailing_no_high_count = 0
+            else:
+                st.phase = DTSymbolPhase.IN_POSITION
+            entry_price = pos.get('entry_price', 0)
+            logger.info(f"FIB DT strategy sync: {sym} marked {st.phase.name} @ ${entry_price:.4f}")
+
     # ── main cycle (synchronous) ────────────────────────
 
     def process_cycle(
