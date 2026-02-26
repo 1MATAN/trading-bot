@@ -4295,15 +4295,22 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
                                       alert_title=alert_reason,
                                       stock_info=si, ma_rows=ma_data)
     if chart_path:
-        # ── Caption: alert reason + stock name + 3 news headlines ──
+        # ── Caption: stock name + alert reason + 3 news headlines ──
         sd = stock_data or {}
         pct = sd.get('pct', 0)
 
-        # Alert reason (strip HTML tags)
-        reason_clean = re.sub(r'<[^>]+>', '', alert_reason).strip() if alert_reason else ''
+        # Start with stock header
         caption = f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)"
-        if reason_clean:
-            caption += f"\n{reason_clean}"
+
+        # Alert reason — strip HTML, skip lines that duplicate stock header
+        if alert_reason:
+            reason_clean = re.sub(r'<[^>]+>', '', alert_reason).strip()
+            lines = reason_clean.split('\n')
+            # Remove first line if it's just the stock name+price (already in header)
+            if lines and sym in lines[0] and '$' in lines[0]:
+                lines = lines[1:]
+            if lines:
+                caption += "\n" + "\n".join(l.strip() for l in lines if l.strip())
 
         enrich = _enrichment.get(sym, {})
         news_items = enrich.get('news', [])
