@@ -3076,8 +3076,8 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
             log.debug(f"Fib bounce {sym}: off ${lv:.4f}{ratio_label} "
                       f"bar L=${bar_low:.4f} C=${bar_close:.4f} H=${bar_high:.4f}")
             full = (
-                f"🎯 <b>באונס מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-                f"רמה ${lv:.4f}{ratio_label} | נסגר מעל"
+                f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"🎯 באונס מפיבו — רמה ${lv:.4f}{ratio_label} | נסגר מעל"
             )
             compact = f"🎯 באונס {sym} ${lv:.4f}{ratio_label}"
             return full, compact
@@ -3088,8 +3088,8 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
             log.debug(f"Fib rejection {sym}: at ${lv:.4f}{ratio_label} "
                       f"bar L=${bar_low:.4f} C=${bar_close:.4f} H=${bar_high:.4f}")
             full = (
-                f"🎯 <b>דחייה מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
-                f"רמה ${lv:.4f}{ratio_label} | נסגר מתחת"
+                f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
+                f"🎯 דחייה מפיבו — רמה ${lv:.4f}{ratio_label} | נסגר מתחת"
             )
             compact = f"🎯 דחייה {sym} ${lv:.4f}{ratio_label}"
             return full, compact
@@ -7545,7 +7545,8 @@ class ScannerThread(threading.Thread):
                     send_telegram_alert(msg, reply_markup=btn)
                     # Send 1-min chart with Fib + alert reason + news
                     if sp > 0:
-                        _send_alert_chart(sym0, sp, alert_reason=batch_full_texts[0])
+                        _send_alert_chart(sym0, sp, alert_reason=batch_full_texts[0],
+                                          stock_data=sd)
                 else:
                     # Multiple alerts — grouped by symbol
                     now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
@@ -7578,12 +7579,14 @@ class ScannerThread(threading.Thread):
 
                     # Send 1-min chart with Fib + alert reasons + news per symbol
                     for s in batch_syms:
-                        sp = current.get(s, {}).get('price', 0)
+                        sd_s = current.get(s, {})
+                        sp = sd_s.get('price', 0)
                         if sp > 0:
                             # Compact alert lines for this symbol
                             sym_alerts = batch_by_sym.get(s, [])
                             reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
-                            _send_alert_chart(s, sp, alert_reason=reason)
+                            _send_alert_chart(s, sp, alert_reason=reason,
+                                              stock_data=sd_s)
 
                 status += f"  🔔{total_alerts}"
             else:
