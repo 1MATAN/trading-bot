@@ -4216,12 +4216,10 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
                       stock_data: dict | None = None) -> None:
     """Download 1-min bars (48h extended hours), generate chart with Fib, send to group.
 
-    Respects 10-min cooldown per symbol.  Telegram send is non-blocking (queued).
-    Caption includes: alert reason + recent news headlines.
+    No cooldown — each alert sends a fresh chart.
+    Caption: stock name + price + 3 latest news headlines in Hebrew.
     """
     now = time_mod.time()
-    if now - _alert_chart_sent.get(sym, 0) < _ALERT_CHART_COOLDOWN_SEC:
-        return
 
     # ── 1-min bars, 2 days (extended hours) ──
     df = _download_intraday(sym, bar_size='1 min', duration='2 D')
@@ -4297,13 +4295,16 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
                                       alert_title=alert_reason,
                                       stock_info=si, ma_rows=ma_data)
     if chart_path:
-        # ── Caption: only news headlines (alert reason is in the chart title) ──
-        caption = ""
+        # ── Caption: stock name + price + 3 news headlines in Hebrew ──
+        sd = stock_data or {}
+        pct = sd.get('pct', 0)
+        caption = f"<b>{sym}</b> ${price:.2f} ({pct:+.1f}%)"
+
         enrich = _enrichment.get(sym, {})
         news_items = enrich.get('news', [])
         if news_items:
             headlines_he = []
-            headlines_en = []  # fallback: translate untranslated headlines
+            headlines_en = []
             for n in news_items[:3]:
                 title_he = n.get('title_he', '')
                 title_en = n.get('title_en', '')
@@ -4311,17 +4312,15 @@ def _send_alert_chart(sym: str, price: float, alert_reason: str = "",
                     headlines_he.append(title_he)
                 elif title_en:
                     headlines_en.append(title_en)
-            # Translate any English-only headlines to Hebrew
             if headlines_en:
                 try:
                     translated = _batch_translate(headlines_en)
                     headlines_he.extend(translated)
                 except Exception:
-                    headlines_he.extend(headlines_en)  # fallback to English
+                    headlines_he.extend(headlines_en)
             if headlines_he:
-                caption = "📰 " + "\n📰 ".join(headlines_he)
+                caption += "\n📰 " + "\n📰 ".join(headlines_he[:3])
 
-        # Telegram photo caption limit: 1024 chars
         if len(caption) > 1024:
             caption = caption[:1020] + "..."
 
@@ -7508,85 +7507,25 @@ class ScannerThread(threading.Thread):
                 _collect(sym, check_doji_candle(sym, price, pct), 'spike', 'Doji')
                 _collect(sym, check_timeframe_high_break(sym, price, pct), 'hod', 'TF High')
 
-            # Send all alerts as one batch
+            # Send all alerts — chart image per symbol (no text messages)
             if batch_by_sym:
-                # GUI alerts disabled — Telegram alerts only
-                # if self.on_alert:
-                #     for full_text in batch_full_texts:
-                #         clean = re.sub(r'<[^>]+>', '', full_text)[:100]
-                #         self.on_alert(clean)
-
                 total_alerts = sum(len(v) for v in batch_by_sym.values())
 
-                # Inline keyboard buttons per symbol
-                keyboard_rows = []
                 for s in batch_syms:
-                    keyboard_rows.append([
-                        {'text': f'📊 {s}', 'callback_data': f'lookup:{s}'},
-                        {'text': f'📈 TradingView', 'url': f'https://www.tradingview.com/chart/?symbol={s}'},
-                    ])
-                btn = {'inline_keyboard': keyboard_rows} if keyboard_rows else None
-
-                if len(batch_syms) == 1 and total_alerts == 1:
-                    # Single stock, single alert — full text + fib levels + smart context
-                    sym0 = batch_syms[0]
-                    sd = current.get(sym0, {})
-                    sp = sd.get('price', 0)
-                    msg = batch_full_texts[0]
-                    # Smart context: RVOL, dollar volume, RS, float turnover
-                    smart = _build_smart_line(sym0, sd)
-                    if smart:
-                        msg += f"\n{smart}"
-                    if sp > 0:
-                        fresh_ma = _get_fresh_ma_rows(sym0, sp)
-                        fib_txt = _format_fib_text(sym0, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
-                        if fib_txt:
-                            msg += "\n" + fib_txt.strip()
-                    send_telegram_alert(msg, reply_markup=btn)
-                    # Send 1-min chart with Fib + alert reason + news
-                    if sp > 0:
-                        _send_alert_chart(sym0, sp, alert_reason=batch_full_texts[0],
-                                          stock_data=sd)
-                else:
-                    # Multiple alerts — grouped by symbol
-                    now_et = datetime.now(ZoneInfo('US/Eastern')).strftime('%H:%M')
-                    blocks = []
-                    for s in batch_syms:
-                        sd = current.get(s, {})
-                        sp = sd.get('price', 0)
-                        spct = sd.get('pct', 0)
-                        alerts = batch_by_sym[s]
-
-                        # Stock header + smart context + compact alert lines
-                        block = f"📌 <b>{s}</b> — ${sp:.2f} ({spct:+.1f}%)"
-                        smart = _build_smart_line(s, sd)
-                        if smart:
-                            block += f"\n{smart}"
-                        for line in alerts:
-                            block += f"\n  {line}"
-
-                        # Fib levels + MAs per symbol
-                        if sp > 0:
-                            fresh_ma = _get_fresh_ma_rows(s, sp)
-                            fib_txt = _format_fib_text(s, sp, vwap=sd.get('vwap', 0), ma_rows=fresh_ma)
-                            if fib_txt:
-                                block += "\n" + fib_txt.strip()
-
-                        blocks.append(block)
-
-                    header = f"🔔 <b>התראות ({total_alerts})</b> — {now_et} ET\n"
-                    send_telegram_alert(header + "\n\n".join(blocks), reply_markup=btn)
-
-                    # Send 1-min chart with Fib + alert reasons + news per symbol
-                    for s in batch_syms:
-                        sd_s = current.get(s, {})
-                        sp = sd_s.get('price', 0)
-                        if sp > 0:
-                            # Compact alert lines for this symbol
-                            sym_alerts = batch_by_sym.get(s, [])
-                            reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
-                            _send_alert_chart(s, sp, alert_reason=reason,
-                                              stock_data=sd_s)
+                    sd_s = current.get(s, {})
+                    sp = sd_s.get('price', 0)
+                    if sp <= 0:
+                        continue
+                    # Build alert reason for chart title
+                    sym_alerts = batch_by_sym.get(s, [])
+                    if len(sym_alerts) == 1 and len(batch_syms) == 1:
+                        # Single alert — use full text (richer)
+                        reason = batch_full_texts[0]
+                    else:
+                        # Multiple alerts — join compact lines
+                        reason = "\n".join(f"  {a}" for a in sym_alerts) if sym_alerts else ""
+                    _send_alert_chart(s, sp, alert_reason=reason,
+                                      stock_data=sd_s)
 
                 status += f"  🔔{total_alerts}"
             else:
