@@ -2863,7 +2863,7 @@ _hod_break_alerted: dict[str, float] = {}              # sym -> last HOD value a
 _hod_last_alert_time: dict[str, float] = {}            # sym -> timestamp of last HOD alert
 _HOD_COOLDOWN_SEC = 300          # 5 min cooldown per symbol
 _HOD_MIN_JUMP_PCT = 0.02         # require 2% above last alerted high
-_fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touch_count}
+_fib_touch_tracker: dict[str, dict[float, int]] = {}   # sym -> {fib_level: touch_count} (legacy, kept for daily reset)
 _lod_touch_tracker: dict[str, int] = {}                 # sym -> touch count at day_low
 _lod_was_near: dict[str, bool] = {}                     # sym -> was near LOD last cycle
 _vwap_side: dict[str, str] = {}                         # sym -> 'above' | 'below'
@@ -3073,21 +3073,25 @@ def check_fib_second_touch(sym: str, price: float, pct: float) -> tuple[str, str
         # Support bounce: wick touched from above, closed above
         if abs(bar_low - lv) <= threshold and bar_close > lv:
             _fib_bounce_cooldown[cooldown_key] = now
+            log.debug(f"Fib bounce {sym}: off ${lv:.4f}{ratio_label} "
+                      f"bar L=${bar_low:.4f} C=${bar_close:.4f} H=${bar_high:.4f}")
             full = (
                 f"🎯 <b>באונס מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
                 f"רמה ${lv:.4f}{ratio_label} | נסגר מעל"
             )
-            compact = f"🎯 באונס ${lv:.4f}{ratio_label}"
+            compact = f"🎯 באונס {sym} ${lv:.4f}{ratio_label}"
             return full, compact
 
         # Resistance rejection: wick touched from below, closed below
         if abs(bar_high - lv) <= threshold and bar_close < lv:
             _fib_bounce_cooldown[cooldown_key] = now
+            log.debug(f"Fib rejection {sym}: at ${lv:.4f}{ratio_label} "
+                      f"bar L=${bar_low:.4f} C=${bar_close:.4f} H=${bar_high:.4f}")
             full = (
                 f"🎯 <b>דחייה מפיבו — {sym}</b> ${price:.2f} ({pct:+.1f}%)\n"
                 f"רמה ${lv:.4f}{ratio_label} | נסגר מתחת"
             )
-            compact = f"🎯 דחייה ${lv:.4f}{ratio_label}"
+            compact = f"🎯 דחייה {sym} ${lv:.4f}{ratio_label}"
             return full, compact
 
     return None
