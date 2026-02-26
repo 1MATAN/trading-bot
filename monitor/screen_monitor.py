@@ -5331,6 +5331,10 @@ def _send_unified_report(sym: str, stock: dict, enriched: dict,
             caption = caption[:1020] + "..."
 
     send_telegram_alert_photo(chart_path, caption)
+    # Also send to private chat with trading buttons
+    buttons = _make_trading_buttons(sym)
+    _tg_sender.enqueue(_do_send_photo, CHAT_ID, str(chart_path), caption,
+                        None, buttons)
     log.info(f"Unified report sent for {sym}")
 
 
@@ -5628,12 +5632,15 @@ def _do_send_message(chat_id: str, text: str, reply_markup: dict | None = None,
 
 
 def _do_send_photo(chat_id: str, image_path: str | Path, caption: str = "",
-                   reply_to: int | None = None) -> bool:
+                   reply_to: int | None = None,
+                   reply_markup: dict | None = None) -> bool:
     """Actually POST a photo to Telegram (blocking)."""
     try:
         data: dict = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
         if reply_to:
             data['reply_to_message_id'] = reply_to
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
         with open(image_path, 'rb') as photo:
             resp = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
@@ -5709,6 +5716,22 @@ def _make_lookup_button(sym: str) -> dict:
     }
 
 
+def _make_trading_buttons(sym: str) -> dict:
+    """Build InlineKeyboardMarkup with BUY / SELL / CLOSE ALL buttons."""
+    return {
+        'inline_keyboard': [
+            [
+                {'text': f'🟢 BUY {sym}', 'callback_data': f'buy:{sym}'},
+                {'text': f'🔴 SELL {sym}', 'callback_data': f'sell:{sym}'},
+            ],
+            [
+                {'text': '❌ סגור הכל', 'callback_data': 'closeall'},
+                {'text': f'📊 דוח — {sym}', 'callback_data': f'lookup:{sym}'},
+            ],
+        ]
+    }
+
+
 def send_telegram_photo(image_path: Path, caption: str = "") -> bool:
     """Send a photo to private chat (non-blocking)."""
     if not BOT_TOKEN or not CHAT_ID:
@@ -5772,17 +5795,20 @@ file_logger = FileLogger()
 # ══════════════════════════════════════════════════════════
 
 class TelegramListenerThread(threading.Thread):
-    """Poll Telegram getUpdates for /stock commands and @mentions."""
+    """Poll Telegram getUpdates for /stock commands, @mentions, and trading buttons."""
 
     _COOLDOWN_SECS = 60
+    _ORDER_COOLDOWN = 5  # seconds between buy/sell clicks
 
-    def __init__(self, lookup_queue: queue.Queue):
+    def __init__(self, lookup_queue: queue.Queue, order_thread=None):
         super().__init__(daemon=True)
         self.lookup_queue = lookup_queue
+        self.order_thread = order_thread  # OrderThread for buy/sell/close
         self.running = False
         self._offset = 0
         self._bot_username: str = ""
         self._cooldowns: dict[str, float] = {}  # symbol -> last lookup time
+        self._order_cooldowns: dict[str, float] = {}  # "action:sym" -> last time
 
     def stop(self):
         self.running = False
@@ -5878,22 +5904,46 @@ class TelegramListenerThread(threading.Thread):
             })
             log.info(f"TelegramListener: queued lookup for {symbol} (chat={chat_id})")
 
+    def _answer_cb(self, cb_id: str, text: str):
+        """Answer callback query to remove loading spinner."""
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+                json={'callback_query_id': cb_id, 'text': text},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
     def _handle_callback(self, cb: dict):
-        """Handle inline keyboard callback (e.g. 'lookup:AAPL')."""
+        """Handle inline keyboard callback (lookup, buy, sell, closeall)."""
         cb_id = cb.get('id', '')
         data = cb.get('data', '')
         chat_id = str(cb.get('message', {}).get('chat', {}).get('id', ''))
         message_id = cb.get('message', {}).get('message_id', 0)
 
-        # Answer the callback to remove the loading spinner
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-                json={'callback_query_id': cb_id, 'text': '🔍 טוען דוח...'},
-                timeout=5,
-            )
-        except Exception:
-            pass
+        # Only allow orders from private chat
+        if data.startswith(('buy:', 'sell:', 'closeall')) and chat_id != CHAT_ID:
+            self._answer_cb(cb_id, '⛔ פקודות מסחר רק בצ\'אט פרטי')
+            return
+
+        if data.startswith('buy:'):
+            self._answer_cb(cb_id, '🟢 מבצע קנייה...')
+            self._handle_buy(data.split(':', 1)[1].upper(), chat_id)
+            return
+
+        if data.startswith('sell:'):
+            self._answer_cb(cb_id, '🔴 מבצע מכירה...')
+            self._handle_sell(data.split(':', 1)[1].upper(), chat_id)
+            return
+
+        if data == 'closeall':
+            self._answer_cb(cb_id, '❌ סוגר הכל...')
+            self._handle_close_all(chat_id)
+            return
+
+        # Default: lookup
+        self._answer_cb(cb_id, '🔍 טוען דוח...')
 
         if data.startswith('lookup:'):
             sym = data.split(':', 1)[1].upper()
@@ -5915,6 +5965,151 @@ class TelegramListenerThread(threading.Thread):
                     'symbol': sym,
                 })
                 log.info(f"TelegramListener: callback lookup for {sym} (chat={chat_id})")
+
+    def _handle_buy(self, sym: str, chat_id: str):
+        """Execute quick buy via OrderThread from Telegram button."""
+        if not self.order_thread:
+            send_telegram_to(chat_id, "⛔ מערכת ההזמנות לא מחוברת")
+            return
+
+        # Rate limit
+        key = f"buy:{sym}"
+        now = time_mod.time()
+        if now - self._order_cooldowns.get(key, 0) < self._ORDER_COOLDOWN:
+            send_telegram_to(chat_id, f"⏳ {sym} — המתן מספר שניות")
+            return
+        self._order_cooldowns[key] = now
+
+        # Get price from OrderThread (live subscription or positions)
+        price = 0.0
+        if self.order_thread._subscribed_sym == sym:
+            price = self.order_thread.get_live_price()
+        if price <= 0:
+            pos = self.order_thread.positions.get(sym)
+            if pos and len(pos) >= 3:
+                price = pos[2]  # mktPrice
+        if price <= 0:
+            send_telegram_to(chat_id, f"⛔ אין מחיר עדכני ל-{sym}. בחר מניה בסורק קודם")
+            return
+
+        # Build order — same logic as _quick_buy (80% BP, 5% stop, 20% TP)
+        nl = self.order_thread.net_liq
+        bp = self.order_thread.buying_power
+        if nl <= 0:
+            send_telegram_to(chat_id, "⛔ ממתין לנתוני חשבון מ-IBKR")
+            return
+        avail = bp if bp > 0 else nl
+        bp_pct = 0.80
+        stop_pct = 0.05
+        tp_pct = 0.20
+
+        buy_price = round(price * 1.01, 2)
+        qty = int(avail * bp_pct / buy_price)
+        if qty <= 0:
+            send_telegram_to(chat_id, "⛔ אין כוח קנייה מספיק")
+            return
+
+        stop_price = round(price * (1 - stop_pct), 2)
+        limit_price = round(stop_price * (1 - STOP_LIMIT_OFFSET_PCT), 2)
+        target_price = round(price * (1 + tp_pct), 2)
+
+        req = {
+            'sym': sym, 'action': 'BUY', 'qty': qty, 'price': buy_price,
+            'stop_price': stop_price, 'limit_price': limit_price,
+            'stop_desc': f"${stop_price:.2f} ({stop_pct*100:.0f}% stop)",
+            'target_price': target_price, 'trailing_pct': 0.0,
+        }
+        self.order_thread.submit(req)
+        send_telegram_to(
+            chat_id,
+            f"🟢 <b>BUY {qty} {sym}</b> @ ${buy_price:.2f}\n"
+            f"🛑 Stop: ${stop_price:.2f} | 🎯 TP: ${target_price:.2f}"
+        )
+        log.info(f"Telegram BUY: {qty} {sym} @ ${buy_price:.2f}")
+
+    def _handle_sell(self, sym: str, chat_id: str):
+        """Execute quick sell via OrderThread from Telegram button."""
+        if not self.order_thread:
+            send_telegram_to(chat_id, "⛔ מערכת ההזמנות לא מחוברת")
+            return
+
+        # Rate limit
+        key = f"sell:{sym}"
+        now = time_mod.time()
+        if now - self._order_cooldowns.get(key, 0) < self._ORDER_COOLDOWN:
+            send_telegram_to(chat_id, f"⏳ {sym} — המתן מספר שניות")
+            return
+        self._order_cooldowns[key] = now
+
+        pos = self.order_thread.positions.get(sym)
+        if not pos or pos[0] == 0:
+            send_telegram_to(chat_id, f"⛔ אין פוזיציה ב-{sym}")
+            return
+
+        qty = abs(pos[0])
+        price = 0.0
+        if len(pos) >= 3:
+            price = pos[2]  # mktPrice from positions tuple
+        if price <= 0 and self.order_thread._subscribed_sym == sym:
+            price = self.order_thread.get_live_price()
+        if price <= 0:
+            send_telegram_to(chat_id, f"⛔ אין מחיר עדכני ל-{sym}")
+            return
+
+        sell_price = round(price * 0.99, 2)
+        if sell_price <= 0:
+            sell_price = 0.01
+
+        req = {
+            'sym': sym, 'action': 'SELL', 'qty': qty, 'price': sell_price,
+            'cancel_existing': True,
+        }
+        self.order_thread.submit(req)
+        send_telegram_to(
+            chat_id,
+            f"🔴 <b>SELL {qty} {sym}</b> @ ${sell_price:.2f}"
+        )
+        log.info(f"Telegram SELL: {qty} {sym} @ ${sell_price:.2f}")
+
+    def _handle_close_all(self, chat_id: str):
+        """Close all open positions via OrderThread from Telegram button."""
+        if not self.order_thread:
+            send_telegram_to(chat_id, "⛔ מערכת ההזמנות לא מחוברת")
+            return
+
+        positions = self.order_thread.positions
+        if not positions:
+            send_telegram_to(chat_id, "✅ אין פוזיציות פתוחות")
+            return
+
+        closed = []
+        for sym, pos in positions.items():
+            qty = abs(pos[0])
+            if qty == 0:
+                continue
+            mkt_price = pos[2] if len(pos) >= 3 else 0
+            if mkt_price <= 0:
+                continue
+
+            # Aggressive sell: price - min($0.50, 5%)
+            offset = min(0.50, mkt_price * 0.05)
+            sell_price = round(max(0.01, mkt_price - offset), 2)
+            req = {
+                'sym': sym, 'action': 'SELL', 'qty': qty, 'price': sell_price,
+                'cancel_existing': True,
+            }
+            self.order_thread.submit(req)
+            closed.append(f"{sym} {qty}sh @ ${sell_price:.2f}")
+
+        if closed:
+            lines = "\n".join(f"  🔴 {c}" for c in closed)
+            send_telegram_to(
+                chat_id,
+                f"❌ <b>סוגר הכל — {len(closed)} פוזיציות</b>\n{lines}"
+            )
+            log.info(f"Telegram CLOSE ALL: {len(closed)} positions")
+        else:
+            send_telegram_to(chat_id, "✅ אין פוזיציות פתוחות")
 
     def _parse_symbol(self, text: str) -> str | None:
         """Extract stock symbol from /SYM, /stock SYM, or @mention SYM."""
@@ -7238,7 +7433,7 @@ class FTVirtualPortfolio:
 class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
                  on_status=None, on_stocks=None, on_alert=None,
-                 on_price_update=None):
+                 on_price_update=None, order_thread=None):
         super().__init__(daemon=True)
         self.freq = freq
         self.price_min = price_min
@@ -7247,6 +7442,7 @@ class ScannerThread(threading.Thread):
         self.on_stocks = on_stocks  # callback(dict) to update GUI table (full rebuild)
         self.on_alert = on_alert    # callback(str) for alert messages
         self.on_price_update = on_price_update  # callback(dict) for in-place price updates
+        self._order_thread = order_thread  # for Telegram trading buttons
         self.running = False
         self.previous: dict = {}
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
@@ -7391,7 +7587,8 @@ class ScannerThread(threading.Thread):
             asyncio.set_event_loop(asyncio.new_event_loop())
         self.running = True
         # Start Telegram listener for stock lookups
-        self._telegram_listener = TelegramListenerThread(self._lookup_queue)
+        self._telegram_listener = TelegramListenerThread(
+            self._lookup_queue, order_thread=self._order_thread)
         self._telegram_listener.start()
         # Start continuous OCR price refresh (independent of enrichment cycle)
         self._start_ocr_refresh_thread()
@@ -10392,6 +10589,7 @@ class App:
                 on_stocks=self._update_stock_table,
                 on_alert=None,  # GUI alerts disabled — Telegram only
                 on_price_update=self._update_prices_inplace,
+                order_thread=self._order_thread,
             )
             # GUI alerts disabled — Telegram alerts only
             # global _gui_alert_cb
