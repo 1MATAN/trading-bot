@@ -2831,6 +2831,7 @@ _IL_TZ = ZoneInfo('Asia/Jerusalem')
 # Persistent unified journal — never resets, survives weekly portfolio resets
 _JOURNAL_JSON_PATH = DATA_DIR / "trade_journal.json"
 _JOURNAL_HTML_PATH = Path.home() / "Desktop" / "יומן.html"
+_DEMO_JOURNAL_HTML_PATH = Path.home() / "Desktop" / "דמו.html"
 
 # Robot emoji map for HTML
 _ROBOT_EMOJI = {'FIB DT': '📐', 'Gap&Go': '🚀', 'MR': '📈', 'FT': '🔄'}
@@ -3126,6 +3127,110 @@ function switchTab(id) {{
         log.warning(f"Journal HTML write error: {e}")
 
 
+def _generate_demo_journal_html(trades: list[dict]):
+    """Generate a clean 'Demo' HTML journal on Desktop showing all trades."""
+    _ROBOT_SHORT = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנטום', 'FT': 'סיבוב'}
+
+    # Stats
+    total_pnl = sum(t.get('pnl', 0) for t in trades)
+    wins = [t for t in trades if t.get('pnl', 0) > 0]
+    losses = [t for t in trades if t.get('pnl', 0) < 0]
+    n = len(trades)
+    wr = (len(wins) / n * 100) if n else 0
+    avg_w = (sum(t['pnl'] for t in wins) / len(wins)) if wins else 0
+    avg_l = (sum(t['pnl'] for t in losses) / len(losses)) if losses else 0
+
+    # Per-robot stats
+    robot_stats_html = ''
+    for rname in ['FIB DT', 'Gap&Go', 'MR', 'FT']:
+        rt = [t for t in trades if t.get('robot') == rname]
+        if not rt:
+            continue
+        rpnl = sum(t.get('pnl', 0) for t in rt)
+        rw = len([t for t in rt if t.get('pnl', 0) > 0])
+        rl = len([t for t in rt if t.get('pnl', 0) < 0])
+        rn = len(rt)
+        rwr = (rw / rn * 100) if rn else 0
+        rc = '#4caf50' if rpnl >= 0 else '#f44336'
+        rhe = _ROBOT_SHORT.get(rname, rname)
+        robot_stats_html += (
+            f'<div style="display:inline-block;background:#16213e;border-radius:8px;'
+            f'padding:8px 16px;margin:4px;text-align:center">'
+            f'<div style="color:#00d4ff;font-weight:bold">{rhe}</div>'
+            f'<div style="color:{rc};font-size:18px;font-weight:bold">${rpnl:+,.2f}</div>'
+            f'<div style="color:#888;font-size:12px">{rn} עסקאות | {rwr:.0f}% הצלחה</div>'
+            f'</div>'
+        )
+
+    # Trade rows
+    rows_html = ''
+    for i, t in enumerate(reversed(trades)):
+        pv = t.get('pnl', 0)
+        pp = t.get('pnl_pct', 0)
+        rc = '#4caf50' if pv >= 0 else '#f44336'
+        bg = '#1a1a2e' if i % 2 == 0 else '#16213e'
+        rhe = _ROBOT_SHORT.get(t.get('robot', ''), t.get('robot', ''))
+        rows_html += (
+            f'<tr style="background:{bg}">'
+            f'<td>{t.get("date","")}</td>'
+            f'<td>{t.get("exit_time","")}</td>'
+            f'<td style="color:#00d4ff">{rhe}</td>'
+            f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+            f'<td>${t.get("entry_price",0):.2f}</td>'
+            f'<td>${t.get("exit_price",0):.2f}</td>'
+            f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
+            f'<td style="color:{rc}">{pp:+.1f}%</td>'
+            f'<td style="color:#888;font-size:11px">{t.get("exit_note","")[:30]}</td>'
+            f'</tr>\n'
+        )
+
+    pnl_color = '#4caf50' if total_pnl >= 0 else '#f44336'
+    html = f'''<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+<meta charset="UTF-8">
+<title>יומן דמו — WTS</title>
+<style>
+body {{ background:#0e1117; color:#e0e0e0; font-family:Segoe UI,sans-serif; margin:0; padding:20px }}
+h1 {{ color:#00d4ff; text-align:center }}
+.stats {{ text-align:center; margin:20px 0 }}
+.stats .big {{ font-size:28px; font-weight:bold; color:{pnl_color} }}
+.stats .sub {{ color:#888; font-size:14px }}
+table {{ width:100%; border-collapse:collapse; margin-top:16px }}
+th {{ background:#1a1a3e; color:#00d4ff; padding:8px; text-align:right; font-size:13px }}
+td {{ padding:6px 8px; border-bottom:1px solid #222; font-size:13px }}
+tr:hover {{ background:#222244 !important }}
+</style>
+</head>
+<body>
+<h1>📊 יומן מסחר — חשבון דמו</h1>
+<div class="stats">
+<div class="big">${total_pnl:+,.2f}</div>
+<div class="sub">{n} עסקאות | {wr:.0f}% הצלחה | ממוצע רווח ${avg_w:+,.2f} | ממוצע הפסד ${avg_l:+,.2f}</div>
+</div>
+<div style="text-align:center">{robot_stats_html}</div>
+<table>
+<thead><tr>
+<th>תאריך</th><th>שעה</th><th>רובוט</th><th>מניה</th>
+<th>כניסה</th><th>יציאה</th><th>ר/ה $</th><th>ר/ה %</th><th>הערה</th>
+</tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+<div style="text-align:center;color:#555;margin-top:20px;font-size:12px">
+עודכן: {datetime.now().strftime("%d/%m/%Y %H:%M")} | WTS Demo Trading System
+</div>
+</body>
+</html>'''
+
+    try:
+        _DEMO_JOURNAL_HTML_PATH.write_text(html, encoding='utf-8')
+        log.info(f"Demo journal HTML written: {_DEMO_JOURNAL_HTML_PATH}")
+    except Exception as e:
+        log.warning(f"Demo journal HTML write error: {e}")
+
+
 def _build_trade_logic_detail(robot_name: str, prefix: str, sym: str,
                                entry_price: float, qty: int) -> str:
     """Build detailed Hebrew logic breakdown for trade journal.
@@ -3337,6 +3442,7 @@ def _send_trade_journal_entry(robot_emoji: str, robot_name: str,
         all_trades.append(trade_record)
         _save_journal_trades(all_trades)
         _generate_journal_html(all_trades)
+        _generate_demo_journal_html(all_trades)
     except Exception as e:
         log.warning(f"Persistent journal write error: {e}")
 
@@ -9120,46 +9226,34 @@ class App:
                                       bg=self.BG, fg='#888')
         self._acct_pnl_lbl.pack(side='left')
 
-        # Positions header
-        port_hdr = tk.Frame(left_port, bg=self.BG)
-        port_hdr.pack(fill='x', pady=(2, 0))
-        tk.Label(port_hdr, text="POSITIONS", font=("Helvetica", 10, "bold"),
-                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 8))
-        for text, w in [("SYM", 6), ("QTY", 5), ("AVG", 7), ("PRICE", 7), ("P&L", 9), ("P&L%", 6)]:
-            tk.Label(port_hdr, text=text, font=("Courier", 10, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        # Positions row (compact, inline with account)
         self._portfolio_frame = tk.Frame(left_port, bg=self.BG)
         self._portfolio_frame.pack(fill='x', pady=1)
+
+        # Trades header
+        trade_hdr = tk.Frame(left_port, bg=self.BG)
+        trade_hdr.pack(fill='x', pady=(2, 0))
+        tk.Label(trade_hdr, text="עסקאות", font=("Helvetica", 10, "bold"),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 6))
+        for text, w in [("תאריך", 6), ("שעה", 5), ("רובוט", 5), ("מניה", 6),
+                         ("כניסה", 7), ("יציאה", 7), ("ר/ה$", 8), ("ר/ה%", 6)]:
+            tk.Label(trade_hdr, text=text, font=("Courier", 9, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        self._trades_frame = tk.Frame(left_port, bg=self.BG)
+        self._trades_frame.pack(fill='x', pady=1)
 
         # 2px separator
         tk.Frame(bottom, bg='#444', width=2).pack(side='left', fill='y', padx=6)
 
-        # Right side: virtual robots summary + recent trades
-        right_port = tk.Frame(bottom, bg=self.BG, width=500)
+        # Right side: SPY chart
+        right_port = tk.Frame(bottom, bg='#0e1117', width=420)
         right_port.pack(side='right', fill='both')
-        right_port.pack_propagate(True)
-
-        # Virtual robot summary
-        robot_hdr = tk.Frame(right_port, bg=self.BG)
-        robot_hdr.pack(fill='x')
-        tk.Label(robot_hdr, text="ROBOTS", font=("Helvetica", 11, "bold"),
-                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 8))
-        for text, w in [("ROBOT", 8), ("CASH", 7), ("POS", 4), ("NLV", 7), ("P&L%", 7)]:
-            tk.Label(robot_hdr, text=text, font=("Courier", 10, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
-        self._robot_summary_frame = tk.Frame(right_port, bg=self.BG)
-        self._robot_summary_frame.pack(fill='x', pady=1)
-
-        # Recent trades header
-        trade_hdr = tk.Frame(right_port, bg=self.BG)
-        trade_hdr.pack(fill='x', pady=(4, 0))
-        tk.Label(trade_hdr, text="RECENT TRADES", font=("Helvetica", 10, "bold"),
-                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 8))
-        for text, w in [("TIME", 6), ("BOT", 5), ("SYM", 6), ("SIDE", 4), ("QTY", 4), ("PRC", 7), ("P&L", 8)]:
-            tk.Label(trade_hdr, text=text, font=("Courier", 9, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
-        self._trades_frame = tk.Frame(right_port, bg=self.BG)
-        self._trades_frame.pack(fill='x', pady=1)
+        right_port.pack_propagate(False)
+        tk.Label(right_port, text="SPY", font=("Helvetica", 10, "bold"),
+                 bg='#0e1117', fg=self.ACCENT).pack(anchor='w', padx=4)
+        self._spy_chart_label = tk.Label(right_port, bg='#0e1117')
+        self._spy_chart_label.pack(fill='both', expand=True)
+        self._spy_chart_image = None  # keep reference to prevent GC
 
         # Init trading variables (no GUI panel — right-click menu instead)
         self._init_trading_vars()
@@ -9339,7 +9433,7 @@ class App:
         self._accumulate_spark_data()
         self.root.after(0, self._render_stock_table)
         self.root.after(0, self._render_stock_table_r)
-        self.root.after(0, self._render_robot_summary)
+        self.root.after(0, self._render_spy_chart)
         self.root.after(0, self._render_recent_trades)
 
     def _compute_row_data(self, sym: str, d: dict, idx: int) -> dict:
@@ -9816,55 +9910,60 @@ class App:
             text=f"P&L: ${total_pnl:+,.2f}" if self._cached_positions else "P&L: ---",
             fg=pnl_fg)
 
-    def _render_robot_summary(self):
-        """Update virtual robot summary panel (FIB DT, GG, MR, FT)."""
-        for w in self._robot_summary_frame.winfo_children():
-            w.destroy()
-
-        scanner = self.scanner
-        if not scanner:
-            return
-
-        # Get current prices from scanner data
-        current_prices = {}
-        for sym, d in self._stock_data.items():
-            p = d.get('price', 0)
-            if p > 0:
-                current_prices[sym] = p
-
-        robots = [
-            ("FIB DT", scanner._virtual_portfolio),
-            ("Gap&Go", scanner._gg_portfolio),
-            ("MR", scanner._mr_portfolio),
-            ("FT", scanner._ft_portfolio),
-        ]
-        bg = self.BG
-        for i, (name, vp) in enumerate(robots):
-            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+    def _render_spy_chart(self):
+        """Render SPY intraday chart in the bottom-right panel."""
+        def _generate():
             try:
-                cash = vp.cash
-                n_pos = len(vp.positions)
-                nlv = vp.net_liq(current_prices) if hasattr(vp, 'net_liq') else cash
-                pnl_pct = (nlv - vp.INITIAL_CASH) / vp.INITIAL_CASH * 100
-                pnl_fg = self.GREEN if pnl_pct >= 0 else self.RED
-            except Exception:
-                cash, n_pos, nlv, pnl_pct, pnl_fg = 0, 0, 0, 0, '#888'
+                df = _download_intraday('SPY', bar_size='5 mins', duration='1 D')
+                if df is None or len(df) < 10:
+                    return
+                fig, ax = plt.subplots(figsize=(4.2, 1.8), facecolor='#0e1117')
+                ax.set_facecolor('#0e1117')
+                closes = df['close'].values
+                xs = range(len(closes))
+                color = '#26a69a' if closes[-1] >= closes[0] else '#ef5350'
+                ax.plot(xs, closes, color=color, linewidth=1.2)
+                ax.fill_between(xs, closes, closes.min(), alpha=0.15, color=color)
+                # Current price label
+                ax.text(len(closes) - 1, closes[-1], f" ${closes[-1]:.2f}",
+                        fontsize=8, color=color, va='center', fontfamily='monospace')
+                # Change %
+                chg = (closes[-1] / closes[0] - 1) * 100
+                chg_c = '#26a69a' if chg >= 0 else '#ef5350'
+                ax.set_title(f"SPY {chg:+.2f}%", fontsize=9, color=chg_c,
+                             loc='left', fontfamily='monospace', pad=2)
+                ax.tick_params(axis='both', colors='#555', labelsize=7)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_color('#333')
+                ax.spines['bottom'].set_color('#333')
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('$%.0f'))
+                fig.tight_layout(pad=0.3)
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, facecolor='#0e1117')
+                plt.close(fig)
+                buf.seek(0)
+                img = Image.open(buf)
+                self.root.after(0, lambda: self._show_spy_image(img))
+            except Exception as e:
+                log.debug(f"SPY chart render: {e}")
+        threading.Thread(target=_generate, daemon=True).start()
 
-            row = tk.Frame(self._robot_summary_frame, bg=row_bg)
-            row.pack(fill='x')
-            tk.Label(row, text=name, font=("Courier", 10, "bold"),
-                     bg=row_bg, fg=self.FG, width=8, anchor='w').pack(side='left')
-            tk.Label(row, text=f"${cash:,.0f}", font=("Courier", 10),
-                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
-            tk.Label(row, text=str(n_pos), font=("Courier", 10),
-                     bg=row_bg, fg=self.FG, width=4, anchor='w').pack(side='left')
-            tk.Label(row, text=f"${nlv:,.0f}", font=("Courier", 10, "bold"),
-                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
-            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 10, "bold"),
-                     bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
+    def _show_spy_image(self, img):
+        """Display SPY chart image in the panel."""
+        try:
+            w = self._spy_chart_label.winfo_width() or 400
+            h = self._spy_chart_label.winfo_height() or 160
+            if w > 10 and h > 10:
+                img = img.resize((w, h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._spy_chart_image = photo
+            self._spy_chart_label.config(image=photo)
+        except Exception as e:
+            log.debug(f"SPY image display: {e}")
 
     def _render_recent_trades(self):
-        """Show last 10 trades from the journal (last 24h)."""
+        """Show last trades from the journal with Hebrew labels."""
         for w in self._trades_frame.winfo_children():
             w.destroy()
 
@@ -9874,86 +9973,63 @@ class App:
             trades = []
 
         if not trades:
-            tk.Label(self._trades_frame, text="No trades yet", font=("Courier", 9),
+            tk.Label(self._trades_frame, text="אין עסקאות", font=("Courier", 9),
                      bg=self.BG, fg='#555').pack(anchor='w')
             return
 
-        # Filter to last 24h and take last 8
-        now = time_mod.time()
-        cutoff = now - 86400
-        recent = []
-        for t in reversed(trades):
-            ts_str = t.get('exit_time', t.get('entry_time', ''))
-            # Try to parse timestamp
-            try:
-                from datetime import datetime
-                dt = datetime.strptime(ts_str[:19], '%Y-%m-%d %H:%M:%S')
-                ts = dt.timestamp()
-                if ts < cutoff:
-                    continue
-            except Exception:
-                pass
-            recent.append(t)
-            if len(recent) >= 8:
-                break
+        # Robot short names in Hebrew
+        _robot_short = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנ', 'FT': 'סיבב'}
 
-        if not recent:
-            tk.Label(self._trades_frame, text="No trades in 24h", font=("Courier", 9),
-                     bg=self.BG, fg='#555').pack(anchor='w')
-            return
+        # Take last 10 trades (newest first)
+        recent = list(reversed(trades))[:10]
 
         for i, t in enumerate(recent):
             row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
             row = tk.Frame(self._trades_frame, bg=row_bg)
             row.pack(fill='x')
 
-            # Time
-            ts_str = t.get('exit_time', t.get('entry_time', ''))
-            time_short = ts_str[11:16] if len(ts_str) >= 16 else ts_str[:5]
-            tk.Label(row, text=time_short, font=("Courier", 9),
+            # Date (dd/mm)
+            date_str = t.get('date', '')
+            date_short = date_str[:5] if date_str else '-'
+            tk.Label(row, text=date_short, font=("Courier", 9),
                      bg=row_bg, fg='#888', width=6, anchor='w').pack(side='left')
 
-            # Robot
-            robot = t.get('robot', t.get('strategy', '?'))[:5]
-            tk.Label(row, text=robot, font=("Courier", 9),
+            # Time
+            exit_t = t.get('exit_time', '')
+            tk.Label(row, text=exit_t or '-', font=("Courier", 9),
+                     bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
+
+            # Robot (Hebrew short)
+            robot = t.get('robot', '?')
+            robot_he = _robot_short.get(robot, robot[:4])
+            tk.Label(row, text=robot_he, font=("Courier", 9),
                      bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
 
             # Symbol
-            sym = t.get('symbol', t.get('sym', '?'))
+            sym = t.get('symbol', '?')
             tk.Label(row, text=sym, font=("Courier", 9, "bold"),
                      bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
 
-            # Side
-            side = t.get('side', t.get('action', '?'))
-            side_fg = self.GREEN if 'buy' in side.lower() else self.RED
-            tk.Label(row, text=side[:4], font=("Courier", 9),
-                     bg=row_bg, fg=side_fg, width=4, anchor='w').pack(side='left')
+            # Entry price
+            entry_p = t.get('entry_price', 0)
+            tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 9),
+                     bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
 
-            # Qty
-            qty = t.get('qty', t.get('shares', '?'))
-            tk.Label(row, text=str(qty), font=("Courier", 9),
-                     bg=row_bg, fg=self.FG, width=4, anchor='w').pack(side='left')
-
-            # Price
-            prc = t.get('price', t.get('exit_price', t.get('entry_price', 0)))
-            try:
-                prc_str = f"${float(prc):.2f}"
-            except (ValueError, TypeError):
-                prc_str = str(prc)
-            tk.Label(row, text=prc_str, font=("Courier", 9),
+            # Exit price
+            exit_p = t.get('exit_price', 0)
+            tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 9),
                      bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
 
-            # P&L
-            pnl = t.get('pnl', t.get('realized_pnl', 0))
-            try:
-                pnl_val = float(pnl)
-                pnl_fg = self.GREEN if pnl_val >= 0 else self.RED
-                pnl_str = f"${pnl_val:+.2f}"
-            except (ValueError, TypeError):
-                pnl_fg = '#888'
-                pnl_str = str(pnl)
-            tk.Label(row, text=pnl_str, font=("Courier", 9, "bold"),
+            # P&L $
+            pnl = t.get('pnl', 0)
+            pnl_fg = self.GREEN if pnl >= 0 else self.RED
+            tk.Label(row, text=f"${pnl:+.2f}", font=("Courier", 9, "bold"),
                      bg=row_bg, fg=pnl_fg, width=8, anchor='w').pack(side='left')
+
+            # P&L %
+            pnl_pct = t.get('pnl_pct', 0)
+            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 9, "bold"),
+                     bg=row_bg, fg=pnl_fg, width=6, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
@@ -10806,7 +10882,7 @@ class App:
             self._update_position_display()
             self._render_portfolio()
             self._render_account_summary()
-            self._render_robot_summary()
+            self._render_spy_chart()
             self._render_recent_trades()
         self.root.after(0, _refresh)
 
