@@ -9963,7 +9963,7 @@ class App:
             log.warning(f"SPY image display: {e}")
 
     def _render_recent_trades(self):
-        """Show trades from the last 24 hours only, compact rows."""
+        """Show today's trades in 3-column grid layout with bidi-correct Hebrew."""
         for w in self._trades_frame.winfo_children():
             w.destroy()
 
@@ -9982,51 +9982,79 @@ class App:
         today_trades = [t for t in trades if t.get('date', '') == today_str]
 
         if not today_trades:
-            tk.Label(self._trades_frame, text="אין עסקאות היום", font=("Courier", 9),
-                     bg=self.BG, fg='#555').pack(anchor='w')
+            tk.Label(self._trades_frame, text=bidi_display("אין עסקאות היום"),
+                     font=("Courier", 11), bg=self.BG, fg='#555').pack(anchor='w')
             return
 
         # Summary header
         day_pnl = sum(t.get('pnl', 0) for t in today_trades)
         day_pnl_fg = self.GREEN if day_pnl >= 0 else self.RED
+        wins = sum(1 for t in today_trades if t.get('pnl', 0) > 0)
         hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
-        hdr.pack(fill='x')
-        tk.Label(hdr, text=f" היום: {len(today_trades)} עסקאות",
-                 font=("Courier", 9, "bold"), bg='#1a1a3e', fg='#00d4ff').pack(side='left')
+        hdr.pack(fill='x', pady=(0, 2))
+        tk.Label(hdr, text=bidi_display(f"היום: {len(today_trades)} עסקאות | {wins} רווח"),
+                 font=("Helvetica", 11, "bold"), bg='#1a1a3e', fg='#00d4ff').pack(side='left', padx=4)
         tk.Label(hdr, text=f"${day_pnl:+,.2f}",
-                 font=("Courier", 9, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=4)
+                 font=("Courier", 12, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=6)
 
-        for i, t in enumerate(reversed(today_trades)):
-            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
-            row = tk.Frame(self._trades_frame, bg=row_bg)
-            row.pack(fill='x')
+        # 3-column grid container
+        cols_frame = tk.Frame(self._trades_frame, bg=self.BG)
+        cols_frame.pack(fill='both', expand=True)
+        for c in range(3):
+            cols_frame.columnconfigure(c, weight=1)
 
-            exit_t = t.get('exit_time', '')
-            tk.Label(row, text=exit_t or '-', font=("Courier", 9),
-                     bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
+        # Split trades into 3 columns
+        sorted_trades = list(reversed(today_trades))
+        n = len(sorted_trades)
+        per_col = (n + 2) // 3  # ceiling division
 
-            robot_he = _robot_short.get(t.get('robot', '?'), t.get('robot', '?')[:4])
-            tk.Label(row, text=robot_he, font=("Courier", 9),
-                     bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
+        for col_idx in range(3):
+            col_trades = sorted_trades[col_idx * per_col : (col_idx + 1) * per_col]
+            if not col_trades and col_idx > 0:
+                continue
 
-            tk.Label(row, text=t.get('symbol', '?'), font=("Courier", 10, "bold"),
-                     bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
+            col_frame = tk.Frame(cols_frame, bg=self.BG)
+            col_frame.grid(row=0, column=col_idx, sticky='nsew', padx=2)
 
-            entry_p = t.get('entry_price', 0)
-            exit_p = t.get('exit_price', 0)
-            tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 9),
-                     bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
-            tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 9),
-                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+            # Column header
+            chdr = tk.Frame(col_frame, bg='#222244')
+            chdr.pack(fill='x')
+            for txt, w, anc in [("שם", 5, 'w'), ("כניסה", 5, 'w'), ("יציאה", 5, 'w'),
+                                ("רוה״פ", 7, 'w'), ("%", 5, 'w')]:
+                tk.Label(chdr, text=bidi_display(txt), font=("Helvetica", 9, "bold"),
+                         bg='#222244', fg='#888', width=w, anchor=anc).pack(side='left')
 
-            pnl = t.get('pnl', 0)
-            pnl_fg = self.GREEN if pnl >= 0 else self.RED
-            tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 9, "bold"),
-                     bg=row_bg, fg=pnl_fg, width=9, anchor='w').pack(side='left')
+            for i, t in enumerate(col_trades):
+                row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+                row = tk.Frame(col_frame, bg=row_bg)
+                row.pack(fill='x')
 
-            pnl_pct = t.get('pnl_pct', 0)
-            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 9, "bold"),
-                     bg=row_bg, fg=pnl_fg, width=6, anchor='w').pack(side='left')
+                # Symbol + robot tag
+                sym = t.get('symbol', '?')
+                robot_he = _robot_short.get(t.get('robot', '?'), t.get('robot', '?')[:3])
+                tk.Label(row, text=f"{sym}", font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=self.FG, width=5, anchor='w').pack(side='left')
+
+                # Entry
+                entry_p = t.get('entry_price', 0)
+                tk.Label(row, text=f"{entry_p:.2f}", font=("Courier", 10),
+                         bg=row_bg, fg='#aaa', width=5, anchor='w').pack(side='left')
+
+                # Exit
+                exit_p = t.get('exit_price', 0)
+                tk.Label(row, text=f"{exit_p:.2f}", font=("Courier", 10),
+                         bg=row_bg, fg=self.FG, width=5, anchor='w').pack(side='left')
+
+                # P&L $
+                pnl = t.get('pnl', 0)
+                pnl_fg = self.GREEN if pnl >= 0 else self.RED
+                tk.Label(row, text=f"${pnl:+.1f}", font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
+
+                # P&L %
+                pnl_pct = t.get('pnl_pct', 0)
+                tk.Label(row, text=f"{pnl_pct:+.0f}%", font=("Courier", 10, "bold"),
+                         bg=row_bg, fg=pnl_fg, width=5, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
