@@ -9563,6 +9563,34 @@ class App:
                 parts.append("⬆" + " ".join(_fp(p) for p in above))
             fib_text = "  📐 " + "  |  ".join(parts) if parts else ""
 
+        # Nearest fib level + ratio for inline column
+        fib_near_text = ""
+        fib_near_fg = "#555"
+        with _fib_cache_lock:
+            cached_fib = _fib_cache.get(sym)
+        if cached_fib:
+            _al, _ah, all_lvls, ratio_map, *_ = cached_fib
+            # Find nearest level to current price
+            if all_lvls and price > 0:
+                nearest = min(all_lvls, key=lambda lv: abs(lv - price))
+                dist_pct = abs(nearest - price) / price * 100 if price > 0 else 999
+                rk = round(nearest, 4)
+                ratio_info = ratio_map.get(rk)
+                if ratio_info and dist_pct < 5:  # within 5% of a fib level
+                    ratio_val, series = ratio_info
+                    # Format: ratio + arrow (above/below)
+                    arrow = "▲" if nearest > price else "▼" if nearest < price else "●"
+                    fib_near_text = f"{ratio_val:.3f}{arrow}"
+                    # Color: bright if very close (<1%), dim if far
+                    if dist_pct < 0.5:
+                        fib_near_fg = "#ff44ff"  # magenta — sitting on fib
+                    elif dist_pct < 1.5:
+                        fib_near_fg = "#cc88ff"  # light purple — close
+                    elif dist_pct < 3:
+                        fib_near_fg = "#9966cc"  # purple — near
+                    else:
+                        fib_near_fg = "#666699"  # dim — approaching
+
         return {
             'bg': bg, 'sym_text': sym_text, 'sym_fg': sym_fg,
             'price_text': f"${price:.2f}",
@@ -9573,6 +9601,7 @@ class App:
             'float_text': flt, 'short_text': short,
             'news_text': news_text,
             'fib_text': fib_text,
+            'fib_near_text': fib_near_text, 'fib_near_fg': fib_near_fg,
             'news_headlines': news_headlines,
         }
 
@@ -9639,6 +9668,9 @@ class App:
                             bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
         news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Button-3>', _rclick)
 
+        fib_near_lbl = tk.Label(row1, text=rd.get('fib_near_text', ''), font=font_b,
+                                bg=rd['bg'], fg=rd.get('fib_near_fg', '#555'), width=8, anchor='w')
+        fib_near_lbl.pack(side='left'); fib_near_lbl.bind('<Button-1>', _click); fib_near_lbl.bind('<Button-3>', _rclick)
 
         # Fib row
         row2 = tk.Frame(parent, bg=rd['bg'])
@@ -9664,7 +9696,8 @@ class App:
             'sym_lbl': sym_lbl, 'price_lbl': price_lbl, 'pct_lbl': pct_lbl,
             'vol_lbl': vol_lbl, 'rvol_lbl': rvol_lbl,
             'vwap_lbl': vwap_lbl, 'float_lbl': float_lbl, 'short_lbl': short_lbl,
-            'news_lbl': news_lbl, 'fib_lbl': fib_lbl, 'news_hl_lbl': news_hl_lbl,
+            'news_lbl': news_lbl, 'fib_near_lbl': fib_near_lbl,
+            'fib_lbl': fib_lbl, 'news_hl_lbl': news_hl_lbl,
             'spark_canvas': spark_canvas,
         }
 
@@ -9744,6 +9777,8 @@ class App:
         widgets['float_lbl'].config(text=rd['float_text'], bg=bg)
         widgets['short_lbl'].config(text=rd['short_text'], bg=bg)
         widgets['news_lbl'].config(text=rd.get('news_text', ''), bg=bg)
+        widgets['fib_near_lbl'].config(text=rd.get('fib_near_text', ''),
+                                        fg=rd.get('fib_near_fg', '#555'), bg=bg)
         # Sparkline
         sc = widgets.get('spark_canvas')
         if sc:
@@ -11352,7 +11387,7 @@ class App:
         ff = self._table_font_var.get()
         fs = self._table_size_var.get()
         cols = [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7),
-                ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]
+                ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2), ("FIB", 8)]
         for frame in (self._hdr_frame, self._hdr_frame_r):
             for w in frame.winfo_children():
                 w.destroy()
