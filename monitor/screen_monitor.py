@@ -9563,33 +9563,25 @@ class App:
                 parts.append("⬆" + " ".join(_fp(p) for p in above))
             fib_text = "  📐 " + "  |  ".join(parts) if parts else ""
 
-        # Nearest fib level + ratio for inline column
+        # Fib anchor candle: Low - High (4.236)
         fib_near_text = ""
         fib_near_fg = "#555"
         with _fib_cache_lock:
             cached_fib = _fib_cache.get(sym)
         if cached_fib:
-            _al, _ah, all_lvls, ratio_map, *_ = cached_fib
-            # Find nearest level to current price
-            if all_lvls and price > 0:
-                nearest = min(all_lvls, key=lambda lv: abs(lv - price))
-                dist_pct = abs(nearest - price) / price * 100 if price > 0 else 999
-                rk = round(nearest, 4)
-                ratio_info = ratio_map.get(rk)
-                if ratio_info and dist_pct < 5:  # within 5% of a fib level
-                    ratio_val, series = ratio_info
-                    # Format: ratio + arrow (above/below)
-                    arrow = "▲" if nearest > price else "▼" if nearest < price else "●"
-                    fib_near_text = f"{ratio_val:.3f}{arrow}"
-                    # Color: bright if very close (<1%), dim if far
-                    if dist_pct < 0.5:
-                        fib_near_fg = "#ff44ff"  # magenta — sitting on fib
-                    elif dist_pct < 1.5:
-                        fib_near_fg = "#cc88ff"  # light purple — close
-                    elif dist_pct < 3:
-                        fib_near_fg = "#9966cc"  # purple — near
-                    else:
-                        fib_near_fg = "#666699"  # dim — approaching
+            anchor_low, anchor_high, _all_lvls, _rm, *_ = cached_fib
+            if anchor_low > 0 and anchor_high > 0:
+                ext_4236 = anchor_low + 4.236 * (anchor_high - anchor_low)
+                _f = lambda v: f"{v:.2f}" if v >= 1 else f"{v:.3f}"
+                fib_near_text = f"{_f(anchor_low)}-{_f(anchor_high)} ({_f(ext_4236)})"
+                if price >= ext_4236:
+                    fib_near_fg = "#ff44ff"  # above 4.236
+                elif price >= anchor_high:
+                    fib_near_fg = "#66cccc"  # between high and 4.236
+                elif price >= anchor_low:
+                    fib_near_fg = "#ccaa00"  # inside candle
+                else:
+                    fib_near_fg = "#666"  # below anchor
 
         return {
             'bg': bg, 'sym_text': sym_text, 'sym_fg': sym_fg,
@@ -9668,9 +9660,9 @@ class App:
                             bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
         news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Button-3>', _rclick)
 
-        fib_near_lbl = tk.Label(row1, text=rd.get('fib_near_text', ''), font=font_b,
-                                bg=rd['bg'], fg=rd.get('fib_near_fg', '#555'), width=8, anchor='w')
-        fib_near_lbl.pack(side='left'); fib_near_lbl.bind('<Button-1>', _click); fib_near_lbl.bind('<Button-3>', _rclick)
+        fib_near_lbl = tk.Label(row1, text=rd.get('fib_near_text', ''), font=font_r,
+                                bg=rd['bg'], fg=rd.get('fib_near_fg', '#555'), anchor='w')
+        fib_near_lbl.pack(side='left', padx=(2, 0)); fib_near_lbl.bind('<Button-1>', _click); fib_near_lbl.bind('<Button-3>', _rclick)
 
         # Fib row
         row2 = tk.Frame(parent, bg=rd['bg'])
@@ -11387,7 +11379,7 @@ class App:
         ff = self._table_font_var.get()
         fs = self._table_size_var.get()
         cols = [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7),
-                ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2), ("FIB", 8)]
+                ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2), ("FIB ANCHOR", 18)]
         for frame in (self._hdr_frame, self._hdr_frame_r):
             for w in frame.winfo_children():
                 w.destroy()
