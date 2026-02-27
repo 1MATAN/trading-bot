@@ -36,7 +36,6 @@ from tkinter import messagebox
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -47,7 +46,7 @@ import requests
 from PIL import Image, ImageFilter, ImageOps, ImageTk
 import pytesseract
 from bidi.algorithm import get_display as bidi_display
-from ib_insync import IB, Stock, LimitOrder, MarketOrder, StopOrder, ScannerSubscription, util as ib_util
+from ib_insync import IB, Stock, ScannerSubscription, util as ib_util
 from finvizfinance.quote import finvizfinance as Finviz
 from deep_translator import GoogleTranslator
 
@@ -55,26 +54,24 @@ from strategies.fibonacci_engine import (
     find_anchor_candle, build_dual_series, advance_series,
 )
 from strategies.fib_dt_live_strategy import (
-    FibDTLiveStrategySync, DTEntryRequest, DTTrailingExit, GapSignal,
+    FibDTLiveStrategySync, GapSignal,
 )
 from strategies.gap_go_live_strategy import (
-    GapGoLiveStrategy, GGCandidate, GGEntrySignal, GGExitSignal,
+    GapGoLiveStrategy, GGCandidate,
 )
 from strategies.momentum_ride_live_strategy import (
-    MomentumRideLiveStrategy, MRCandidate, MREntrySignal, MRExitSignal,
+    MomentumRideLiveStrategy, MRCandidate,
 )
 from strategies.float_turnover_live_strategy import (
-    FloatTurnoverLiveStrategy, FTCandidate, FTEntrySignal, FTExitSignal,
+    FloatTurnoverLiveStrategy, FTCandidate,
 )
 from monitor.order_thread import OrderThread
 from config.settings import (
-    FIB_LEVELS_24, FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
-    MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_CODE, MONITOR_SCAN_CODES, MONITOR_SCAN_MAX_RESULTS,
+    FIB_LEVEL_COLORS, IBKR_HOST, IBKR_PORT,
+    MONITOR_IBKR_CLIENT_ID, MONITOR_SCAN_MAX_RESULTS,
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT, ALERT_VWAP_MAX_BELOW_PCT,
-    FIB_DT_LIVE_STOP_PCT, FIB_DT_LIVE_TARGET_LEVELS,
     BRACKET_FIB_STOP_PCT, BRACKET_TRAILING_PROFIT_PCT, STOP_LIMIT_OFFSET_PCT,
-    STARTING_CAPITAL,
     GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_FIXED,
     GG_LIVE_MAX_POSITIONS, GG_MAX_HOLD_MINUTES,
     GG_LIVE_RVOL_MIN, GG_LIVE_REQUIRE_NEWS,
@@ -886,26 +883,6 @@ def _find_window_by_title(title: str) -> int | None:
     return None
 
 
-def add_scanner_source(wid: int, name: str = ""):
-    """Add a scanner source window to the first empty slot."""
-    if not name:
-        name = _get_window_name(wid)
-    with _scanner_sources_lock:
-        # Don't add duplicates
-        if any(s and s['wid'] == wid for s in _scanner_sources):
-            log.info(f"Scanner source WID {wid} already added")
-            return False
-        # Find first empty slot
-        for i in range(_MAX_SCANNER_SOURCES):
-            if _scanner_sources[i] is None:
-                _scanner_sources[i] = {'wid': wid, 'name': name}
-                active = sum(1 for s in _scanner_sources if s is not None)
-                log.info(f"Scanner source added: slot {i} WID={wid} name={name} (active: {active})")
-                return True
-        log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
-        return False
-
-
 def remove_scanner_source(idx: int):
     """Remove scanner source by slot index (0-based). Sets slot to None."""
     with _scanner_sources_lock:
@@ -915,12 +892,6 @@ def remove_scanner_source(idx: int):
             log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
         else:
             log.warning(f"Invalid or empty scanner source index: {idx}")
-
-
-def get_scanner_sources() -> list[dict]:
-    """Get active (non-None) scanner sources."""
-    with _scanner_sources_lock:
-        return [s for s in _scanner_sources if s is not None]
 
 
 def _capture_and_ocr(wid: int) -> str:
@@ -1533,46 +1504,6 @@ class StockHistory:
     def record(self, symbol: str, price: float, pct: float):
         self.data[symbol].append((datetime.now(), price, pct))
 
-    def get_momentum(self, symbol: str) -> dict:
-        """Calculate pct change over different time windows."""
-        pts = self.data.get(symbol, [])
-        if len(pts) < 2:
-            return {}
-
-        now_pct = pts[-1][2]
-        now_price = pts[-1][1]
-        momentum = {}
-
-        for label, minutes in [('1m', 1), ('5m', 5), ('15m', 15), ('30m', 30), ('1h', 60)]:
-            target_time = datetime.now() - timedelta(minutes=minutes)
-            # Find closest point to target_time
-            closest = min(pts, key=lambda x: abs((x[0] - target_time).total_seconds()))
-            age = abs((closest[0] - target_time).total_seconds())
-            # Only use if within 50% of the interval
-            if age < minutes * 30:
-                delta_pct = now_pct - closest[2]
-                delta_price = ((now_price - closest[1]) / closest[1] * 100) if closest[1] > 0 else 0
-                momentum[label] = {
-                    'pct_delta': delta_pct,
-                    'price_delta_pct': delta_price,
-                }
-
-        return momentum
-
-    def format_momentum(self, symbol: str) -> str:
-        """Format momentum as readable string."""
-        m = self.get_momentum(symbol)
-        if not m:
-            return ""
-        parts = []
-        for label in ['1m', '5m', '15m', '30m', '1h']:
-            if label in m:
-                d = m[label]['pct_delta']
-                arrow = "↑" if d > 0 else "↓" if d < 0 else "→"
-                parts.append(f"{label}:{arrow}{d:+.1f}%")
-        return "  ".join(parts)
-
-
 stock_history = StockHistory()
 
 
@@ -1802,10 +1733,6 @@ def _check_news_updates(current_stocks: dict, suppress_send: bool = False):
         if not suppress_send:
             btn = _make_lookup_button(sym)
             send_telegram_alert("\n".join(lines), reply_markup=btn)
-            # Push to GUI ALERTS panel
-            # GUI alert disabled — Telegram alerts only
-            # if _gui_alert_cb:
-            #     _gui_alert_cb(f"📰 NEWS — {sym} ({len(new_headlines)} headlines)")
         log.info(f"News alert: {sym} — {len(new_headlines)} new headlines{' (warmup)' if suppress_send else ''}")
 
     # Clean up symbols that dropped below threshold
@@ -4322,9 +4249,6 @@ _spark_bars_cache: dict[str, list[tuple]] = {}
 # Alert highlight: {sym: timestamp} — yellow bg for 60s after alert
 _alerted_at: dict[str, float] = {}
 
-# Global GUI alert callback — set by App, used by standalone functions
-# (stock reports, news alerts) to push alerts to GUI ALERTS panel.
-_gui_alert_cb: callable = None
 
 
 def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -> dict:
@@ -4495,66 +4419,6 @@ def _get_fresh_ma_rows(sym: str, price: float) -> list[dict] | None:
         return _calc_ma_table(price, ma_frames)
     # Fallback: cached ma_rows from enrichment
     return _enrichment.get(sym, {}).get('ma_rows')
-
-
-def _render_ma_overlay(ax, ma_rows: list[dict], current_price: float,
-                       ma_type: str, x_start: float, y_start: float):
-    """Render a compact MA table overlay on the chart axes.
-
-    ``ma_type``: 'sma' or 'ema' — which column to display.
-    ``x_start``, ``y_start``: top-left corner in axes coordinates.
-    """
-    green, red, grey = '#26a69a', '#ef5350', '#555'
-    periods = [9, 20, 50, 100, 200]
-    tf_order = ['1m', '5m', '15m', '30m', '1h', 'D']
-
-    ma_lookup = {}
-    for r in ma_rows:
-        ma_lookup[(r['tf'], r['period'])] = (r['sma'], r['ema'])
-
-    # Background box
-    from matplotlib.patches import FancyBboxPatch
-    box_w, box_h = 0.30, 0.44
-    bg = FancyBboxPatch((x_start - 0.005, y_start - box_h),
-                        box_w, box_h,
-                        boxstyle="round,pad=0.005",
-                        facecolor='#0e1117', edgecolor='#333',
-                        alpha=0.88, linewidth=0.5,
-                        transform=ax.transAxes, zorder=5)
-    ax.add_patch(bg)
-
-    z = 6  # zorder for text (above bg)
-    y = y_start - 0.015
-    lbl = ma_type.upper()
-    ax.text(x_start + box_w / 2, y, lbl, transform=ax.transAxes,
-            fontsize=7, fontweight='bold', color='#00d4ff',
-            ha='center', va='top', zorder=z)
-
-    # Column headers
-    col_offsets = [0.055, 0.105, 0.155, 0.21, 0.265]
-    y -= 0.025
-    for co, p in zip(col_offsets, periods):
-        ax.text(x_start + co, y, str(p), transform=ax.transAxes,
-                fontsize=5.5, fontweight='bold', color='#888',
-                ha='center', va='top', zorder=z)
-
-    # Data rows
-    key = 0 if ma_type == 'sma' else 1
-    for tf in tf_order:
-        y -= 0.023
-        ax.text(x_start + 0.005, y, tf, transform=ax.transAxes,
-                fontsize=5.5, fontweight='bold', color='#aaa',
-                va='top', zorder=z)
-        for co, p in zip(col_offsets, periods):
-            val = ma_lookup.get((tf, p), (None, None))[key]
-            if val is not None:
-                clr = green if current_price >= val else red
-                ax.text(x_start + co, y, f'{val:.2f}', transform=ax.transAxes,
-                        fontsize=5, color=clr, ha='center', va='top',
-                        fontfamily='monospace', zorder=z)
-            else:
-                ax.text(x_start + co, y, '—', transform=ax.transAxes,
-                        fontsize=5, color=grey, ha='center', va='top', zorder=z)
 
 
 def generate_fib_chart(sym: str, df: pd.DataFrame, all_levels: list[float],
@@ -7575,7 +7439,7 @@ class FTVirtualPortfolio:
 
 class ScannerThread(threading.Thread):
     def __init__(self, freq: int, price_min: float, price_max: float,
-                 on_status=None, on_stocks=None, on_alert=None,
+                 on_status=None, on_stocks=None,
                  on_price_update=None, order_thread=None):
         super().__init__(daemon=True)
         self.freq = freq
@@ -7583,7 +7447,6 @@ class ScannerThread(threading.Thread):
         self.price_max = price_max
         self.on_status = on_status
         self.on_stocks = on_stocks  # callback(dict) to update GUI table (full rebuild)
-        self.on_alert = on_alert    # callback(str) for alert messages
         self.on_price_update = on_price_update  # callback(dict) for in-place price updates
         self._order_thread = order_thread  # for Telegram trading buttons
         self.running = False
@@ -11420,10 +11283,6 @@ class App:
         self._render_stock_table()
         self._render_stock_table_r()
 
-    def _push_alert(self, msg: str):
-        """Alert stub — GUI alerts panel removed; Telegram-only alerts."""
-        pass
-
     def _pick_scanner(self, idx: int):
         """Let user click on a window to add as scanner source in slot idx."""
         self.status.set(f"Click on the scanner window for slot S{idx+1}...")
@@ -11478,13 +11337,9 @@ class App:
                 price_max=self.price_max.get(),
                 on_status=self._st,
                 on_stocks=self._update_stock_table,
-                on_alert=None,  # GUI alerts disabled — Telegram only
                 on_price_update=self._update_prices_inplace,
                 order_thread=self._order_thread,
             )
-            # GUI alerts disabled — Telegram alerts only
-            # global _gui_alert_cb
-            # _gui_alert_cb = self._push_alert
             self.scanner.start()
             self.btn.config(text="STOP", bg=self.RED)
             self.status.set("Scanner running...")

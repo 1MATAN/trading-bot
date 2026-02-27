@@ -70,18 +70,12 @@ SCAN_FLOAT_MAX = 60_000_000  # 60M shares
 SCAN_MOVE_PCT_MIN = 20.0  # start watching once stock moves 20%+ intraday
 SCAN_MAX_RESULTS = 50
 
-# ── VWAP ─────────────────────────────────────────────
-VWAP_ENABLED = True  # require price above VWAP for entry
-
 # ── SMA Settings ──────────────────────────────────────
 SMA_200_PERIODS = 200  # trend filter on 1-min, 5-min
 SMA_30M_PERIOD = 50  # 50 bars of 30-min = 25 hours ~ 3 trading days
 SMA_9_PERIOD = 9  # entry confirmation on 5-min
 SMA_20_PERIOD = 20  # exit signal on 1-min
 
-# ── Reversal Detection ────────────────────────────────
-REVERSAL_VWAP_PROXIMITY_PCT = 0.005   # within 0.5% of VWAP = "near VWAP"
-REVERSAL_FIB_PROXIMITY_PCT = 0.01     # within 1% of a fib level
 MA20_SLOPE_LOOKBACK = 5               # check MA20 slope over last 5 bars
 TRAILING_STOP_CANDLE_BUFFER = 0.001   # 0.1% below prev candle low
 
@@ -164,9 +158,6 @@ RE_ENTRY_COOLDOWN_BARS = 15      # wait ~30 min after exit
 TRAILING_STOP_INITIAL_PCT = 0.10  # 10% below entry as safety
 TRAILING_STOP_CHECK_INTERVAL = 2  # seconds between checks
 TRAILING_ATR_PERIOD = 14  # ATR lookback period
-TRAILING_ATR_MULTIPLIER = 2.0  # stop = highest_high - ATR * multiplier
-TRAILING_GRACE_BARS = 5  # don't check trailing for first N bars after entry
-
 # ── Market Hours (US/Eastern) ──────────────────────────
 TIMEZONE = "US/Eastern"
 PREMARKET_START = "04:00"
@@ -178,19 +169,14 @@ AFTERHOURS_END = "20:00"
 SCAN_INTERVAL_SECONDS = 30  # how often to scan for new candidates
 WATCHLIST_REFRESH_SECONDS = 60  # pre/after-market watchlist refresh
 
-# ── Dashboard ──────────────────────────────────────────
 DASHBOARD_PORT = 8501
-DASHBOARD_REFRESH_SECONDS = 5
 
 # ── Fibonacci Backtest ───────────────────────────────
-FIB_GAP_MIN_PCT = 10.0            # min gap % to qualify as gapper
-FIB_RETRACEMENT_RATIOS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618]
 FIB_STOP_BUFFER_PCT = 0.015       # 1.5% below entry for stop
 FIB_TARGET_LEVELS_ABOVE = 3       # take-profit 3 fib levels above entry
 FIB_MAX_ENTRIES_PER_DAY = 2       # max entries per gap day
 FIB_WARMUP_BARS = 15              # first 30 min (2-min bars) to establish gap high
 FIB_ENTRY_WINDOW_END = "15:00"    # no new entries after 3 PM ET
-FIB_PROXIMITY_PCT = 0.008         # 0.8% — "at a fib level" threshold
 FIB_GAP_LOOKBACK_DAYS = 30        # 30-day lookback for gap detection
 FIB_CHARTS_DIR = DATA_DIR / "fib_charts"
 FIB_CHARTS_DIR.mkdir(exist_ok=True)
@@ -222,10 +208,6 @@ FIB_CONFIRM_FLOAT_MAX = 60_000_000      # max float 60M shares
 FIB_CONFIRM_RVOL_MIN = 1.5             # minimum relative volume vs 14-day avg
 FIB_CONFIRM_SMA_SHORT = 20             # short SMA period for gate
 FIB_CONFIRM_SMA_LONG = 200             # long SMA period for gate
-
-# ── Bollinger Bands ──────────────────────────────────
-BB_PERIOD = 20                    # SMA period for middle band
-BB_STD = 2.0                      # standard deviations for upper/lower bands
 
 # ── Fibonacci Double-Touch Backtest ────────────────────
 FIB_DT_STOP_PCT = 0.04             # 4% below fib level (was 3%, too tight)
@@ -278,18 +260,9 @@ MR_LIVE_REQUIRE_NEWS = True           # require news catalyst
 MR_MIN_GAP_VOLUME = 10_000           # minimum gap-day volume
 MR_EXIT_BARS_IN_MINUTE = 3           # exit after 3 of 4 15s bars with no new high
 
-# ── Gap and Go Backtest ─────────────────────────────────
-GG_GAP_MIN_PCT = 15.0
-GG_PM_VOLUME_MIN = 350_000
-GG_RVOL_MIN = 2.0
-GG_PRICE_MIN = 0.10
-GG_PRICE_MAX = 15.0
-GG_FLOAT_MAX_M = 60               # millions
-GG_STOP_PCT = 0.04                # 4%
-GG_TARGET1_PCT = 0.10             # 10% (50% of position)
-GG_TARGET2_PCT = 0.20             # 20% (25% of position)
-GG_TRAIL_PCT = 0.05               # 5% trailing (last 25%)
-GG_ENTRY_AFTER_MINUTES = 5        # enter after 9:35
+# ── Gap and Go ────────────────────────────────────────
+GG_GAP_MIN_PCT = 15.0             # backtest min gap %
+GG_ENTRY_AFTER_MINUTES = 5        # enter after 9:35 (backtest)
 
 # ── Gap and Go LIVE ───────────────────────────────────
 GG_LIVE_GAP_MIN_PCT = 30.0
@@ -345,8 +318,6 @@ STRATEGY_DAILY_LOSS_LIMIT = 300.0      # $300 max realized loss per strategy per
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20
 MONITOR_ORDER_CLIENT_ID = 21   # separate IBKR connection for order execution
-MONITOR_SCAN_CODE = "TOP_PERC_GAIN"
-MONITOR_SCAN_CODES = ["TOP_PERC_GAIN", "HOT_BY_VOLUME", "MOST_ACTIVE"]
 MONITOR_SCAN_MAX_RESULTS = 50
 MONITOR_PRICE_MIN = 0.01
 MONITOR_PRICE_MAX = 20.00
