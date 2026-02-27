@@ -9230,17 +9230,17 @@ class App:
         self._portfolio_frame = tk.Frame(left_port, bg=self.BG)
         self._portfolio_frame.pack(fill='x', pady=1)
 
-        # Trades header
+        # Trades section (scrollable, last 3 days)
         trade_hdr = tk.Frame(left_port, bg=self.BG)
         trade_hdr.pack(fill='x', pady=(2, 0))
-        tk.Label(trade_hdr, text="עסקאות", font=("Helvetica", 10, "bold"),
-                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 6))
-        for text, w in [("תאריך", 6), ("שעה", 5), ("רובוט", 5), ("מניה", 6),
-                         ("כניסה", 7), ("יציאה", 7), ("ר/ה$", 8), ("ר/ה%", 6)]:
-            tk.Label(trade_hdr, text=text, font=("Courier", 9, "bold"),
+        tk.Label(trade_hdr, text="עסקאות אחרונות", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 6))
+        for text, w in [("שעה", 5), ("רובוט", 5), ("מניה", 6),
+                         ("כניסה", 7), ("יציאה", 7), ("ר/ה$", 9), ("ר/ה%", 7)]:
+            tk.Label(trade_hdr, text=text, font=("Courier", 10, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
         self._trades_frame = tk.Frame(left_port, bg=self.BG)
-        self._trades_frame.pack(fill='x', pady=1)
+        self._trades_frame.pack(fill='both', expand=True, pady=1)
 
         # 2px separator
         tk.Frame(bottom, bg='#444', width=2).pack(side='left', fill='y', padx=6)
@@ -9374,6 +9374,9 @@ class App:
 
         self._load()
         self.root.after(500, self._check_connection)
+        # Initial SPY chart and trades render
+        self.root.after(3000, self._render_spy_chart)
+        self.root.after(1500, self._render_recent_trades)
         # Auto-start scanner on launch
         self.root.after(1000, self._toggle)
 
@@ -9911,59 +9914,56 @@ class App:
             fg=pnl_fg)
 
     def _render_spy_chart(self):
-        """Render SPY intraday chart in the bottom-right panel."""
-        def _generate():
+        """Fetch SPY chart image from TradingView/Finviz and display."""
+        # Throttle: only refresh every 60s
+        now = time_mod.time()
+        if hasattr(self, '_spy_last_fetch') and now - self._spy_last_fetch < 60:
+            return
+        self._spy_last_fetch = now
+
+        def _fetch():
             try:
-                df = _download_intraday('SPY', bar_size='5 mins', duration='1 D')
-                if df is None or len(df) < 10:
-                    return
-                fig, ax = plt.subplots(figsize=(4.2, 1.8), facecolor='#0e1117')
-                ax.set_facecolor('#0e1117')
-                closes = df['close'].values
-                xs = range(len(closes))
-                color = '#26a69a' if closes[-1] >= closes[0] else '#ef5350'
-                ax.plot(xs, closes, color=color, linewidth=1.2)
-                ax.fill_between(xs, closes, closes.min(), alpha=0.15, color=color)
-                # Current price label
-                ax.text(len(closes) - 1, closes[-1], f" ${closes[-1]:.2f}",
-                        fontsize=8, color=color, va='center', fontfamily='monospace')
-                # Change %
-                chg = (closes[-1] / closes[0] - 1) * 100
-                chg_c = '#26a69a' if chg >= 0 else '#ef5350'
-                ax.set_title(f"SPY {chg:+.2f}%", fontsize=9, color=chg_c,
-                             loc='left', fontfamily='monospace', pad=2)
-                ax.tick_params(axis='both', colors='#555', labelsize=7)
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['left'].set_color('#333')
-                ax.spines['bottom'].set_color('#333')
-                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('$%.0f'))
-                fig.tight_layout(pad=0.3)
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=100, facecolor='#0e1117')
-                plt.close(fig)
-                buf.seek(0)
-                img = Image.open(buf)
+                # TradingView mini chart (public, no auth needed)
+                url = "https://s3.tradingview.com/tv.js"  # widget — won't work as image
+                # Use Finviz intraday chart (works reliably as static image)
+                url = f"https://finviz.com/chart.ashx?t=SPY&ty=c&ta=1&p=i5&s=l"
+                resp = requests.get(url, timeout=10, headers={
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+                })
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content))
+                log.info(f"SPY chart fetched: {img.size}")
                 self.root.after(0, lambda: self._show_spy_image(img))
             except Exception as e:
-                log.debug(f"SPY chart render: {e}")
-        threading.Thread(target=_generate, daemon=True).start()
+                log.warning(f"SPY chart fetch: {e}")
+                # Fallback: try StockCharts
+                try:
+                    url2 = "https://stockcharts.com/c-sc/sc?s=SPY&p=D&yr=0&mn=1&dy=0&id=p75498498580"
+                    resp2 = requests.get(url2, timeout=10, headers={
+                        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+                    })
+                    resp2.raise_for_status()
+                    img2 = Image.open(io.BytesIO(resp2.content))
+                    self.root.after(0, lambda: self._show_spy_image(img2))
+                except Exception as e2:
+                    log.warning(f"SPY chart fallback also failed: {e2}")
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _show_spy_image(self, img):
         """Display SPY chart image in the panel."""
         try:
             w = self._spy_chart_label.winfo_width() or 400
-            h = self._spy_chart_label.winfo_height() or 160
+            h = self._spy_chart_label.winfo_height() or 180
             if w > 10 and h > 10:
                 img = img.resize((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._spy_chart_image = photo
             self._spy_chart_label.config(image=photo)
         except Exception as e:
-            log.debug(f"SPY image display: {e}")
+            log.warning(f"SPY image display: {e}")
 
     def _render_recent_trades(self):
-        """Show last trades from the journal with Hebrew labels."""
+        """Show trades from the last 3 days, grouped by date, bigger font."""
         for w in self._trades_frame.winfo_children():
             w.destroy()
 
@@ -9973,63 +9973,97 @@ class App:
             trades = []
 
         if not trades:
-            tk.Label(self._trades_frame, text="אין עסקאות", font=("Courier", 9),
+            tk.Label(self._trades_frame, text="אין עסקאות", font=("Courier", 11),
                      bg=self.BG, fg='#555').pack(anchor='w')
             return
 
-        # Robot short names in Hebrew
         _robot_short = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנ', 'FT': 'סיבב'}
+        _day_names = {0: 'ב׳', 1: 'ג׳', 2: 'ד׳', 3: 'ה׳', 4: 'ו׳', 5: 'שבת', 6: 'א׳'}
 
-        # Take last 10 trades (newest first)
-        recent = list(reversed(trades))[:10]
+        # Group by date (last 3 unique dates)
+        from collections import OrderedDict
+        by_date = OrderedDict()
+        for t in reversed(trades):
+            d = t.get('date', '')
+            if d not in by_date:
+                by_date[d] = []
+            by_date[d].append(t)
 
-        for i, t in enumerate(recent):
-            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
-            row = tk.Frame(self._trades_frame, bg=row_bg)
-            row.pack(fill='x')
+        # Take last 3 dates
+        dates_to_show = list(by_date.keys())[:3]
+        row_idx = 0
 
-            # Date (dd/mm)
-            date_str = t.get('date', '')
-            date_short = date_str[:5] if date_str else '-'
-            tk.Label(row, text=date_short, font=("Courier", 9),
-                     bg=row_bg, fg='#888', width=6, anchor='w').pack(side='left')
+        for date_key in dates_to_show:
+            day_trades = by_date[date_key]
 
-            # Time
-            exit_t = t.get('exit_time', '')
-            tk.Label(row, text=exit_t or '-', font=("Courier", 9),
-                     bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
+            # Day P&L summary
+            day_pnl = sum(t.get('pnl', 0) for t in day_trades)
+            day_pnl_fg = self.GREEN if day_pnl >= 0 else self.RED
 
-            # Robot (Hebrew short)
-            robot = t.get('robot', '?')
-            robot_he = _robot_short.get(robot, robot[:4])
-            tk.Label(row, text=robot_he, font=("Courier", 9),
-                     bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
+            # Parse day name
+            day_label = date_key
+            try:
+                from datetime import datetime as _dt
+                parts = date_key.split('/')
+                if len(parts) == 3:
+                    parsed = _dt(int(parts[2]), int(parts[1]), int(parts[0]))
+                    day_label = f"{_day_names.get(parsed.weekday(), '')} {date_key[:5]}"
+            except Exception:
+                pass
 
-            # Symbol
-            sym = t.get('symbol', '?')
-            tk.Label(row, text=sym, font=("Courier", 9, "bold"),
-                     bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
+            # Date header row
+            hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
+            hdr.pack(fill='x', pady=(3, 0))
+            tk.Label(hdr, text=f"  {day_label}", font=("Helvetica", 10, "bold"),
+                     bg='#1a1a3e', fg='#00d4ff').pack(side='left')
+            tk.Label(hdr, text=f"  {len(day_trades)} עסקאות",
+                     font=("Helvetica", 9), bg='#1a1a3e', fg='#888').pack(side='left', padx=6)
+            tk.Label(hdr, text=f"${day_pnl:+,.2f}",
+                     font=("Courier", 10, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=6)
 
-            # Entry price
-            entry_p = t.get('entry_price', 0)
-            tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 9),
-                     bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
+            # Trade rows for this date
+            for t in day_trades:
+                row_bg = self.ROW_BG if row_idx % 2 == 0 else self.ROW_ALT
+                row = tk.Frame(self._trades_frame, bg=row_bg)
+                row.pack(fill='x')
+                row_idx += 1
 
-            # Exit price
-            exit_p = t.get('exit_price', 0)
-            tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 9),
-                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+                # Time
+                exit_t = t.get('exit_time', '')
+                tk.Label(row, text=exit_t or '-', font=("Courier", 10),
+                         bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
 
-            # P&L $
-            pnl = t.get('pnl', 0)
-            pnl_fg = self.GREEN if pnl >= 0 else self.RED
-            tk.Label(row, text=f"${pnl:+.2f}", font=("Courier", 9, "bold"),
-                     bg=row_bg, fg=pnl_fg, width=8, anchor='w').pack(side='left')
+                # Robot (Hebrew short)
+                robot = t.get('robot', '?')
+                robot_he = _robot_short.get(robot, robot[:4])
+                tk.Label(row, text=robot_he, font=("Courier", 10),
+                         bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
 
-            # P&L %
-            pnl_pct = t.get('pnl_pct', 0)
-            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 9, "bold"),
-                     bg=row_bg, fg=pnl_fg, width=6, anchor='w').pack(side='left')
+                # Symbol
+                sym = t.get('symbol', '?')
+                tk.Label(row, text=sym, font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
+
+                # Entry price
+                entry_p = t.get('entry_price', 0)
+                tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 10),
+                         bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
+
+                # Exit price
+                exit_p = t.get('exit_price', 0)
+                tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 10),
+                         bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+
+                # P&L $
+                pnl = t.get('pnl', 0)
+                pnl_fg = self.GREEN if pnl >= 0 else self.RED
+                tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=pnl_fg, width=9, anchor='w').pack(side='left')
+
+                # P&L %
+                pnl_pct = t.get('pnl_pct', 0)
+                tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 10, "bold"),
+                         bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
