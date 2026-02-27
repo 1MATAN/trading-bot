@@ -817,10 +817,10 @@ def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
 #  Webull Desktop OCR Scanner
 # ══════════════════════════════════════════════════════════
 
-# Multi-scanner sources: up to 3 user-picked windows for OCR scanning
-_scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 3
+# Multi-scanner sources: up to 4 user-picked windows for OCR scanning
+_scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 4
 _scanner_sources_lock = threading.Lock()
-_MAX_SCANNER_SOURCES = 3
+_MAX_SCANNER_SOURCES = 4
 _ocr_capture_lock = threading.Lock()  # prevent simultaneous OCR captures
 
 
@@ -1463,6 +1463,18 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
             if d.get('pct', 0) == 0 and prev_close > 0 and price > 0:
                 d['pct'] = round((price - prev_close) / prev_close * 100, 1)
             d['contract'] = contract
+            # Fetch 5-min bars for sparkline (24h including extended hours)
+            if sym not in _spark_bars_cache:
+                try:
+                    spark_bars = ib.reqHistoricalData(
+                        contract, endDateTime="", durationStr="1 D",
+                        barSizeSetting="5 mins", whatToShow="TRADES",
+                        useRTH=False, timeout=10,
+                    )
+                    if spark_bars:
+                        _spark_bars_cache[sym] = [(b.close, b.volume) for b in spark_bars]
+                except Exception:
+                    pass
             # Seed running alert trackers with IBKR accurate data
             if day_high > _running_high.get(sym, 0):
                 _running_high[sym] = day_high
@@ -4178,6 +4190,10 @@ def check_timeframe_high_break(sym: str, price: float, pct: float) -> tuple[str,
 _enrichment: dict[str, dict] = {}
 _enrichment_ts: dict[str, float] = {}   # symbol → time.time() when enriched
 ENRICHMENT_TTL_SECS = 30 * 60           # 30 minutes
+# Sparkline: 5-min bars cache {sym: [(close, volume), ...]}
+_spark_bars_cache: dict[str, list[tuple]] = {}
+# Alert highlight: {sym: timestamp} — yellow bg for 60s after alert
+_alerted_at: dict[str, float] = {}
 
 # Global GUI alert callback — set by App, used by standalone functions
 # (stock reports, news alerts) to push alerts to GUI ALERTS panel.
@@ -8743,6 +8759,7 @@ class ScannerThread(threading.Thread):
                 _alerts_per_stock[sym][counter_name] = _alerts_per_stock[sym].get(counter_name, 0) + 1
                 if sym not in batch_syms:
                     batch_syms.append(sym)
+                _alerted_at[sym] = time_mod.time()
 
             for sym, d in current.items():
                 if sym not in _enrichment:
@@ -8917,13 +8934,17 @@ class App:
     def __init__(self):
         self.scanner = None
         self._stock_data: dict = {}  # current scan results for table display
-        self._filter_20pct: bool = False  # show top 10 by pct (no 20% filter)
         self._selected_symbol_name: str | None = None
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
         self._cached_positions: dict[str, tuple] = {}  # {sym: (qty, avgCost, mktPrice, pnl)}
+        # Scanner 1 (left) widgets
         self._row_widgets: dict[str, dict] = {}   # sym → cached label widgets
         self._rendered_order: list[str] = []       # last symbol render order
+        # Scanner 2 (right) widgets
+        self._row_widgets_r: dict[str, dict] = {}
+        self._rendered_order_r: list[str] = []
+        # Portfolio widgets
         self._portfolio_widgets: dict[str, dict] = {}  # sym → cached portfolio widgets
         self._portfolio_order: list[str] = []
         # Separate order thread — starts immediately, independent of scanner
@@ -8938,7 +8959,7 @@ class App:
 
         self.root = tk.Tk()
         self.root.title("IBKR Scanner Monitor")
-        self.root.geometry("1400x900")
+        self.root.geometry("1600x950")
         self.root.attributes('-topmost', True)
         self.root.configure(bg=self.BG, highlightbackground=self.ACCENT,
                             highlightcolor=self.ACCENT, highlightthickness=2)
@@ -8947,8 +8968,6 @@ class App:
         # Font settings (user-configurable)
         self._table_font_var = tk.StringVar(value="Courier")
         self._table_size_var = tk.IntVar(value=14)
-        self._alerts_font_var = tk.StringVar(value="Courier")
-        self._alerts_size_var = tk.IntVar(value=12)
 
         # Header
         hdr = tk.Frame(self.root, bg=self.BG)
@@ -8956,7 +8975,13 @@ class App:
         tk.Label(hdr, text="IBKR SCANNER", font=("Helvetica", 20, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(side='left')
 
-        # Connection status (inline with header)
+        # Account summary (inline with header)
+        self._hdr_account_var = tk.StringVar(value="")
+        tk.Label(hdr, textvariable=self._hdr_account_var,
+                 font=("Courier", 12, "bold"), bg=self.BG, fg="#aaa"
+                 ).pack(side='left', padx=(20, 0))
+
+        # Connection status (inline with header, right side)
         self.conn_var = tk.StringVar(value="Checking...")
         self.conn_label = tk.Label(hdr, textvariable=self.conn_var,
                                    font=("Courier", 13, "bold"), bg=self.BG, fg="#888")
@@ -8964,50 +8989,42 @@ class App:
 
         tk.Frame(self.root, bg=self.ACCENT, height=1).pack(fill='x', padx=10, pady=3)
 
-        # ── Main content: left (stocks+portfolio) + right (alerts) ──
+        # ── Scanner range variables ──
+        self._scan1_min_pct = tk.DoubleVar(value=20.0)
+        self._scan1_max_pct = tk.DoubleVar(value=200.0)
+        self._scan2_min_pct = tk.DoubleVar(value=10.0)
+        self._scan2_max_pct = tk.DoubleVar(value=20.0)
+
+        # ── Main content: dual scanners side-by-side ──
         content = tk.Frame(self.root, bg=self.BG)
         content.pack(fill='both', expand=True, padx=10, pady=2)
 
-        # Right panel: Alerts (fixed width, packed first for right alignment)
-        right_panel = tk.Frame(content, bg="#111122", width=360)
-        right_panel.pack(side='right', fill='y', padx=(4, 0))
-        right_panel.pack_propagate(False)
+        # ── Scanner 1 (left) ──
+        left_scanner = tk.Frame(content, bg=self.BG)
+        left_scanner.pack(side='left', fill='both', expand=True)
 
-        tk.Label(right_panel, text=" ALERTS", font=("Helvetica", 13, "bold"),
-                 bg="#111122", fg=self.ACCENT, anchor='w').pack(fill='x', pady=(4, 2))
+        scan1_hdr = tk.Frame(left_scanner, bg=self.BG)
+        scan1_hdr.pack(fill='x', pady=(0, 2))
+        tk.Label(scan1_hdr, text="SCANNER 1", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left')
+        tk.Label(scan1_hdr, text="Min%:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(8, 2))
+        tk.Spinbox(scan1_hdr, from_=0, to=500, increment=5, textvariable=self._scan1_min_pct,
+                   width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(0, 4))
+        tk.Label(scan1_hdr, text="Max%:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(4, 2))
+        tk.Spinbox(scan1_hdr, from_=0, to=1000, increment=10, textvariable=self._scan1_max_pct,
+                   width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(0, 4))
 
-        self._alerts_text = tk.Text(
-            right_panel, bg="#111122", fg="#e0e0e0",
-            font=(self._alerts_font_var.get(), self._alerts_size_var.get()),
-            wrap='word', state='disabled', bd=0, highlightthickness=0,
-            padx=6, pady=4, cursor='arrow',
-        )
-        self._alerts_text.pack(fill='both', expand=True)
-        self._alerts_text.tag_configure('hod', foreground='#ff6600')
-        self._alerts_text.tag_configure('fib', foreground='#66cccc')
-        self._alerts_text.tag_configure('lod', foreground='#ffcc00')
-        self._alerts_text.tag_configure('vwap', foreground='#00d4ff')
-        self._alerts_text.tag_configure('spike', foreground='#ff4444')
-        self._alerts_text.tag_configure('report', foreground='#00c853')
-        self._alerts_text.tag_configure('default', foreground='#e0e0e0')
-
-        # Vertical separator
-        tk.Frame(content, bg="#444", width=1).pack(side='right', fill='y', padx=2)
-
-        # Left panel: stocks + portfolio
-        left_panel = tk.Frame(content, bg=self.BG)
-        left_panel.pack(side='left', fill='both', expand=True)
-
-        # Column headers
-        self._hdr_frame = tk.Frame(left_panel, bg=self.BG)
+        self._hdr_frame = tk.Frame(left_scanner, bg=self.BG)
         self._hdr_frame.pack(fill='x')
-        self._rebuild_column_headers()
 
-        # Scrollable stock list
-        list_frame = tk.Frame(left_panel, bg=self.BG)
+        list_frame = tk.Frame(left_scanner, bg=self.BG)
         list_frame.pack(fill='both', expand=True, pady=1)
 
-        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0, height=200)
+        self.canvas = tk.Canvas(list_frame, bg=self.BG, highlightthickness=0)
         scrollbar = tk.Scrollbar(list_frame, orient='vertical', command=self.canvas.yview)
         self.stock_frame = tk.Frame(self.canvas, bg=self.BG)
 
@@ -9019,29 +9036,133 @@ class App:
         self.canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        # Mousewheel scrolling
-        def _on_mousewheel(event):
+        def _on_mousewheel_l(event):
             self.canvas.yview_scroll(-1 * (event.delta // 120 or (1 if event.num == 4 else -1)), "units")
-        self.canvas.bind('<Button-4>', _on_mousewheel)
-        self.canvas.bind('<Button-5>', _on_mousewheel)
-        self.stock_frame.bind('<Button-4>', _on_mousewheel)
-        self.stock_frame.bind('<Button-5>', _on_mousewheel)
+        self.canvas.bind('<Button-4>', _on_mousewheel_l)
+        self.canvas.bind('<Button-5>', _on_mousewheel_l)
+        self.stock_frame.bind('<Button-4>', _on_mousewheel_l)
+        self.stock_frame.bind('<Button-5>', _on_mousewheel_l)
 
-        # ── Portfolio Panel ──
-        tk.Frame(left_panel, bg="#444", height=1).pack(fill='x', pady=2)
-        port_hdr = tk.Frame(left_panel, bg=self.BG)
-        port_hdr.pack(fill='x')
-        tk.Label(port_hdr, text="Portfolio", font=("Helvetica", 12, "bold"),
-                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 10))
-        for text, w in [("SYM", 6), ("QTY", 6), ("AVG", 7), ("PRICE", 7), ("P&L", 9), ("P&L%", 6)]:
-            tk.Label(port_hdr, text=text, font=("Courier", 12, "bold"),
+        # ── Separator ──
+        tk.Frame(content, bg=self.ACCENT, width=2).pack(side='left', fill='y', padx=4)
+
+        # ── Scanner 2 (right) ──
+        right_scanner = tk.Frame(content, bg=self.BG)
+        right_scanner.pack(side='right', fill='both', expand=True)
+
+        scan2_hdr = tk.Frame(right_scanner, bg=self.BG)
+        scan2_hdr.pack(fill='x', pady=(0, 2))
+        tk.Label(scan2_hdr, text="SCANNER 2", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left')
+        tk.Label(scan2_hdr, text="Min%:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(8, 2))
+        tk.Spinbox(scan2_hdr, from_=0, to=500, increment=5, textvariable=self._scan2_min_pct,
+                   width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(0, 4))
+        tk.Label(scan2_hdr, text="Max%:", font=("Helvetica", 10),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(4, 2))
+        tk.Spinbox(scan2_hdr, from_=0, to=1000, increment=10, textvariable=self._scan2_max_pct,
+                   width=4, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
+                   buttonbackground=self.ROW_BG, relief='flat').pack(side='left', padx=(0, 4))
+
+        self._hdr_frame_r = tk.Frame(right_scanner, bg=self.BG)
+        self._hdr_frame_r.pack(fill='x')
+
+        list_frame_r = tk.Frame(right_scanner, bg=self.BG)
+        list_frame_r.pack(fill='both', expand=True, pady=1)
+
+        self.canvas_r = tk.Canvas(list_frame_r, bg=self.BG, highlightthickness=0)
+        scrollbar_r = tk.Scrollbar(list_frame_r, orient='vertical', command=self.canvas_r.yview)
+        self.stock_frame_r = tk.Frame(self.canvas_r, bg=self.BG)
+
+        self.stock_frame_r.bind('<Configure>',
+            lambda e: self.canvas_r.configure(scrollregion=self.canvas_r.bbox('all')))
+        self.canvas_r.create_window((0, 0), window=self.stock_frame_r, anchor='nw')
+        self.canvas_r.configure(yscrollcommand=scrollbar_r.set)
+
+        self.canvas_r.pack(side='left', fill='both', expand=True)
+        scrollbar_r.pack(side='right', fill='y')
+
+        def _on_mousewheel_r(event):
+            self.canvas_r.yview_scroll(-1 * (event.delta // 120 or (1 if event.num == 4 else -1)), "units")
+        self.canvas_r.bind('<Button-4>', _on_mousewheel_r)
+        self.canvas_r.bind('<Button-5>', _on_mousewheel_r)
+        self.stock_frame_r.bind('<Button-4>', _on_mousewheel_r)
+        self.stock_frame_r.bind('<Button-5>', _on_mousewheel_r)
+
+        self._rebuild_column_headers()
+
+        # ── Bottom Panel: Portfolio + Account + Trades ──
+        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
+        bottom = tk.Frame(self.root, bg=self.BG, height=200)
+        bottom.pack(fill='x', padx=10, pady=2)
+        bottom.pack_propagate(True)
+
+        # Left side: account summary + IBKR positions
+        left_port = tk.Frame(bottom, bg=self.BG)
+        left_port.pack(side='left', fill='both', expand=True)
+
+        # Account summary row
+        acct_row = tk.Frame(left_port, bg=self.BG)
+        acct_row.pack(fill='x')
+        tk.Label(acct_row, text="ACCOUNT", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 8))
+        self._acct_nlv_lbl = tk.Label(acct_row, text="NLV: ---", font=("Courier", 11),
+                                      bg=self.BG, fg=self.FG)
+        self._acct_nlv_lbl.pack(side='left', padx=(0, 10))
+        self._acct_bp_lbl = tk.Label(acct_row, text="BP: ---", font=("Courier", 11),
+                                     bg=self.BG, fg=self.FG)
+        self._acct_bp_lbl.pack(side='left', padx=(0, 10))
+        self._acct_pos_lbl = tk.Label(acct_row, text="Pos: 0", font=("Courier", 11),
+                                      bg=self.BG, fg=self.FG)
+        self._acct_pos_lbl.pack(side='left', padx=(0, 10))
+        self._acct_pnl_lbl = tk.Label(acct_row, text="P&L: ---", font=("Courier", 11, "bold"),
+                                      bg=self.BG, fg='#888')
+        self._acct_pnl_lbl.pack(side='left')
+
+        # Positions header
+        port_hdr = tk.Frame(left_port, bg=self.BG)
+        port_hdr.pack(fill='x', pady=(2, 0))
+        tk.Label(port_hdr, text="POSITIONS", font=("Helvetica", 10, "bold"),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 8))
+        for text, w in [("SYM", 6), ("QTY", 5), ("AVG", 7), ("PRICE", 7), ("P&L", 9), ("P&L%", 6)]:
+            tk.Label(port_hdr, text=text, font=("Courier", 10, "bold"),
                      bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
-        self._portfolio_frame = tk.Frame(left_panel, bg=self.BG)
+        self._portfolio_frame = tk.Frame(left_port, bg=self.BG)
         self._portfolio_frame.pack(fill='x', pady=1)
-        tk.Frame(left_panel, bg="#444", height=1).pack(fill='x', pady=2)
 
-        # ── Trading Panel ──
-        self._build_trading_panel()
+        # 2px separator
+        tk.Frame(bottom, bg='#444', width=2).pack(side='left', fill='y', padx=6)
+
+        # Right side: virtual robots summary + recent trades
+        right_port = tk.Frame(bottom, bg=self.BG, width=500)
+        right_port.pack(side='right', fill='both')
+        right_port.pack_propagate(True)
+
+        # Virtual robot summary
+        robot_hdr = tk.Frame(right_port, bg=self.BG)
+        robot_hdr.pack(fill='x')
+        tk.Label(robot_hdr, text="ROBOTS", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 8))
+        for text, w in [("ROBOT", 8), ("CASH", 7), ("POS", 4), ("NLV", 7), ("P&L%", 7)]:
+            tk.Label(robot_hdr, text=text, font=("Courier", 10, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        self._robot_summary_frame = tk.Frame(right_port, bg=self.BG)
+        self._robot_summary_frame.pack(fill='x', pady=1)
+
+        # Recent trades header
+        trade_hdr = tk.Frame(right_port, bg=self.BG)
+        trade_hdr.pack(fill='x', pady=(4, 0))
+        tk.Label(trade_hdr, text="RECENT TRADES", font=("Helvetica", 10, "bold"),
+                 bg=self.BG, fg="#888").pack(side='left', padx=(0, 8))
+        for text, w in [("TIME", 6), ("BOT", 5), ("SYM", 6), ("SIDE", 4), ("QTY", 4), ("PRC", 7), ("P&L", 8)]:
+            tk.Label(trade_hdr, text=text, font=("Courier", 9, "bold"),
+                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        self._trades_frame = tk.Frame(right_port, bg=self.BG)
+        self._trades_frame.pack(fill='x', pady=1)
+
+        # Init trading variables (no GUI panel — right-click menu instead)
+        self._init_trading_vars()
 
         tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
 
@@ -9101,15 +9222,9 @@ class App:
                 command=lambda idx=i: self._clear_scanner(idx), relief='flat', padx=2, pady=0,
             ).pack(side='left', padx=(0, 4))
 
-        # Filter toggle + Sound controls + Start/Stop row
+        # Sound controls + Font + Start/Stop row
         ctrl_row = tk.Frame(self.root, bg=self.BG)
         ctrl_row.pack(fill='x', padx=10, pady=(4, 0))
-        self._filter_btn = tk.Button(
-            ctrl_row, text="TOP10", font=("Helvetica", 11, "bold"),
-            bg="#553333", fg="#aaa", relief='flat', padx=6, pady=2,
-            command=self._toggle_filter,
-        )
-        self._filter_btn.pack(side='left', padx=(0, 6))
 
         # Sound mute toggle
         self._sound_muted = False
@@ -9152,20 +9267,6 @@ class App:
                    buttonbackground=self.ROW_BG, relief='flat',
                    command=self._apply_table_font).pack(side='left', padx=(0, 4))
 
-        # Font controls: Alerts font
-        tk.Label(ctrl_row, text="Alerts:", font=("Helvetica", 10),
-                 bg=self.BG, fg="#888").pack(side='left')
-        self._alrt_font_menu = tk.OptionMenu(
-            ctrl_row, self._alerts_font_var, *_fonts,
-            command=lambda _: self._apply_alerts_font())
-        self._alrt_font_menu.config(font=("Helvetica", 9), bg=self.ROW_BG, fg=self.FG,
-                                     highlightthickness=0, relief='flat', width=8)
-        self._alrt_font_menu.pack(side='left', padx=(1, 2))
-        tk.Spinbox(ctrl_row, from_=8, to=22, textvariable=self._alerts_size_var,
-                   width=2, font=("Helvetica", 10), bg=self.ROW_BG, fg=self.FG,
-                   buttonbackground=self.ROW_BG, relief='flat',
-                   command=self._apply_alerts_font).pack(side='left', padx=(0, 4))
-
         self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 16, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
                              relief='flat', activebackground="#00a844")
@@ -9176,8 +9277,6 @@ class App:
         tk.Label(self.root, textvariable=self.status, font=("Courier", 11),
                  bg=self.BG, fg="#888", wraplength=1000, justify='left'
                  ).pack(padx=10, pady=1, anchor='w')
-
-        # (Alerts panel is in right_panel above)
 
         self._load()
         self.root.after(500, self._check_connection)
@@ -9219,16 +9318,15 @@ class App:
         """
         def _do():
             for sym, (price, pct) in changes.items():
-                w = self._row_widgets.get(sym)
-                if not w:
-                    continue
-                # Update price label
-                price_text = f"${price:.2f}" if price >= 1 else f"${price:.4f}"
-                w['price_lbl'].config(text=price_text)
-                # Update pct label
-                pct_text = f"{pct:+.1f}%"
-                pct_fg = self.GREEN if pct >= 0 else self.RED
-                w['pct_lbl'].config(text=pct_text, fg=pct_fg)
+                for widgets in (self._row_widgets, self._row_widgets_r):
+                    w = widgets.get(sym)
+                    if not w:
+                        continue
+                    price_text = f"${price:.2f}" if price >= 1 else f"${price:.4f}"
+                    w['price_lbl'].config(text=price_text)
+                    pct_text = f"{pct:+.1f}%"
+                    pct_fg = self.GREEN if pct >= 0 else self.RED
+                    w['pct_lbl'].config(text=pct_text, fg=pct_fg)
             # Update trade price for selected stock
             sel = self._selected_symbol_name
             if sel and sel in changes:
@@ -9238,12 +9336,24 @@ class App:
     def _update_stock_table(self, stocks: dict):
         """Update the stock table in the GUI (called from scanner thread)."""
         self._stock_data = stocks
+        self._accumulate_spark_data()
         self.root.after(0, self._render_stock_table)
+        self.root.after(0, self._render_stock_table_r)
+        self.root.after(0, self._render_robot_summary)
+        self.root.after(0, self._render_recent_trades)
 
     def _compute_row_data(self, sym: str, d: dict, idx: int) -> dict:
         """Compute display values for a stock row."""
         is_selected = (sym == self._selected_symbol_name)
-        bg = self.SELECTED_BG if is_selected else (self.ROW_BG if idx % 2 == 0 else self.ROW_ALT)
+        # Yellow background if alerted in last 60 seconds
+        alert_ts = _alerted_at.get(sym, 0)
+        is_alerted = (time_mod.time() - alert_ts) < 60 if alert_ts else False
+        if is_selected:
+            bg = self.SELECTED_BG
+        elif is_alerted:
+            bg = "#3d3d1a"  # dark yellow tint
+        else:
+            bg = self.ROW_BG if idx % 2 == 0 else self.ROW_ALT
         enrich = d.get('enrich', {})
 
         vol_raw = d.get('volume_raw', 0)
@@ -9251,8 +9361,17 @@ class App:
         turnover = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
         is_hot = turnover >= 10.0  # volume > 10% of float
 
+        # Symbol color: hot → orange, above VWAP → green, else white
+        vwap = d.get('vwap', 0)
+        price = d.get('price', 0)
+        above_vwap = vwap > 0 and price > vwap
         sym_text = f"🔥{sym}" if is_hot else sym
-        sym_fg = "#ff6600" if is_hot else self.FG
+        if is_hot:
+            sym_fg = "#ff6600"
+        elif above_vwap:
+            sym_fg = self.GREEN
+        else:
+            sym_fg = self.FG
 
         pct = d['pct']
         pct_color = self.GREEN if pct > 0 else self.RED if pct < 0 else self.FG
@@ -9327,70 +9446,72 @@ class App:
             'news_headlines': news_headlines,
         }
 
-    def _build_stock_row(self, sym: str, rd: dict) -> dict:
+    def _build_stock_row(self, sym: str, rd: dict, parent: tk.Frame = None) -> dict:
         """Create widget row for a stock and return widget refs."""
+        parent = parent or self.stock_frame
         ff = self._table_font_var.get()
         fs = self._table_size_var.get()
         font_b = (ff, fs, "bold")
         font_r = (ff, fs)
         _click = lambda e, s=sym: self._select_stock(s)
-        _dbl_click = lambda e, s=sym: self._open_tradingview(s)
+        _dbl_click = lambda e, s=sym: self._open_stock_detail(s)
 
-        row1 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        _rclick = lambda e, s=sym: self._on_stock_right_click(s, e)
+
+        row1 = tk.Frame(parent, bg=rd['bg'])
         row1.pack(fill='x', pady=0)
         row1.bind('<Button-1>', _click)
         row1.bind('<Double-Button-1>', _dbl_click)
+        row1.bind('<Button-3>', _rclick)
+
+        # Sparkline mini-chart
+        spark_w, spark_h = 60, 18
+        spark_canvas = tk.Canvas(row1, width=spark_w, height=spark_h,
+                                 bg=rd['bg'], highlightthickness=0)
+        spark_canvas.pack(side='left', padx=(2, 2))
+        spark_canvas.bind('<Button-1>', _click)
+        spark_canvas.bind('<Button-3>', _rclick)
+        self._draw_sparkline(spark_canvas, sym, spark_w, spark_h)
 
         sym_lbl = tk.Label(row1, text=rd['sym_text'], font=font_b,
-                           bg=rd['bg'], fg=rd['sym_fg'], width=8, anchor='w')
-        sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click)
+                           bg=rd['bg'], fg=rd['sym_fg'], width=7, anchor='w')
+        sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click); sym_lbl.bind('<Double-Button-1>', _dbl_click); sym_lbl.bind('<Button-3>', _rclick)
 
         price_lbl = tk.Label(row1, text=rd['price_text'], font=font_r,
                              bg=rd['bg'], fg=self.FG, width=8, anchor='w')
-        price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click); price_lbl.bind('<Double-Button-1>', _dbl_click)
+        price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click); price_lbl.bind('<Double-Button-1>', _dbl_click); price_lbl.bind('<Button-3>', _rclick)
 
         pct_lbl = tk.Label(row1, text=rd['pct_text'], font=font_b,
                            bg=rd['bg'], fg=rd['pct_fg'], width=8, anchor='w')
-        pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click); pct_lbl.bind('<Double-Button-1>', _dbl_click)
+        pct_lbl.pack(side='left'); pct_lbl.bind('<Button-1>', _click); pct_lbl.bind('<Button-3>', _rclick)
 
         vol_lbl = tk.Label(row1, text=rd['vol_text'], font=font_r,
                            bg=rd['bg'], fg=rd['vol_fg'], width=7, anchor='w')
-        vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click); vol_lbl.bind('<Double-Button-1>', _dbl_click)
+        vol_lbl.pack(side='left'); vol_lbl.bind('<Button-1>', _click); vol_lbl.bind('<Button-3>', _rclick)
 
         rvol_lbl = tk.Label(row1, text=rd['rvol_text'], font=font_b,
                             bg=rd['bg'], fg=rd['rvol_fg'], width=6, anchor='w')
-        rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click); rvol_lbl.bind('<Double-Button-1>', _dbl_click)
+        rvol_lbl.pack(side='left'); rvol_lbl.bind('<Button-1>', _click); rvol_lbl.bind('<Button-3>', _rclick)
 
         vwap_lbl = tk.Label(row1, text=rd.get('vwap_text', '—'), font=font_r,
                             bg=rd['bg'], fg=rd.get('vwap_fg', '#555'), width=7, anchor='w')
-        vwap_lbl.pack(side='left'); vwap_lbl.bind('<Button-1>', _click); vwap_lbl.bind('<Double-Button-1>', _dbl_click)
+        vwap_lbl.pack(side='left'); vwap_lbl.bind('<Button-1>', _click); vwap_lbl.bind('<Button-3>', _rclick)
 
         float_lbl = tk.Label(row1, text=rd['float_text'], font=font_r,
                              bg=rd['bg'], fg="#cca0ff", width=7, anchor='w')
-        float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click); float_lbl.bind('<Double-Button-1>', _dbl_click)
+        float_lbl.pack(side='left'); float_lbl.bind('<Button-1>', _click); float_lbl.bind('<Button-3>', _rclick)
 
         short_lbl = tk.Label(row1, text=rd['short_text'], font=font_r,
                              bg=rd['bg'], fg="#ffaa00", width=6, anchor='w')
-        short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click); short_lbl.bind('<Double-Button-1>', _dbl_click)
+        short_lbl.pack(side='left'); short_lbl.bind('<Button-1>', _click); short_lbl.bind('<Button-3>', _rclick)
 
         news_lbl = tk.Label(row1, text=rd.get('news_text', ''), font=font_r,
                             bg=rd['bg'], fg="#ffcc00", width=2, anchor='w')
-        news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Double-Button-1>', _dbl_click)
+        news_lbl.pack(side='left'); news_lbl.bind('<Button-1>', _click); news_lbl.bind('<Button-3>', _rclick)
 
-        # Chart button
-        chart_btn = tk.Button(row1, text="Ch", font=("Helvetica", 9), bg='#333',
-                              fg=self.ACCENT, relief='flat', padx=2, pady=0,
-                              command=lambda s=sym: self._open_chart_window(s))
-        chart_btn.pack(side='left', padx=(2, 0))
-
-        # News button
-        news_btn = tk.Button(row1, text="N", font=("Helvetica", 9), bg='#333',
-                             fg='#ffcc00', relief='flat', padx=2, pady=0,
-                             command=lambda s=sym: self._open_news_window(s))
-        news_btn.pack(side='left', padx=(2, 0))
 
         # Fib row
-        row2 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        row2 = tk.Frame(parent, bg=rd['bg'])
         row2.pack(fill='x', pady=0)
         fib_lbl = tk.Label(row2, text=rd['fib_text'], font=font_r,
                            bg=rd['bg'], fg="#66cccc", anchor='w')
@@ -9398,12 +9519,12 @@ class App:
         if not rd['fib_text']:
             row2.pack_forget()
 
-        # News headlines row (wraplength prevents overflow into alerts panel)
-        row3 = tk.Frame(self.stock_frame, bg=rd['bg'])
+        # News headlines row
+        row3 = tk.Frame(parent, bg=rd['bg'])
         row3.pack(fill='x', pady=0)
         news_hl_lbl = tk.Label(row3, text=rd.get('news_headlines', ''), font=font_r,
                                bg=rd['bg'], fg="#ccaa00", anchor='w', justify='left',
-                               wraplength=680)
+                               wraplength=500)
         news_hl_lbl.pack(side='left', padx=(12, 0))
         if not rd.get('news_headlines'):
             row3.pack_forget()
@@ -9414,8 +9535,71 @@ class App:
             'vol_lbl': vol_lbl, 'rvol_lbl': rvol_lbl,
             'vwap_lbl': vwap_lbl, 'float_lbl': float_lbl, 'short_lbl': short_lbl,
             'news_lbl': news_lbl, 'fib_lbl': fib_lbl, 'news_hl_lbl': news_hl_lbl,
-            'chart_btn': chart_btn,
+            'spark_canvas': spark_canvas,
         }
+
+    def _draw_sparkline(self, canvas: tk.Canvas, sym: str, w: int, h: int):
+        """Draw sparkline: price line + volume bars from IBKR 5-min bars or accumulated data."""
+        canvas.delete('all')
+        # Prefer IBKR cached bars, fallback to accumulated scan data
+        cached = _spark_bars_cache.get(sym)
+        if cached and len(cached) >= 2:
+            prices = [p for p, v in cached]
+            volumes = [v for p, v in cached]
+        else:
+            prices = self._spark_data.get(sym, [])
+            volumes = []
+
+        if len(prices) < 2:
+            return
+        lo, hi = min(prices), max(prices)
+        if hi == lo:
+            hi = lo + 0.01
+        margin = 1
+        aw = w - 2 * margin
+        # Volume bars in bottom 30% of canvas
+        vol_h = int(h * 0.3)
+        price_h = h - vol_h - 1
+        n = len(prices)
+
+        # Draw volume bars (if available)
+        if volumes and max(volumes) > 0:
+            max_vol = max(volumes)
+            for i, v in enumerate(volumes):
+                x = margin + i * aw / (n - 1)
+                bar_h = v / max_vol * vol_h if max_vol > 0 else 0
+                if bar_h > 0.5:
+                    canvas.create_line(x, h - margin, x, h - margin - bar_h,
+                                       fill="#334455", width=1)
+
+        # Draw price line
+        points = []
+        for i, p in enumerate(prices):
+            x = margin + i * aw / (n - 1)
+            y = margin + price_h - (p - lo) / (hi - lo) * price_h
+            points.append(x)
+            points.append(y)
+        color = self.GREEN if prices[-1] >= prices[0] else self.RED
+        canvas.create_line(*points, fill=color, width=1.5, smooth=True)
+
+    def _accumulate_spark_data(self):
+        """Add current prices to sparkline history (called each scan cycle)."""
+        for sym, d in self._stock_data.items():
+            price = d.get('price', 0)
+            if price <= 0:
+                continue
+            if sym not in self._spark_data:
+                self._spark_data[sym] = []
+            buf = self._spark_data[sym]
+            buf.append(price)
+            if len(buf) > 120:
+                self._spark_data[sym] = buf[-120:]
+            # Also append to IBKR cache if it exists (keep it current)
+            cached = _spark_bars_cache.get(sym)
+            if cached:
+                _spark_bars_cache[sym].append((price, 0))
+                if len(_spark_bars_cache[sym]) > 300:
+                    _spark_bars_cache[sym] = _spark_bars_cache[sym][-300:]
 
     def _update_stock_row(self, widgets: dict, rd: dict):
         """In-place update of an existing stock row's labels."""
@@ -9430,6 +9614,12 @@ class App:
         widgets['float_lbl'].config(text=rd['float_text'], bg=bg)
         widgets['short_lbl'].config(text=rd['short_text'], bg=bg)
         widgets['news_lbl'].config(text=rd.get('news_text', ''), bg=bg)
+        # Sparkline
+        sc = widgets.get('spark_canvas')
+        if sc:
+            sc.config(bg=bg)
+            sym = rd['sym_text'].replace('\U0001f525', '').strip()  # strip fire emoji
+            self._draw_sparkline(sc, sym, 60, 18)
         # Fib row
         if rd['fib_text']:
             widgets['fib_lbl'].config(text=rd['fib_text'], bg=bg)
@@ -9462,10 +9652,9 @@ class App:
 
         all_sorted = sorted(self._stock_data.items(),
                             key=lambda x: x[1]['pct'], reverse=True)
-        if self._filter_20pct:
-            sorted_stocks = [(s, d) for s, d in all_sorted if d.get('pct', 0) >= 20.0]
-        else:
-            sorted_stocks = all_sorted[:10]  # top 10 by pct
+        lo = self._scan1_min_pct.get()
+        hi = self._scan1_max_pct.get()
+        sorted_stocks = [(s, d) for s, d in all_sorted if lo <= d.get('pct', 0) <= hi]
         new_order = [sym for sym, _ in sorted_stocks]
 
         if new_order == self._rendered_order:
@@ -9490,6 +9679,39 @@ class App:
         if sel and sel in self._stock_data:
             new_price = self._stock_data[sel]['price']
             self._trade_price.set(f"{new_price:.2f}")
+
+    def _render_stock_table_r(self):
+        """Render scanner 2 stock table from self._stock_data (right panel)."""
+        if not self._stock_data:
+            for w in self.stock_frame_r.winfo_children():
+                w.destroy()
+            self._row_widgets_r.clear()
+            self._rendered_order_r.clear()
+            tk.Label(self.stock_frame_r, text="No stocks yet",
+                     bg=self.BG, fg="#666", font=("Helvetica", 20)).pack(pady=10)
+            return
+
+        all_sorted = sorted(self._stock_data.items(),
+                            key=lambda x: x[1]['pct'], reverse=True)
+        lo = self._scan2_min_pct.get()
+        hi = self._scan2_max_pct.get()
+        sorted_stocks = [(s, d) for s, d in all_sorted if lo <= d.get('pct', 0) <= hi]
+        new_order = [sym for sym, _ in sorted_stocks]
+
+        if new_order == self._rendered_order_r:
+            for i, (sym, d) in enumerate(sorted_stocks):
+                rd = self._compute_row_data(sym, d, i)
+                if sym in self._row_widgets_r:
+                    self._update_stock_row(self._row_widgets_r[sym], rd)
+        else:
+            for w in self.stock_frame_r.winfo_children():
+                w.destroy()
+            self._row_widgets_r.clear()
+            self._rendered_order_r = new_order
+
+            for i, (sym, d) in enumerate(sorted_stocks):
+                rd = self._compute_row_data(sym, d, i)
+                self._row_widgets_r[sym] = self._build_stock_row(sym, rd, parent=self.stock_frame_r)
 
     # ── Portfolio Panel ─────────────────────────────────────
 
@@ -9579,132 +9801,636 @@ class App:
                     'pnl_lbl': pnl_lbl, 'pnl_pct_lbl': pnl_pct_lbl,
                 }
 
-    # ── Trading Panel ──────────────────────────────────────
+    def _render_account_summary(self):
+        """Update account summary labels."""
+        nl = self._cached_net_liq
+        bp = self._cached_buying_power
+        n_pos = len(self._cached_positions)
+        total_pnl = sum(pos[3] for pos in self._cached_positions.values() if len(pos) >= 4)
 
-    def _build_trading_panel(self):
-        """Build the trading panel UI — two modes: Quick Entry + Planned Trade."""
-        panel = tk.Frame(self.root, bg=self.BG)
-        panel.pack(fill='x', padx=10, pady=1)
+        self._acct_nlv_lbl.config(text=f"NLV: ${nl:,.0f}" if nl > 0 else "NLV: ---")
+        self._acct_bp_lbl.config(text=f"BP: ${bp:,.0f}" if bp > 0 else "BP: ---")
+        self._acct_pos_lbl.config(text=f"Pos: {n_pos}")
+        pnl_fg = self.GREEN if total_pnl >= 0 else self.RED
+        self._acct_pnl_lbl.config(
+            text=f"P&L: ${total_pnl:+,.2f}" if self._cached_positions else "P&L: ---",
+            fg=pnl_fg)
 
-        # Row 1: Symbol + Price + Position + Account
-        row1 = tk.Frame(panel, bg=self.BG)
-        row1.pack(fill='x', pady=1)
+    def _render_robot_summary(self):
+        """Update virtual robot summary panel (FIB DT, GG, MR, FT)."""
+        for w in self._robot_summary_frame.winfo_children():
+            w.destroy()
 
-        tk.Label(row1, text="Sym:", font=("Helvetica", 12),
-                 bg=self.BG, fg="#888").pack(side='left')
+        scanner = self.scanner
+        if not scanner:
+            return
+
+        # Get current prices from scanner data
+        current_prices = {}
+        for sym, d in self._stock_data.items():
+            p = d.get('price', 0)
+            if p > 0:
+                current_prices[sym] = p
+
+        robots = [
+            ("FIB DT", scanner._virtual_portfolio),
+            ("Gap&Go", scanner._gg_portfolio),
+            ("MR", scanner._mr_portfolio),
+            ("FT", scanner._ft_portfolio),
+        ]
+        bg = self.BG
+        for i, (name, vp) in enumerate(robots):
+            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+            try:
+                cash = vp.cash
+                n_pos = len(vp.positions)
+                nlv = vp.net_liq(current_prices) if hasattr(vp, 'net_liq') else cash
+                pnl_pct = (nlv - vp.INITIAL_CASH) / vp.INITIAL_CASH * 100
+                pnl_fg = self.GREEN if pnl_pct >= 0 else self.RED
+            except Exception:
+                cash, n_pos, nlv, pnl_pct, pnl_fg = 0, 0, 0, 0, '#888'
+
+            row = tk.Frame(self._robot_summary_frame, bg=row_bg)
+            row.pack(fill='x')
+            tk.Label(row, text=name, font=("Courier", 10, "bold"),
+                     bg=row_bg, fg=self.FG, width=8, anchor='w').pack(side='left')
+            tk.Label(row, text=f"${cash:,.0f}", font=("Courier", 10),
+                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+            tk.Label(row, text=str(n_pos), font=("Courier", 10),
+                     bg=row_bg, fg=self.FG, width=4, anchor='w').pack(side='left')
+            tk.Label(row, text=f"${nlv:,.0f}", font=("Courier", 10, "bold"),
+                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 10, "bold"),
+                     bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
+
+    def _render_recent_trades(self):
+        """Show last 10 trades from the journal (last 24h)."""
+        for w in self._trades_frame.winfo_children():
+            w.destroy()
+
+        try:
+            trades = _load_journal_trades()
+        except Exception:
+            trades = []
+
+        if not trades:
+            tk.Label(self._trades_frame, text="No trades yet", font=("Courier", 9),
+                     bg=self.BG, fg='#555').pack(anchor='w')
+            return
+
+        # Filter to last 24h and take last 8
+        now = time_mod.time()
+        cutoff = now - 86400
+        recent = []
+        for t in reversed(trades):
+            ts_str = t.get('exit_time', t.get('entry_time', ''))
+            # Try to parse timestamp
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(ts_str[:19], '%Y-%m-%d %H:%M:%S')
+                ts = dt.timestamp()
+                if ts < cutoff:
+                    continue
+            except Exception:
+                pass
+            recent.append(t)
+            if len(recent) >= 8:
+                break
+
+        if not recent:
+            tk.Label(self._trades_frame, text="No trades in 24h", font=("Courier", 9),
+                     bg=self.BG, fg='#555').pack(anchor='w')
+            return
+
+        for i, t in enumerate(recent):
+            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+            row = tk.Frame(self._trades_frame, bg=row_bg)
+            row.pack(fill='x')
+
+            # Time
+            ts_str = t.get('exit_time', t.get('entry_time', ''))
+            time_short = ts_str[11:16] if len(ts_str) >= 16 else ts_str[:5]
+            tk.Label(row, text=time_short, font=("Courier", 9),
+                     bg=row_bg, fg='#888', width=6, anchor='w').pack(side='left')
+
+            # Robot
+            robot = t.get('robot', t.get('strategy', '?'))[:5]
+            tk.Label(row, text=robot, font=("Courier", 9),
+                     bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
+
+            # Symbol
+            sym = t.get('symbol', t.get('sym', '?'))
+            tk.Label(row, text=sym, font=("Courier", 9, "bold"),
+                     bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
+
+            # Side
+            side = t.get('side', t.get('action', '?'))
+            side_fg = self.GREEN if 'buy' in side.lower() else self.RED
+            tk.Label(row, text=side[:4], font=("Courier", 9),
+                     bg=row_bg, fg=side_fg, width=4, anchor='w').pack(side='left')
+
+            # Qty
+            qty = t.get('qty', t.get('shares', '?'))
+            tk.Label(row, text=str(qty), font=("Courier", 9),
+                     bg=row_bg, fg=self.FG, width=4, anchor='w').pack(side='left')
+
+            # Price
+            prc = t.get('price', t.get('exit_price', t.get('entry_price', 0)))
+            try:
+                prc_str = f"${float(prc):.2f}"
+            except (ValueError, TypeError):
+                prc_str = str(prc)
+            tk.Label(row, text=prc_str, font=("Courier", 9),
+                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
+
+            # P&L
+            pnl = t.get('pnl', t.get('realized_pnl', 0))
+            try:
+                pnl_val = float(pnl)
+                pnl_fg = self.GREEN if pnl_val >= 0 else self.RED
+                pnl_str = f"${pnl_val:+.2f}"
+            except (ValueError, TypeError):
+                pnl_fg = '#888'
+                pnl_str = str(pnl)
+            tk.Label(row, text=pnl_str, font=("Courier", 9, "bold"),
+                     bg=row_bg, fg=pnl_fg, width=8, anchor='w').pack(side='left')
+
+    # ── Trading (right-click menu) ────────────────────────
+
+    def _init_trading_vars(self):
+        """Initialize trading variables (no GUI panel — trading via right-click)."""
         self._selected_sym = tk.StringVar(value="---")
-        self._sym_entry = tk.Entry(row1, textvariable=self._selected_sym,
-                 font=("Courier", 14, "bold"), bg=self.ROW_BG, fg=self.ACCENT,
-                 insertbackground=self.ACCENT, width=6, relief='flat')
-        self._sym_entry.pack(side='left', padx=(2, 8))
-        self._sym_entry.bind('<Return>', self._on_sym_entry)
-
-        tk.Label(row1, text="Price:", font=("Helvetica", 12),
-                 bg=self.BG, fg="#888").pack(side='left')
         self._trade_price = tk.StringVar(value="")
-        tk.Entry(row1, textvariable=self._trade_price, font=("Courier", 14),
-                 bg=self.ROW_BG, fg=self.FG, insertbackground=self.FG,
-                 width=8, relief='flat').pack(side='left', padx=(2, 8))
-
         self._position_var = tk.StringVar(value="Pos: ---")
-        tk.Label(row1, textvariable=self._position_var,
-                 font=("Courier", 13), bg=self.BG, fg="#cca0ff"
-                 ).pack(side='left', padx=(0, 8))
-
         self._account_var = tk.StringVar(value="Account: ---")
-        tk.Label(row1, textvariable=self._account_var,
-                 font=("Courier", 13), bg=self.BG, fg="#aaa"
-                 ).pack(side='left')
-
-        # ── Quick Entry section ──
-        sep1 = tk.Frame(panel, bg="#444", height=1)
-        sep1.pack(fill='x', pady=2)
-
-        row_quick_fields = tk.Frame(panel, bg=self.BG)
-        row_quick_fields.pack(fill='x', pady=1)
-
-        tk.Label(row_quick_fields, text="BP%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
         self._quick_bp_var = tk.StringVar(value="80")
-        tk.Entry(row_quick_fields, textvariable=self._quick_bp_var, width=4, font=("Courier", 12),
-                 bg="#333", fg="#00e676", insertbackground="white", relief='flat').pack(side='left', padx=2)
-
-        tk.Label(row_quick_fields, text="Stop%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
         self._quick_stop_var = tk.StringVar(value="5")
-        tk.Entry(row_quick_fields, textvariable=self._quick_stop_var, width=4, font=("Courier", 12),
-                 bg="#333", fg="#ff5252", insertbackground="white", relief='flat').pack(side='left', padx=2)
-
-        tk.Label(row_quick_fields, text="TP%:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
         self._quick_tp_var = tk.StringVar(value="20")
-        tk.Entry(row_quick_fields, textvariable=self._quick_tp_var, width=4, font=("Courier", 12),
-                 bg="#333", fg="#448aff", insertbackground="white", relief='flat').pack(side='left', padx=2)
-
-        row_quick = tk.Frame(panel, bg=self.BG)
-        row_quick.pack(fill='x', pady=2)
-
-        tk.Button(row_quick, text="QUICK BUY", font=("Helvetica", 13, "bold"),
-                  bg="#1b5e20", fg="white", activebackground="#2e7d32",
-                  relief='flat', padx=14, pady=2,
-                  command=self._quick_buy).pack(side='left', padx=2)
-
-        tk.Button(row_quick, text="QUICK SELL", font=("Helvetica", 13, "bold"),
-                  bg="#b71c1c", fg="white", activebackground="#c62828",
-                  relief='flat', padx=14, pady=2,
-                  command=self._quick_sell).pack(side='left', padx=2)
-
-        tk.Button(row_quick, text="CLOSE ALL", font=("Helvetica", 13, "bold"),
-                  bg="#e6a800", fg="black", activebackground="#ffc107",
-                  relief='flat', padx=14, pady=2,
-                  command=self._close_all_position).pack(side='left', padx=4)
-
-        # ── Planned Trade section ──
-        sep2 = tk.Frame(panel, bg="#444", height=1)
-        sep2.pack(fill='x', pady=2)
-
-        row_fields = tk.Frame(panel, bg=self.BG)
-        row_fields.pack(fill='x', pady=2)
-
-        tk.Label(row_fields, text="Entry:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(4, 2))
-        self._planned_entry_field = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
-                                             insertbackground="white", relief='flat')
-        self._planned_entry_field.pack(side='left', padx=2)
-
-        tk.Label(row_fields, text="Stop:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
-        self._stop_entry = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
-                                    insertbackground="white", relief='flat')
-        self._stop_entry.pack(side='left', padx=2)
-
-        tk.Label(row_fields, text="TP:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(8, 2))
-        self._tp_entry = tk.Entry(row_fields, width=8, font=("Courier", 12), bg="#333", fg="white",
-                                  insertbackground="white", relief='flat')
-        self._tp_entry.pack(side='left', padx=2)
-
-        row_planned_btns = tk.Frame(panel, bg=self.BG)
-        row_planned_btns.pack(fill='x', pady=2)
-
-        tk.Button(row_planned_btns, text="BUY PLANNED", font=("Helvetica", 12, "bold"),
-                  bg="#0d47a1", fg="white", activebackground="#1565c0",
-                  relief='flat', padx=10, pady=1,
-                  command=self._planned_buy).pack(side='left', padx=2)
-
-        tk.Button(row_planned_btns, text="SELL PLANNED", font=("Helvetica", 12, "bold"),
-                  bg="#880e4f", fg="white", activebackground="#ad1457",
-                  relief='flat', padx=10, pady=1,
-                  command=self._planned_sell).pack(side='left', padx=2)
-
-        tk.Label(row_planned_btns, text="(OCA bracket: Stop + TP cancel each other)",
-                 font=("Helvetica", 9), bg=self.BG, fg="#666").pack(side='left', padx=6)
-
-        # Order status
         self._order_status_var = tk.StringVar(value="")
-        self._order_status_label = tk.Label(
-            panel, textvariable=self._order_status_var,
-            font=("Courier", 11), bg=self.BG, fg="#888", anchor='w')
-        self._order_status_label.pack(fill='x', pady=1)
+        # Planned trade fields — created as StringVars (no Entry widgets)
+        self._planned_entry_var = tk.StringVar(value="")
+        self._planned_stop_var = tk.StringVar(value="")
+        self._planned_tp_var = tk.StringVar(value="")
+        # Dummy label for order status (so _on_order_result doesn't crash)
+        self._order_status_label = tk.Label(self.root, textvariable=self._order_status_var,
+                                            font=("Courier", 10), bg=self.BG, fg="#888")
+        self._order_status_label.pack(side='bottom', fill='x', padx=10)
+        # Sparkline price history — {sym: [price, price, ...]}
+        self._spark_data: dict[str, list[float]] = {}
+
+    def _on_stock_right_click(self, sym: str, event):
+        """Show right-click trade context menu for stock."""
+        self._select_stock(sym)
+        menu = tk.Menu(self.root, tearoff=0, bg="#2d2d44", fg="#e0e0e0",
+                       activebackground="#00d4ff", activeforeground="black",
+                       font=("Helvetica", 12))
+        d = self._stock_data.get(sym, {})
+        price = d.get('price', 0) if d else 0
+        pos = self._cached_positions.get(sym)
+        pos_text = f"  [{pos[0]} @ ${pos[1]:.2f}]" if pos else ""
+
+        menu.add_command(label=f"{sym}  ${price:.2f}{pos_text}", state='disabled')
+        menu.add_separator()
+        menu.add_command(label="QUICK BUY", foreground="#00e676",
+                         command=self._quick_buy)
+        menu.add_command(label="QUICK SELL", foreground="#ff5252",
+                         command=self._quick_sell)
+        menu.add_command(label="CLOSE ALL", foreground="#ffc107",
+                         command=self._close_all_position)
+        menu.add_separator()
+        menu.add_command(label="Trade Settings...",
+                         command=lambda s=sym: self._show_trade_dialog(s))
+        menu.add_separator()
+        menu.add_command(label="Stock Detail", command=lambda s=sym: self._open_stock_detail(s))
+        menu.add_command(label="Open Chart", command=lambda s=sym: self._open_chart_window(s))
+        menu.add_command(label="Open TradingView", command=lambda s=sym: self._open_tradingview(s))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_trade_dialog(self, sym: str):
+        """Show trade settings dialog for quick/planned trades."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Trade — {sym}")
+        dlg.configure(bg=self.BG)
+        dlg.geometry("380x340")
+        dlg.attributes('-topmost', True)
+        dlg.transient(self.root)
+
+        d = self._stock_data.get(sym, {})
+        price = d.get('price', 0) if d else 0
+        pos = self._cached_positions.get(sym)
+
+        # Header
+        hdr_text = f"{sym}  ${price:.2f}"
+        if pos:
+            pnl = pos[3] if len(pos) >= 4 else 0
+            hdr_text += f"  |  Pos: {pos[0]} @ ${pos[1]:.2f}  P&L: ${pnl:+,.2f}"
+        tk.Label(dlg, text=hdr_text, font=("Courier", 13, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(fill='x', padx=8, pady=(8, 4))
+
+        # Quick Entry fields
+        tk.Frame(dlg, bg="#444", height=1).pack(fill='x', padx=8, pady=4)
+        tk.Label(dlg, text="Quick Entry", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg="#888").pack(anchor='w', padx=8)
+
+        qf = tk.Frame(dlg, bg=self.BG)
+        qf.pack(fill='x', padx=8, pady=2)
+        for label, var, fg in [("BP%", self._quick_bp_var, "#00e676"),
+                                ("Stop%", self._quick_stop_var, "#ff5252"),
+                                ("TP%", self._quick_tp_var, "#448aff")]:
+            tk.Label(qf, text=f"{label}:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(0, 2))
+            tk.Entry(qf, textvariable=var, width=5, font=("Courier", 12),
+                     bg="#333", fg=fg, insertbackground="white", relief='flat').pack(side='left', padx=(0, 8))
+
+        bf = tk.Frame(dlg, bg=self.BG)
+        bf.pack(fill='x', padx=8, pady=4)
+        tk.Button(bf, text="QUICK BUY", font=("Helvetica", 12, "bold"),
+                  bg="#1b5e20", fg="white", relief='flat', padx=12, pady=3,
+                  command=lambda: (self._quick_buy(), dlg.destroy())).pack(side='left', padx=2)
+        tk.Button(bf, text="QUICK SELL", font=("Helvetica", 12, "bold"),
+                  bg="#b71c1c", fg="white", relief='flat', padx=12, pady=3,
+                  command=lambda: (self._quick_sell(), dlg.destroy())).pack(side='left', padx=2)
+        tk.Button(bf, text="CLOSE ALL", font=("Helvetica", 12, "bold"),
+                  bg="#e6a800", fg="black", relief='flat', padx=12, pady=3,
+                  command=lambda: (self._close_all_position(), dlg.destroy())).pack(side='left', padx=2)
+
+        # Planned Trade fields
+        tk.Frame(dlg, bg="#444", height=1).pack(fill='x', padx=8, pady=4)
+        tk.Label(dlg, text="Planned Trade", font=("Helvetica", 11, "bold"),
+                 bg=self.BG, fg="#888").pack(anchor='w', padx=8)
+
+        pf = tk.Frame(dlg, bg=self.BG)
+        pf.pack(fill='x', padx=8, pady=2)
+        self._planned_entry_var.set(f"{price:.2f}" if price else "")
+        self._planned_stop_var.set("")
+        self._planned_tp_var.set("")
+        for label, var in [("Entry", self._planned_entry_var),
+                           ("Stop", self._planned_stop_var),
+                           ("TP", self._planned_tp_var)]:
+            tk.Label(pf, text=f"{label}:", font=("Helvetica", 11), bg=self.BG, fg="#ccc").pack(side='left', padx=(0, 2))
+            tk.Entry(pf, textvariable=var, width=8, font=("Courier", 12),
+                     bg="#333", fg="white", insertbackground="white", relief='flat').pack(side='left', padx=(0, 6))
+
+        pbf = tk.Frame(dlg, bg=self.BG)
+        pbf.pack(fill='x', padx=8, pady=4)
+        tk.Button(pbf, text="BUY PLANNED", font=("Helvetica", 11, "bold"),
+                  bg="#0d47a1", fg="white", relief='flat', padx=8, pady=2,
+                  command=lambda: (self._planned_buy(), dlg.destroy())).pack(side='left', padx=2)
+        tk.Button(pbf, text="SELL PLANNED", font=("Helvetica", 11, "bold"),
+                  bg="#880e4f", fg="white", relief='flat', padx=8, pady=2,
+                  command=lambda: (self._planned_sell(), dlg.destroy())).pack(side='left', padx=2)
+        tk.Label(pbf, text="OCA bracket", font=("Helvetica", 9),
+                 bg=self.BG, fg="#666").pack(side='left', padx=6)
 
     def _open_tradingview(self, sym: str):
         """Open TradingView chart in browser for the given symbol."""
         url = f"https://www.tradingview.com/chart/?symbol={sym}"
         webbrowser.open(url)
+
+    def _open_stock_detail(self, sym: str):
+        """Open full-screen stock detail window (same as Telegram unified report).
+
+        Shows: intraday candlestick chart with fib levels + news + fundamentals
+        in a compact layout.  Chart generated via generate_alert_chart().
+        """
+        stock_data = self._stock_data.get(sym, {})
+        price = stock_data.get('price', 0)
+        if price <= 0:
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Detail — {sym}")
+        win.configure(bg='#0e1117')
+        win.attributes('-zoomed', True)
+        win.update_idletasks()
+
+        # Status bar
+        status_var = tk.StringVar(value=f"Loading chart for {sym}...")
+        tk.Label(win, textvariable=status_var, font=("Courier", 10),
+                 bg='#0e1117', fg='#888').pack(anchor='w', padx=8, pady=2)
+
+        # Main body: chart left (70%), info right (30%)
+        body = tk.Frame(win, bg='#0e1117')
+        body.pack(fill='both', expand=True, padx=4, pady=2)
+
+        chart_frame = tk.Frame(body, bg='#0e1117')
+        chart_frame.pack(side='left', fill='both', expand=True)
+
+        info_frame = tk.Frame(body, bg='#0e1117', width=360)
+        info_frame.pack(side='right', fill='y')
+        info_frame.pack_propagate(False)
+
+        # Keep reference to avoid GC
+        win._chart_images = []
+        win._refresh_after_id = None
+
+        # Build info panel immediately from cached data
+        self._build_detail_info(info_frame, sym, stock_data)
+
+        # Generate chart in background thread
+        def _generate():
+            try:
+                chart_path = self._generate_detail_chart(sym, stock_data)
+                if chart_path:
+                    win.after(0, lambda: self._show_detail_chart(
+                        win, chart_frame, chart_path, status_var, sym))
+                else:
+                    win.after(0, lambda: status_var.set(f"No chart data for {sym}"))
+            except Exception as e:
+                log.error(f"Stock detail chart {sym}: {e}")
+                win.after(0, lambda: status_var.set(f"Error: {e}"))
+
+        threading.Thread(target=_generate, daemon=True).start()
+
+        # Auto-refresh every 90s
+        def _auto_refresh():
+            try:
+                if not win.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+
+            def _regen():
+                try:
+                    sd = self._stock_data.get(sym, stock_data)
+                    chart_path = self._generate_detail_chart(sym, sd)
+                    if chart_path:
+                        win.after(0, lambda: self._show_detail_chart(
+                            win, chart_frame, chart_path, status_var, sym))
+                except Exception as e:
+                    log.debug(f"Detail refresh {sym}: {e}")
+
+            threading.Thread(target=_regen, daemon=True).start()
+            win._refresh_after_id = win.after(90_000, _auto_refresh)
+
+        win._refresh_after_id = win.after(90_000, _auto_refresh)
+
+        def _on_close():
+            if win._refresh_after_id:
+                win.after_cancel(win._refresh_after_id)
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _generate_detail_chart(self, sym: str, stock_data: dict) -> Path | None:
+        """Generate the unified report chart for the stock detail popup."""
+        price = stock_data.get('price', 0)
+        if price <= 0:
+            return None
+
+        df = _download_intraday(sym, bar_size='1 min', duration='2 D')
+        if df is None or len(df) < 20:
+            return None
+
+        # Fib levels
+        with _fib_cache_lock:
+            cached = _fib_cache.get(sym)
+        if cached:
+            anchor_low, anchor_high, all_levels, ratio_map, anchor_date = cached
+        else:
+            calc_fib_levels(sym, price)
+            with _fib_cache_lock:
+                cached = _fib_cache.get(sym)
+            if cached:
+                anchor_low, anchor_high, all_levels, ratio_map, anchor_date = cached
+            else:
+                anchor_low, anchor_high, all_levels, ratio_map, anchor_date = 0, 0, [], {}, ''
+
+        # Build stock_info
+        enrich = _enrichment.get(sym, {})
+        vol_raw = stock_data.get('volume_raw', 0)
+        dol_vol = vol_raw * price if vol_raw and price else 0
+        float_str = enrich.get('float', '-')
+        float_shares = _parse_float_to_shares(float_str)
+        rvol = stock_data.get('rvol', 0)
+        ft_pct = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+        si = {
+            'float_str': float_str,
+            'float_dollar': _format_dollar_short(float_shares * price).replace('מליון', 'M').replace('אלף', 'K') if float_shares > 0 and price > 0 else '',
+            'vol_shares': _format_shares_short(vol_raw).replace('מליון', 'M').replace('אלף', 'K') if vol_raw > 0 else '',
+            'vol_dollar': _format_dollar_short(dol_vol).replace('מליון', 'M').replace('אלף', 'K') if dol_vol > 0 else '',
+            'vol_str': (_format_dollar_short(dol_vol) if dol_vol > 0 else (_format_shares_short(vol_raw) if vol_raw > 0 else '')).replace('מליון', 'M').replace('אלף', 'K'),
+            'short': enrich.get('short', '-'),
+            'cash': enrich.get('cash', '-'),
+            'inst_own': enrich.get('inst_own', '-'),
+            'insider_own': enrich.get('insider_own', '-'),
+            'vwap': stock_data.get('vwap', 0),
+            'pct': stock_data.get('pct', 0),
+            'rvol': rvol,
+            'float_turnover': ft_pct,
+        }
+
+        # Compute MAs
+        ma_data = None
+        try:
+            if df is not None and len(df) > 20 and 'date' in df.columns:
+                df_ts = df.copy()
+                df_ts.index = pd.to_datetime(df_ts['date'])
+                ma_frames = {'1m': df}
+                for tf_key, rule in [('5m', '5min'), ('15m', '15min'),
+                                     ('30m', '30min'), ('1h', '1h')]:
+                    resampled = df_ts.resample(rule).agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+                    }).dropna()
+                    if len(resampled) > 0:
+                        ma_frames[tf_key] = resampled
+                ma_frames['D'] = _daily_cache.get(sym)
+                ma_data = _calc_ma_table(price, ma_frames)
+        except Exception as e:
+            log.debug(f"MA calc detail {sym}: {e}")
+
+        fib_anchor = None
+        if anchor_low and anchor_high:
+            fib_anchor = (anchor_low, anchor_high, anchor_date)
+
+        pct = stock_data.get('pct', 0)
+        title = f"{sym} ${price:.2f} ({pct:+.1f}%)"
+        return generate_alert_chart(sym, df, all_levels, price, ratio_map,
+                                    alert_title=title, stock_info=si,
+                                    ma_rows=ma_data, fib_anchor=fib_anchor)
+
+    def _show_detail_chart(self, win, chart_frame: tk.Frame,
+                           chart_path: Path, status_var: tk.StringVar, sym: str):
+        """Display the chart image in the detail window."""
+        for w in chart_frame.winfo_children():
+            w.destroy()
+        try:
+            win.update_idletasks()
+            cw = chart_frame.winfo_width() or 1000
+            ch = chart_frame.winfo_height() or 700
+            img = Image.open(chart_path)
+            img = img.resize((cw, ch), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            win._chart_images = [photo]
+            lbl = tk.Label(chart_frame, image=photo, bg='#0e1117')
+            lbl.pack(fill='both', expand=True)
+            status_var.set(f"{sym} — chart loaded")
+        except Exception as e:
+            tk.Label(chart_frame, text=f"Error: {e}", font=("Courier", 14),
+                     bg='#0e1117', fg='#ff4444').pack(fill='both', expand=True)
+
+    def _build_detail_info(self, parent: tk.Frame, sym: str, stock_data: dict):
+        """Build the right-side info panel for stock detail popup."""
+        enrich = _enrichment.get(sym, {})
+        price = stock_data.get('price', 0)
+        pct = stock_data.get('pct', 0)
+        vwap = stock_data.get('vwap', 0)
+        rvol = stock_data.get('rvol', 0)
+        vol_raw = stock_data.get('volume_raw', 0)
+        dol_vol = vol_raw * price if vol_raw and price else 0
+        float_str = enrich.get('float', '-')
+        float_shares = _parse_float_to_shares(float_str)
+        ft_pct = (vol_raw / float_shares * 100) if float_shares > 0 and vol_raw > 0 else 0
+
+        bg = '#0e1117'
+        hdr_font = ("Helvetica", 16, "bold")
+        lbl_font = ("Helvetica", 12)
+        val_font = ("Helvetica", 12, "bold")
+
+        # Scrollable container
+        canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
+        inner = tk.Frame(canvas, bg=bg)
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.pack(fill='both', expand=True)
+
+        def _mw(event):
+            canvas.yview_scroll(-1 * (event.delta // 120 or (1 if event.num == 4 else -1)), "units")
+        canvas.bind('<Button-4>', _mw)
+        canvas.bind('<Button-5>', _mw)
+
+        pad = {'padx': 8, 'pady': 1, 'anchor': 'w'}
+
+        # Header
+        pct_fg = self.GREEN if pct >= 0 else self.RED
+        tk.Label(inner, text=sym, font=("Helvetica", 22, "bold"),
+                 bg=bg, fg=self.ACCENT).pack(**pad, pady=(8, 0))
+        tk.Label(inner, text=f"${price:.2f}  ({pct:+.1f}%)", font=hdr_font,
+                 bg=bg, fg=pct_fg).pack(**pad)
+
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=4)
+
+        # Company info
+        company = enrich.get('company', '')
+        sector = enrich.get('sector', '')
+        country = enrich.get('country', '')
+        if company:
+            tk.Label(inner, text=company, font=lbl_font, bg=bg, fg='#ccc',
+                     wraplength=340).pack(**pad)
+        if sector or country:
+            tk.Label(inner, text=f"{sector}  {country}".strip(), font=("Helvetica", 10),
+                     bg=bg, fg='#888').pack(**pad)
+
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=4)
+
+        # Key metrics
+        def _metric(label, value, fg='#ccc'):
+            row = tk.Frame(inner, bg=bg)
+            row.pack(fill='x', padx=8, pady=1)
+            tk.Label(row, text=label, font=lbl_font, bg=bg, fg='#888',
+                     width=12, anchor='w').pack(side='left')
+            tk.Label(row, text=str(value), font=val_font, bg=bg, fg=fg).pack(side='left')
+
+        # VWAP
+        if vwap > 0:
+            vwap_pct = (price - vwap) / vwap * 100
+            vwap_fg = self.GREEN if price > vwap else self.RED
+            vp = f"${vwap:.2f}" if vwap >= 1 else f"${vwap:.4f}"
+            _metric("VWAP", f"{vp} ({vwap_pct:+.1f}%)", vwap_fg)
+
+        _metric("Float", float_str, '#cca0ff')
+        if float_shares > 0 and price > 0:
+            _metric("Float $", _format_dollar_short(float_shares * price), '#cca0ff')
+        _metric("Short", enrich.get('short', '-'), '#ffaa00')
+        _metric("RVOL", f"{rvol:.1f}x" if rvol > 0 else '-',
+                self.GREEN if rvol >= 2.0 else '#ccc')
+        _metric("Volume", _format_shares_short(vol_raw) if vol_raw > 0 else '-')
+        _metric("Vol $", _format_dollar_short(dol_vol) if dol_vol > 0 else '-')
+        if ft_pct >= 5:
+            _metric("Turnover", f"{ft_pct:.0f}%", self.GREEN if ft_pct >= 50 else '#ccc')
+
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=4)
+
+        # Financials
+        mcap = enrich.get('market_cap', '-')
+        eps = enrich.get('eps', '-')
+        cash = enrich.get('cash', '-')
+        inst_own = enrich.get('inst_own', '-')
+        if mcap and mcap != '-':
+            _metric("MCap", mcap)
+        if eps and eps != '-':
+            _metric("EPS", eps)
+        if cash and cash != '-':
+            _metric("Cash", f"${cash}")
+        if inst_own and inst_own != '-':
+            _metric("Inst Own", inst_own)
+
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=4)
+
+        # News headlines
+        news_items = enrich.get('news', [])
+        if news_items:
+            tk.Label(inner, text="NEWS", font=("Helvetica", 12, "bold"),
+                     bg=bg, fg='#ffcc00').pack(**pad, pady=(4, 2))
+            for item in news_items[:5]:
+                title = item.get('title_he', item.get('title_en', ''))
+                date_str = item.get('date', '')
+                try:
+                    title_d = bidi_display(title)
+                except Exception:
+                    title_d = title
+                nrow = tk.Frame(inner, bg=bg)
+                nrow.pack(fill='x', padx=8, pady=1)
+                if date_str:
+                    il_date = _et_to_israel(date_str)
+                    tk.Label(nrow, text=il_date or date_str[:10], font=("Helvetica", 9),
+                             bg=bg, fg='#888').pack(side='left')
+                tk.Label(nrow, text=title_d, font=("Helvetica", 10),
+                         bg=bg, fg='#ddd', wraplength=300, justify='left').pack(
+                    side='left', padx=(4, 0))
+        else:
+            tk.Label(inner, text="No news", font=lbl_font,
+                     bg=bg, fg='#555').pack(**pad, pady=4)
+
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=4)
+
+        # Fib levels
+        with _fib_cache_lock:
+            cached_fib = _fib_cache.get(sym)
+        if cached_fib:
+            a_low, a_high, all_levels, ratio_map, a_date = cached_fib
+            tk.Label(inner, text="FIB LEVELS", font=("Helvetica", 12, "bold"),
+                     bg=bg, fg='#66cccc').pack(**pad, pady=(4, 2))
+            if a_low and a_high:
+                tk.Label(inner, text=f"Anchor: ${a_low:.4f} → ${a_high:.4f} ({a_date})",
+                         font=("Helvetica", 10), bg=bg, fg='#66cccc').pack(**pad)
+            fibs_below = sorted([lv for lv in all_levels if lv <= price], reverse=True)[:3]
+            fibs_above = sorted([lv for lv in all_levels if lv > price])[:3]
+            for lv in fibs_above[::-1]:
+                r_info = ratio_map.get(round(lv, 4), ('?', '?'))
+                r_str = f"{r_info[0]}" if isinstance(r_info, tuple) else str(r_info)
+                fg = self.RED if lv > price else self.GREEN
+                _metric(f"R {r_str}", f"${lv:.4f}" if lv < 1 else f"${lv:.2f}", fg)
+            _metric("PRICE", f"${price:.2f}", self.ACCENT)
+            for lv in fibs_below:
+                r_info = ratio_map.get(round(lv, 4), ('?', '?'))
+                r_str = f"{r_info[0]}" if isinstance(r_info, tuple) else str(r_info)
+                _metric(f"S {r_str}", f"${lv:.4f}" if lv < 1 else f"${lv:.2f}", self.GREEN)
+
+        # Action buttons at bottom
+        tk.Frame(inner, bg='#333', height=1).pack(fill='x', padx=8, pady=6)
+        btn_frame = tk.Frame(inner, bg=bg)
+        btn_frame.pack(fill='x', padx=8, pady=4)
+        tk.Button(btn_frame, text="TradingView", font=("Helvetica", 11, "bold"),
+                  bg='#1a5276', fg='white', relief='flat', padx=10, pady=4,
+                  command=lambda: self._open_tradingview(sym)).pack(side='left', padx=2)
+        tk.Button(btn_frame, text="QUICK BUY", font=("Helvetica", 11, "bold"),
+                  bg='#1b5e20', fg='white', relief='flat', padx=10, pady=4,
+                  command=lambda: (self._select_stock(sym), self._quick_buy())).pack(side='left', padx=2)
+        tk.Button(btn_frame, text="QUICK SELL", font=("Helvetica", 11, "bold"),
+                  bg='#b71c1c', fg='white', relief='flat', padx=10, pady=4,
+                  command=lambda: (self._select_stock(sym), self._quick_sell())).pack(side='left', padx=2)
 
     def _open_chart_window(self, sym: str):
         """Open a fullscreen Toplevel window with 2x2 chart grid.
@@ -10030,8 +10756,9 @@ class App:
         elif sym in self._cached_positions and len(self._cached_positions[sym]) >= 3:
             self._trade_price.set(f"{self._cached_positions[sym][2]:.2f}")
         self._update_position_display()
-        # Re-render table to update highlight
+        # Re-render tables to update highlight
         self._render_stock_table()
+        self._render_stock_table_r()
         self._render_portfolio()
 
     def _on_sym_entry(self, _event=None):
@@ -10059,10 +10786,14 @@ class App:
         """Update account label with cached values."""
         nl = self._cached_net_liq
         bp = self._cached_buying_power
+        n_pos = len(self._cached_positions)
         if nl > 0 or bp > 0:
             self._account_var.set(f"Account: ${nl:,.0f} | BP: ${bp:,.0f}")
+            pos_txt = f" | {n_pos} pos" if n_pos > 0 else ""
+            self._hdr_account_var.set(f"Account ${nl:,.0f} | BP ${bp:,.0f}{pos_txt}")
         else:
             self._account_var.set("Account: ---")
+            self._hdr_account_var.set("")
 
     def _on_account_data(self, net_liq: float, buying_power: float,
                          positions: dict[str, tuple]):
@@ -10074,6 +10805,9 @@ class App:
             self._update_account_display()
             self._update_position_display()
             self._render_portfolio()
+            self._render_account_summary()
+            self._render_robot_summary()
+            self._render_recent_trades()
         self.root.after(0, _refresh)
 
     def _on_order_result(self, msg: str, success: bool):
@@ -10205,7 +10939,7 @@ class App:
 
         # Read entry/stop/tp fields
         try:
-            entry_str = self._planned_entry_field.get().strip()
+            entry_str = self._planned_entry_var.get().strip()
             entry_price = float(entry_str) if entry_str else price
             if entry_price <= 0:
                 raise ValueError
@@ -10214,13 +10948,13 @@ class App:
             return
 
         try:
-            stop_str = self._stop_entry.get().strip()
+            stop_str = self._planned_stop_var.get().strip()
             stop_price = float(stop_str) if stop_str else 0.0
         except (ValueError, TypeError):
             stop_price = 0.0
 
         try:
-            tp_str = self._tp_entry.get().strip()
+            tp_str = self._planned_tp_var.get().strip()
             target_price = float(tp_str) if tp_str else 0.0
         except (ValueError, TypeError):
             target_price = 0.0
@@ -10323,13 +11057,13 @@ class App:
 
         # Read stop/tp fields
         try:
-            stop_str = self._stop_entry.get().strip()
+            stop_str = self._planned_stop_var.get().strip()
             stop_price = float(stop_str) if stop_str else 0.0
         except (ValueError, TypeError):
             stop_price = 0.0
 
         try:
-            tp_str = self._tp_entry.get().strip()
+            tp_str = self._planned_tp_var.get().strip()
             sell_price_val = float(tp_str) if tp_str else price
         except (ValueError, TypeError):
             sell_price_val = price
@@ -10461,71 +11195,30 @@ class App:
             self._sound_btn.config(text="🔊", fg=self.GREEN)
 
     def _rebuild_column_headers(self):
-        """Rebuild column header labels with current font settings."""
-        for w in self._hdr_frame.winfo_children():
-            w.destroy()
+        """Rebuild column header labels with current font settings (both scanners)."""
         ff = self._table_font_var.get()
         fs = self._table_size_var.get()
-        for text, w in [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7),
-                        ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]:
-            tk.Label(self._hdr_frame, text=text, font=(ff, fs, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        cols = [("SYM", 8), ("PRICE", 8), ("CHG%", 8), ("VOL", 7),
+                ("RVOL", 6), ("VWAP", 7), ("FLOAT", 7), ("SHORT", 6), ("N", 2)]
+        for frame in (self._hdr_frame, self._hdr_frame_r):
+            for w in frame.winfo_children():
+                w.destroy()
+            for text, w in cols:
+                tk.Label(frame, text=text, font=(ff, fs, "bold"),
+                         bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
 
     def _apply_table_font(self, _=None):
-        """Apply font changes to the stock table."""
+        """Apply font changes to both stock tables."""
         self._rebuild_column_headers()
-        # Force full rebuild of stock rows
+        # Force full rebuild of stock rows in both scanners
         self._rendered_order.clear()
+        self._rendered_order_r.clear()
         self._render_stock_table()
-
-    def _apply_alerts_font(self, _=None):
-        """Apply font changes to the alerts panel."""
-        ff = self._alerts_font_var.get()
-        fs = self._alerts_size_var.get()
-        self._alerts_text.config(font=(ff, fs))
-
-    def _toggle_filter(self):
-        """Toggle 20%+ filter on stock table."""
-        self._filter_20pct = not self._filter_20pct
-        if self._filter_20pct:
-            self._filter_btn.config(bg="#335533", fg=self.GREEN, text="20%+")
-        else:
-            self._filter_btn.config(bg="#553333", fg="#aaa", text="TOP10")
-        self._render_stock_table()
+        self._render_stock_table_r()
 
     def _push_alert(self, msg: str):
-        """Add alert message to alerts panel (GUI thread safe)."""
-        ts = datetime.now().strftime('%H:%M:%S')
-        try:
-            msg = bidi_display(msg)
-        except Exception:
-            pass
-        line = f"[{ts}] {msg}\n"
-        # Determine color tag based on alert type
-        ml = msg.lower()
-        if 'hod' in ml or 'high' in ml:
-            tag = 'hod'
-        elif 'fib' in ml:
-            tag = 'fib'
-        elif 'lod' in ml or 'low' in ml:
-            tag = 'lod'
-        elif 'vwap' in ml:
-            tag = 'vwap'
-        elif 'spike' in ml:
-            tag = 'spike'
-        elif 'report' in ml or 'sent' in ml:
-            tag = 'report'
-        else:
-            tag = 'default'
-        def _update():
-            self._alerts_text.config(state='normal')
-            self._alerts_text.insert('1.0', line, tag)
-            # Keep max 50 lines
-            line_count = int(self._alerts_text.index('end-1c').split('.')[0])
-            if line_count > 50:
-                self._alerts_text.delete('50.0', 'end')
-            self._alerts_text.config(state='disabled')
-        self.root.after(0, _update)
+        """Alert stub — GUI alerts panel removed; Telegram-only alerts."""
+        pass
 
     def _pick_scanner(self, idx: int):
         """Let user click on a window to add as scanner source in slot idx."""
@@ -10631,8 +11324,10 @@ class App:
                 'scanner_sources': scanner_data,
                 'table_font': self._table_font_var.get(),
                 'table_size': self._table_size_var.get(),
-                'alerts_font': self._alerts_font_var.get(),
-                'alerts_size': self._alerts_size_var.get(),
+                'scan1_min_pct': self._scan1_min_pct.get(),
+                'scan1_max_pct': self._scan1_max_pct.get(),
+                'scan2_min_pct': self._scan2_min_pct.get(),
+                'scan2_max_pct': self._scan2_max_pct.get(),
             }, f)
 
     def _load(self):
@@ -10673,13 +11368,17 @@ class App:
                 self._table_font_var.set(s['table_font'])
             if 'table_size' in s:
                 self._table_size_var.set(int(s['table_size']))
-            if 'alerts_font' in s:
-                self._alerts_font_var.set(s['alerts_font'])
-            if 'alerts_size' in s:
-                self._alerts_size_var.set(int(s['alerts_size']))
+            # Restore scanner ranges
+            if 'scan1_min_pct' in s:
+                self._scan1_min_pct.set(float(s['scan1_min_pct']))
+            if 'scan1_max_pct' in s:
+                self._scan1_max_pct.set(float(s['scan1_max_pct']))
+            if 'scan2_min_pct' in s:
+                self._scan2_min_pct.set(float(s['scan2_min_pct']))
+            if 'scan2_max_pct' in s:
+                self._scan2_max_pct.set(float(s['scan2_max_pct']))
             # Apply loaded fonts
             self._apply_table_font()
-            self._apply_alerts_font()
         except Exception:
             pass
 
