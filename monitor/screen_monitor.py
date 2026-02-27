@@ -9045,6 +9045,7 @@ class App:
         self._cached_buying_power: float = 0.0
         self._cached_positions: dict[str, tuple] = {}  # {sym: (qty, avgCost, mktPrice, pnl)}
         self._cached_fills: list[dict] = []  # IBKR fills (manual trades)
+        self._cached_acct_extra: dict = {}  # extra IBKR account values
         # Scanner 1 (left) widgets
         self._row_widgets: dict[str, dict] = {}   # sym → cached label widgets
         self._rendered_order: list[str] = []       # last symbol render order
@@ -9199,51 +9200,92 @@ class App:
 
         self._rebuild_column_headers()
 
-        # ── Bottom Panel: Portfolio + Account + Trades ──
+        # ── Bottom Panel: TWS-style Portfolio + SPY chart ──
         tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=1)
-        bottom = tk.Frame(self.root, bg=self.BG, height=150)
+        bottom = tk.Frame(self.root, bg=self.BG, height=160)
         bottom.pack(fill='x', padx=10, pady=1)
         bottom.pack_propagate(True)
 
-        # Left side: account summary + IBKR positions
+        # Left side: account + positions (TWS style)
         left_port = tk.Frame(bottom, bg=self.BG)
         left_port.pack(side='left', fill='both', expand=True)
 
-        # Account summary row
+        # ── Row 1: P&L box + Unrealized/Realized ──
+        pnl_row = tk.Frame(left_port, bg=self.BG)
+        pnl_row.pack(fill='x', pady=(0, 2))
+
+        tk.Label(pnl_row, text="P&L", font=("Helvetica", 10),
+                 bg=self.BG, fg='#888').pack(side='left', padx=(0, 8))
+
+        # Daily P&L box (bordered)
+        daily_box = tk.Frame(pnl_row, bg='#2a1a1a', bd=1, relief='solid',
+                             highlightbackground='#444', highlightthickness=1)
+        daily_box.pack(side='left', padx=(0, 10))
+        tk.Label(daily_box, text="DAILY", font=("Helvetica", 9),
+                 bg='#2a1a1a', fg='#aaa').pack(side='left', padx=(4, 2))
+        self._daily_pnl_lbl = tk.Label(daily_box, text="---",
+                                        font=("Courier", 13, "bold"),
+                                        bg='#2a1a1a', fg='#888')
+        self._daily_pnl_lbl.pack(side='left', padx=(2, 4))
+
+        # Unrealized / Realized
+        ur_frame = tk.Frame(pnl_row, bg=self.BG)
+        ur_frame.pack(side='left', padx=(0, 10))
+        ur_row1 = tk.Frame(ur_frame, bg=self.BG)
+        ur_row1.pack(anchor='w')
+        tk.Label(ur_row1, text="Unrealized", font=("Helvetica", 9),
+                 bg=self.BG, fg='#888').pack(side='left', padx=(0, 4))
+        self._unrealized_pnl_lbl = tk.Label(ur_row1, text="---",
+                                             font=("Courier", 11, "bold"),
+                                             bg=self.BG, fg='#888')
+        self._unrealized_pnl_lbl.pack(side='left')
+        ur_row2 = tk.Frame(ur_frame, bg=self.BG)
+        ur_row2.pack(anchor='w')
+        tk.Label(ur_row2, text="Realized  ", font=("Helvetica", 9),
+                 bg=self.BG, fg='#888').pack(side='left', padx=(0, 4))
+        self._realized_pnl_lbl = tk.Label(ur_row2, text="---",
+                                           font=("Courier", 11, "bold"),
+                                           bg=self.BG, fg='#888')
+        self._realized_pnl_lbl.pack(side='left')
+
+        # ── Row 2: Account info ──
         acct_row = tk.Frame(left_port, bg=self.BG)
-        acct_row.pack(fill='x')
-        tk.Label(acct_row, text="ACCOUNT", font=("Helvetica", 11, "bold"),
-                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 8))
-        self._acct_nlv_lbl = tk.Label(acct_row, text="NLV: ---", font=("Courier", 11),
-                                      bg=self.BG, fg=self.FG)
-        self._acct_nlv_lbl.pack(side='left', padx=(0, 10))
-        self._acct_bp_lbl = tk.Label(acct_row, text="BP: ---", font=("Courier", 11),
-                                     bg=self.BG, fg=self.FG)
-        self._acct_bp_lbl.pack(side='left', padx=(0, 10))
-        self._acct_pos_lbl = tk.Label(acct_row, text="Pos: 0", font=("Courier", 11),
-                                      bg=self.BG, fg=self.FG)
-        self._acct_pos_lbl.pack(side='left', padx=(0, 10))
-        self._acct_pnl_lbl = tk.Label(acct_row, text="P&L: ---", font=("Courier", 11, "bold"),
-                                      bg=self.BG, fg='#888')
-        self._acct_pnl_lbl.pack(side='left')
+        acct_row.pack(fill='x', pady=(0, 2))
+        _ACCT_BG = self.BG
+        for text, attr, w in [("Net Liquidity", '_acct_nlv_lbl', 7),
+                               ("Excess Liq", '_acct_bp_lbl', 7),
+                               ("Maintenance", '_acct_maint_lbl', 7),
+                               ("Cash", '_acct_cash_lbl', 7)]:
+            tk.Label(acct_row, text=text, font=("Helvetica", 9),
+                     bg=_ACCT_BG, fg='#888').pack(side='left', padx=(0, 2))
+            lbl = tk.Label(acct_row, text="---", font=("Courier", 11, "bold"),
+                           bg=_ACCT_BG, fg=self.FG, width=w, anchor='w')
+            lbl.pack(side='left', padx=(0, 12))
+            setattr(self, attr, lbl)
 
-        # Positions row (compact, inline with account)
+        # ── Separator ──
+        tk.Frame(left_port, bg='#444', height=1).pack(fill='x', pady=1)
+
+        # ── Row 3: Positions table header ──
+        pos_hdr = tk.Frame(left_port, bg='#1a1a2e')
+        pos_hdr.pack(fill='x')
+        _cols = [("P&L", 6), ("SYMBOL", 7), ("POS", 5), ("AVG PX", 8),
+                 ("LAST", 8), ("CHANGE", 8)]
+        for text, w in _cols:
+            tk.Label(pos_hdr, text=text, font=("Courier", 9, "bold"),
+                     bg='#1a1a2e', fg='#666', width=w, anchor='w').pack(side='left')
+
+        # ── Row 4: Positions list ──
         self._portfolio_frame = tk.Frame(left_port, bg=self.BG)
-        self._portfolio_frame.pack(fill='x', pady=1)
-
-        # Trades section — IBKR fills (manual demo trades)
-        self._trades_frame = tk.Frame(left_port, bg=self.BG)
-        self._trades_frame.pack(fill='both', expand=True, pady=1)
+        self._portfolio_frame.pack(fill='both', expand=True)
 
         # 2px separator
         tk.Frame(bottom, bg='#444', width=2).pack(side='left', fill='y', padx=6)
 
-        # Right side: SPY chart (compact)
+        # Right side: SPY chart
         right_port = tk.Frame(bottom, bg='#0e1117', width=320)
-        right_port.pack(side='right', fill='y')
+        right_port.pack(side='right', fill='both')
         right_port.pack_propagate(False)
-        tk.Label(right_port, text="SPY", font=("Helvetica", 9, "bold"),
-                 bg='#0e1117', fg=self.ACCENT).pack(anchor='w', padx=2)
         self._spy_chart_label = tk.Label(right_port, bg='#0e1117')
         self._spy_chart_label.pack(fill='both', expand=True)
         self._spy_chart_image = None  # keep reference to prevent GC
@@ -9367,9 +9409,8 @@ class App:
 
         self._load()
         self.root.after(500, self._check_connection)
-        # Initial SPY chart and trades render
+        # Initial SPY chart render
         self.root.after(3000, self._render_spy_chart)
-        self.root.after(1500, self._render_recent_trades)
         # Auto-start scanner on launch
         self.root.after(1000, self._toggle)
 
@@ -9430,7 +9471,6 @@ class App:
         self.root.after(0, self._render_stock_table)
         self.root.after(0, self._render_stock_table_r)
         self.root.after(0, self._render_spy_chart)
-        self.root.after(0, self._render_recent_trades)
 
     def _compute_row_data(self, sym: str, d: dict, idx: int) -> dict:
         """Compute display values for a stock row."""
@@ -9821,33 +9861,46 @@ class App:
         }
 
     def _render_portfolio(self):
-        """Render portfolio positions with P&L. Uses in-place updates."""
+        """Render TWS-style positions table. In-place updates prevent flicker."""
         positions = self._cached_positions
         if not positions:
             for w in self._portfolio_frame.winfo_children():
                 w.destroy()
             self._portfolio_widgets.clear()
             self._portfolio_order.clear()
+            # Show USD CASH row even with no positions
+            cash = self._cached_acct_extra.get('TotalCashValue', 0)
+            if cash != 0:
+                r = tk.Frame(self._portfolio_frame, bg=self.ROW_BG)
+                r.pack(fill='x')
+                tk.Label(r, text="", font=("Courier", 11), bg=self.ROW_BG,
+                         fg='#888', width=6).pack(side='left')
+                tk.Label(r, text="USD CASH", font=("Courier", 11, "bold"), bg=self.ROW_BG,
+                         fg=self.FG, width=7, anchor='w').pack(side='left')
+                tk.Label(r, text=f"{cash:,.0f}", font=("Courier", 11, "bold"),
+                         bg='#1a3a1a' if cash > 0 else self.ROW_BG,
+                         fg=self.GREEN if cash > 0 else self.FG, width=5).pack(side='left')
             return
 
         new_order = sorted(positions.keys())
 
         if new_order == self._portfolio_order:
-            # Fast path — in-place update
+            # Fast path — in-place update (no flicker)
             for i, sym in enumerate(new_order):
                 rd = self._portfolio_row_data(sym, positions[sym], i)
                 w = self._portfolio_widgets.get(sym)
                 if not w:
                     continue
+                chg = rd['mkt_price'] - rd['avg'] if rd['avg'] > 0 else 0
                 w['row'].config(bg=rd['bg'])
+                w['pnl_lbl'].config(text=f"{rd['pnl']:+,.0f}", fg=rd['pnl_fg'], bg=rd['bg'])
                 w['sym_lbl'].config(bg=rd['bg'])
                 w['qty_lbl'].config(text=str(rd['qty']), bg=rd['bg'])
-                w['avg_lbl'].config(text=f"${rd['avg']:.2f}", bg=rd['bg'])
-                w['price_lbl'].config(text=f"${rd['mkt_price']:.2f}", bg=rd['bg'])
-                w['pnl_lbl'].config(text=f"${rd['pnl']:+,.2f}", fg=rd['pnl_fg'], bg=rd['bg'])
-                w['pnl_pct_lbl'].config(text=f"{rd['pnl_pct']:+.1f}%", fg=rd['pnl_fg'], bg=rd['bg'])
+                w['avg_lbl'].config(text=f"{rd['avg']:.4f}", bg=rd['bg'])
+                w['price_lbl'].config(text=f"{rd['mkt_price']:.4f}", bg=rd['bg'])
+                w['chg_lbl'].config(text=f"{chg:+.2f}", fg=rd['pnl_fg'], bg=rd['bg'])
         else:
-            # Full rebuild
+            # Full rebuild (only when positions change)
             for w in self._portfolio_frame.winfo_children():
                 w.destroy()
             self._portfolio_widgets.clear()
@@ -9856,55 +9909,104 @@ class App:
             for i, sym in enumerate(new_order):
                 rd = self._portfolio_row_data(sym, positions[sym], i)
                 _click = lambda e, s=sym: self._select_stock(s)
+                chg = rd['mkt_price'] - rd['avg'] if rd['avg'] > 0 else 0
 
                 row = tk.Frame(self._portfolio_frame, bg=rd['bg'])
                 row.pack(fill='x', pady=0)
                 row.bind('<Button-1>', _click)
 
-                sym_lbl = tk.Label(row, text=sym, font=("Courier", 12, "bold"),
-                                   bg=rd['bg'], fg=self.FG, width=6, anchor='w')
-                sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
-
-                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 12),
-                                   bg=rd['bg'], fg=self.FG, width=6, anchor='w')
-                qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
-
-                avg_lbl = tk.Label(row, text=f"${rd['avg']:.2f}", font=("Courier", 12),
-                                   bg=rd['bg'], fg="#aaa", width=7, anchor='w')
-                avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
-
-                price_lbl = tk.Label(row, text=f"${rd['mkt_price']:.2f}", font=("Courier", 12),
-                                     bg=rd['bg'], fg=self.FG, width=7, anchor='w')
-                price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
-
-                pnl_lbl = tk.Label(row, text=f"${rd['pnl']:+,.2f}", font=("Courier", 12, "bold"),
-                                   bg=rd['bg'], fg=rd['pnl_fg'], width=9, anchor='w')
+                # P&L column (colored bg like TWS)
+                pnl_bg = '#1a2a1a' if rd['pnl'] >= 0 else '#2a1a1a'
+                pnl_lbl = tk.Label(row, text=f"{rd['pnl']:+,.0f}",
+                                   font=("Courier", 11, "bold"),
+                                   bg=pnl_bg, fg=rd['pnl_fg'], width=6, anchor='w')
                 pnl_lbl.pack(side='left'); pnl_lbl.bind('<Button-1>', _click)
 
-                pnl_pct_lbl = tk.Label(row, text=f"{rd['pnl_pct']:+.1f}%", font=("Courier", 12, "bold"),
-                                       bg=rd['bg'], fg=rd['pnl_fg'], width=6, anchor='w')
-                pnl_pct_lbl.pack(side='left'); pnl_pct_lbl.bind('<Button-1>', _click)
+                # Symbol
+                sym_lbl = tk.Label(row, text=sym, font=("Courier", 11, "bold"),
+                                   bg=rd['bg'], fg=self.FG, width=7, anchor='w')
+                sym_lbl.pack(side='left'); sym_lbl.bind('<Button-1>', _click)
+
+                # Qty (green bg if has position)
+                qty_bg = '#1a3a1a' if rd['qty'] > 0 else '#3a1a1a' if rd['qty'] < 0 else rd['bg']
+                qty_lbl = tk.Label(row, text=str(rd['qty']), font=("Courier", 11),
+                                   bg=qty_bg, fg=self.FG, width=5, anchor='center')
+                qty_lbl.pack(side='left'); qty_lbl.bind('<Button-1>', _click)
+
+                # Avg Price
+                avg_lbl = tk.Label(row, text=f"{rd['avg']:.4f}", font=("Courier", 11),
+                                   bg=rd['bg'], fg='#aaa', width=8, anchor='w')
+                avg_lbl.pack(side='left'); avg_lbl.bind('<Button-1>', _click)
+
+                # Last Price
+                price_lbl = tk.Label(row, text=f"{rd['mkt_price']:.4f}", font=("Courier", 11),
+                                     bg=rd['bg'], fg=self.FG, width=8, anchor='w')
+                price_lbl.pack(side='left'); price_lbl.bind('<Button-1>', _click)
+
+                # Change
+                chg_lbl = tk.Label(row, text=f"{chg:+.2f}",
+                                   font=("Courier", 11), bg=rd['bg'],
+                                   fg=rd['pnl_fg'], width=8, anchor='w')
+                chg_lbl.pack(side='left'); chg_lbl.bind('<Button-1>', _click)
 
                 self._portfolio_widgets[sym] = {
-                    'row': row, 'sym_lbl': sym_lbl, 'qty_lbl': qty_lbl,
-                    'avg_lbl': avg_lbl, 'price_lbl': price_lbl,
-                    'pnl_lbl': pnl_lbl, 'pnl_pct_lbl': pnl_pct_lbl,
+                    'row': row, 'pnl_lbl': pnl_lbl, 'sym_lbl': sym_lbl,
+                    'qty_lbl': qty_lbl, 'avg_lbl': avg_lbl,
+                    'price_lbl': price_lbl, 'chg_lbl': chg_lbl,
                 }
 
+            # USD CASH row at bottom
+            cash = self._cached_acct_extra.get('TotalCashValue', 0)
+            if cash != 0:
+                r = tk.Frame(self._portfolio_frame, bg=self.ROW_ALT)
+                r.pack(fill='x')
+                tk.Label(r, text="", font=("Courier", 11), bg=self.ROW_ALT,
+                         fg='#888', width=6).pack(side='left')
+                tk.Label(r, text="USD CASH", font=("Courier", 11, "bold"), bg=self.ROW_ALT,
+                         fg=self.FG, width=7, anchor='w').pack(side='left')
+                tk.Label(r, text=f"{cash:,.0f}", font=("Courier", 11, "bold"),
+                         bg='#1a3a1a' if cash > 0 else self.ROW_ALT,
+                         fg=self.GREEN if cash > 0 else self.FG, width=5).pack(side='left')
+
     def _render_account_summary(self):
-        """Update account summary labels."""
+        """Update TWS-style account summary labels (in-place, no flicker)."""
         nl = self._cached_net_liq
         bp = self._cached_buying_power
-        n_pos = len(self._cached_positions)
-        total_pnl = sum(pos[3] for pos in self._cached_positions.values() if len(pos) >= 4)
+        ex = self._cached_acct_extra
 
-        self._acct_nlv_lbl.config(text=f"NLV: ${nl:,.0f}" if nl > 0 else "NLV: ---")
-        self._acct_bp_lbl.config(text=f"BP: ${bp:,.0f}" if bp > 0 else "BP: ---")
-        self._acct_pos_lbl.config(text=f"Pos: {n_pos}")
-        pnl_fg = self.GREEN if total_pnl >= 0 else self.RED
-        self._acct_pnl_lbl.config(
-            text=f"P&L: ${total_pnl:+,.2f}" if self._cached_positions else "P&L: ---",
-            fg=pnl_fg)
+        # P&L values
+        unrealized = ex.get('UnrealizedPnL', sum(
+            pos[3] for pos in self._cached_positions.values() if len(pos) >= 4))
+        realized = ex.get('RealizedPnL', 0)
+        daily = unrealized + realized
+        excess_liq = ex.get('ExcessLiquidity', bp)
+        maint = ex.get('MaintMarginReq', 0)
+        cash = ex.get('TotalCashValue', 0)
+
+        # Daily P&L (big, colored)
+        daily_fg = self.GREEN if daily >= 0 else self.RED
+        self._daily_pnl_lbl.config(text=f"{daily:+,.0f}", fg=daily_fg)
+        # Color the daily box background
+        daily_bg = '#1a2a1a' if daily >= 0 else '#2a1a1a'
+        self._daily_pnl_lbl.master.config(bg=daily_bg)
+        for w in self._daily_pnl_lbl.master.winfo_children():
+            w.config(bg=daily_bg)
+
+        # Unrealized / Realized
+        ur_fg = self.GREEN if unrealized >= 0 else self.RED
+        self._unrealized_pnl_lbl.config(text=f"{unrealized:+,.1f}", fg=ur_fg)
+        re_fg = self.GREEN if realized >= 0 else self.RED
+        self._realized_pnl_lbl.config(text=f"{realized:+,.1f}", fg=re_fg)
+
+        # Account info
+        def _fmt(v):
+            if abs(v) >= 1000:
+                return f"{v / 1000:.1f}K"
+            return f"{v:,.0f}"
+        self._acct_nlv_lbl.config(text=_fmt(nl) if nl > 0 else "---")
+        self._acct_bp_lbl.config(text=_fmt(excess_liq) if excess_liq > 0 else "---")
+        self._acct_maint_lbl.config(text=_fmt(maint) if maint > 0 else "--")
+        self._acct_cash_lbl.config(text=_fmt(cash) if cash != 0 else "--")
 
     def _render_spy_chart(self):
         """Draw real-time SPY chart (yfinance data + matplotlib)."""
@@ -10001,80 +10103,6 @@ class App:
             self._spy_chart_label.config(image=photo)
         except Exception as e:
             log.warning(f"SPY image display: {e}")
-
-    def _render_recent_trades(self):
-        """Show IBKR fills (manual demo trades) in 3-column layout."""
-        for w in self._trades_frame.winfo_children():
-            w.destroy()
-
-        fills = self._cached_fills
-        if not fills:
-            tk.Label(self._trades_frame, text=bidi_display("אין עסקאות היום"),
-                     font=("Courier", 11), bg=self.BG, fg='#555').pack(anchor='w')
-            return
-
-        # Summary header
-        buys = sum(1 for f in fills if f['side'] == 'BOT')
-        sells = sum(1 for f in fills if f['side'] == 'SLD')
-        hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
-        hdr.pack(fill='x', pady=(0, 2))
-        tk.Label(hdr, text=bidi_display(f"עסקאות היום: {len(fills)} | קניה {buys} | מכירה {sells}"),
-                 font=("Helvetica", 11, "bold"), bg='#1a1a3e', fg='#00d4ff').pack(side='left', padx=4)
-
-        # 3-column grid
-        cols_frame = tk.Frame(self._trades_frame, bg=self.BG)
-        cols_frame.pack(fill='both', expand=True)
-        for c in range(3):
-            cols_frame.columnconfigure(c, weight=1)
-
-        n = len(fills)
-        per_col = max(1, (n + 2) // 3)
-
-        for col_idx in range(3):
-            col_fills = fills[col_idx * per_col : (col_idx + 1) * per_col]
-            if not col_fills and col_idx > 0:
-                continue
-
-            col_frame = tk.Frame(cols_frame, bg=self.BG)
-            col_frame.grid(row=0, column=col_idx, sticky='nsew', padx=2)
-
-            # Column header
-            chdr = tk.Frame(col_frame, bg='#222244')
-            chdr.pack(fill='x')
-            for txt, w in [(bidi_display("שעה"), 5), (bidi_display("מניה"), 6),
-                           (bidi_display("פעולה"), 5), (bidi_display("כמות"), 5),
-                           (bidi_display("מחיר"), 7)]:
-                tk.Label(chdr, text=txt, font=("Helvetica", 9, "bold"),
-                         bg='#222244', fg='#888', width=w, anchor='w').pack(side='left')
-
-            for i, f in enumerate(col_fills):
-                row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
-                row = tk.Frame(col_frame, bg=row_bg)
-                row.pack(fill='x')
-
-                # Time
-                tk.Label(row, text=f.get('time', ''), font=("Courier", 10),
-                         bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
-
-                # Symbol
-                tk.Label(row, text=f.get('symbol', '?'), font=("Courier", 11, "bold"),
-                         bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
-
-                # Side (buy=green, sell=red)
-                side = f.get('side', '')
-                side_text = bidi_display("קניה") if side == 'BOT' else bidi_display("מכירה")
-                side_fg = self.GREEN if side == 'BOT' else self.RED
-                tk.Label(row, text=side_text, font=("Courier", 10, "bold"),
-                         bg=row_bg, fg=side_fg, width=5, anchor='w').pack(side='left')
-
-                # Qty
-                tk.Label(row, text=str(f.get('qty', 0)), font=("Courier", 10),
-                         bg=row_bg, fg=self.FG, width=5, anchor='w').pack(side='left')
-
-                # Price
-                price = f.get('price', 0)
-                tk.Label(row, text=f"${price:.2f}", font=("Courier", 11, "bold"),
-                         bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
@@ -10917,20 +10945,22 @@ class App:
             self._hdr_account_var.set("")
 
     def _on_account_data(self, net_liq: float, buying_power: float,
-                         positions: dict[str, tuple], fills: list[dict] = None):
-        """Callback from OrderThread with account data + fills."""
+                         positions: dict[str, tuple], fills: list[dict] = None,
+                         acct_extra: dict = None):
+        """Callback from OrderThread with account data + fills + extras."""
         self._cached_net_liq = net_liq
         self._cached_buying_power = buying_power
         self._cached_positions = positions
         if fills is not None:
             self._cached_fills = fills
+        if acct_extra is not None:
+            self._cached_acct_extra = acct_extra
         def _refresh():
             self._update_account_display()
             self._update_position_display()
             self._render_portfolio()
             self._render_account_summary()
             self._render_spy_chart()
-            self._render_recent_trades()
         self.root.after(0, _refresh)
 
     def _on_order_result(self, msg: str, success: bool):

@@ -132,6 +132,7 @@ class OrderThread(threading.Thread):
         self.buying_power: float = 0.0
         self.positions: dict[str, tuple] = {}  # sym → (qty, avgCost, mktPrice, pnl)
         self.fills: list[dict] = []  # today's fills from IBKR
+        self.acct_extra: dict = {}  # extra account values for TWS-style display
 
         # Connection backoff — prevent reconnect spam when TWS needs manual action
         self._connect_fail_count: int = 0
@@ -322,11 +323,18 @@ class OrderThread(threading.Thread):
                 acct_vals = ib.accountValues()
             net_liq = 0.0
             buying_power = 0.0
+            acct_extra = {}
+            _tags = {'NetLiquidation', 'BuyingPower', 'ExcessLiquidity',
+                     'MaintMarginReq', 'RealizedPnL', 'UnrealizedPnL',
+                     'TotalCashValue', 'SMA'}
             for av in acct_vals:
-                if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                    net_liq = float(av.value)
-                elif av.tag == 'BuyingPower' and av.currency == 'USD':
-                    buying_power = float(av.value)
+                if av.currency == 'USD' and av.tag in _tags:
+                    val = float(av.value)
+                    if av.tag == 'NetLiquidation':
+                        net_liq = val
+                    elif av.tag == 'BuyingPower':
+                        buying_power = val
+                    acct_extra[av.tag] = val
 
             # Use ib.positions() (reqPositions) — more reliable than ib.portfolio()
             # which can return empty on secondary clientId connections.
@@ -387,6 +395,7 @@ class OrderThread(threading.Thread):
             self.buying_power = buying_power
             self.positions = positions
             self.fills = fills
+            self.acct_extra = acct_extra
             self._last_successful_fetch = time_mod.time()
 
             if positions:
@@ -396,7 +405,7 @@ class OrderThread(threading.Thread):
                 log.debug(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: (none)")
 
             if self.on_account:
-                self.on_account(net_liq, buying_power, positions, fills)
+                self.on_account(net_liq, buying_power, positions, fills, acct_extra)
         except Exception as e:
             log.error(f"OrderThread: account fetch failed: {e}")
             # If fetch keeps failing, force reconnect sooner
