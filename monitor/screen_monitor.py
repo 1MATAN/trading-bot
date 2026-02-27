@@ -9044,6 +9044,7 @@ class App:
         self._cached_net_liq: float = 0.0
         self._cached_buying_power: float = 0.0
         self._cached_positions: dict[str, tuple] = {}  # {sym: (qty, avgCost, mktPrice, pnl)}
+        self._cached_fills: list[dict] = []  # IBKR fills (manual trades)
         # Scanner 1 (left) widgets
         self._row_widgets: dict[str, dict] = {}   # sym → cached label widgets
         self._rendered_order: list[str] = []       # last symbol render order
@@ -9230,15 +9231,7 @@ class App:
         self._portfolio_frame = tk.Frame(left_port, bg=self.BG)
         self._portfolio_frame.pack(fill='x', pady=1)
 
-        # Trades section (scrollable, last 3 days)
-        trade_hdr = tk.Frame(left_port, bg=self.BG)
-        trade_hdr.pack(fill='x', pady=(2, 0))
-        tk.Label(trade_hdr, text="עסקאות אחרונות", font=("Helvetica", 11, "bold"),
-                 bg=self.BG, fg=self.ACCENT).pack(side='left', padx=(0, 6))
-        for text, w in [("שעה", 5), ("רובוט", 5), ("מניה", 6),
-                         ("כניסה", 7), ("יציאה", 7), ("ר/ה$", 9), ("ר/ה%", 7)]:
-            tk.Label(trade_hdr, text=text, font=("Courier", 10, "bold"),
-                     bg=self.BG, fg=self.ACCENT, width=w, anchor='w').pack(side='left')
+        # Trades section — IBKR fills (manual demo trades)
         self._trades_frame = tk.Frame(left_port, bg=self.BG)
         self._trades_frame.pack(fill='both', expand=True, pady=1)
 
@@ -9914,46 +9907,93 @@ class App:
             fg=pnl_fg)
 
     def _render_spy_chart(self):
-        """Fetch SPY chart image from TradingView/Finviz and display."""
-        # Throttle: only refresh every 60s
+        """Draw real-time SPY chart (yfinance data + matplotlib)."""
         now = time_mod.time()
         if hasattr(self, '_spy_last_fetch') and now - self._spy_last_fetch < 60:
             return
         self._spy_last_fetch = now
 
-        def _fetch():
+        def _draw():
             try:
-                # TradingView mini chart (public, no auth needed)
-                url = "https://s3.tradingview.com/tv.js"  # widget — won't work as image
-                # Use Finviz intraday chart (works reliably as static image)
-                url = f"https://finviz.com/chart.ashx?t=SPY&ty=c&ta=1&p=i5&s=l"
-                resp = requests.get(url, timeout=10, headers={
-                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                })
-                resp.raise_for_status()
-                img = Image.open(io.BytesIO(resp.content))
-                log.info(f"SPY chart fetched: {img.size}")
+                import yfinance as yf
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as _mplt
+
+                spy = yf.Ticker('SPY')
+                df = spy.history(period='1d', interval='5m')
+                if df is None or len(df) < 5:
+                    log.warning("SPY chart: no yfinance data, using Finviz fallback")
+                    self._fetch_spy_finviz()
+                    return
+
+                fig, ax = _mplt.subplots(figsize=(4, 2), facecolor='#0e1117')
+                ax.set_facecolor('#0e1117')
+
+                closes = df['Close'].values
+                opens = df['Open'].values
+
+                day_open = opens[0]
+                day_close = closes[-1]
+                line_color = '#26a69a' if day_close >= day_open else '#ef5350'
+                fill_color = '#26a69a33' if day_close >= day_open else '#ef535033'
+
+                x = range(len(closes))
+                ax.plot(x, closes, color=line_color, linewidth=1.5)
+                ax.fill_between(x, closes, min(closes) * 0.999, color=fill_color)
+
+                # Current price
+                ax.text(len(closes) - 1, day_close, f" ${day_close:.2f}",
+                        color=line_color, fontsize=9, fontweight='bold',
+                        va='center', ha='left')
+
+                # Day change
+                chg_pct = (day_close / day_open - 1) * 100 if day_open > 0 else 0
+                ax.set_title(f"SPY {chg_pct:+.2f}%", color=line_color,
+                             fontsize=10, fontweight='bold', loc='left', pad=2)
+
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['bottom'].set_color('#333')
+                ax.spines['left'].set_color('#333')
+                ax.tick_params(colors='#555', labelsize=7)
+                ax.set_xticks([])
+                ax.yaxis.set_major_formatter(
+                    _mplt.FuncFormatter(lambda v, _: f'${v:.0f}'))
+
+                fig.tight_layout(pad=0.3)
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, facecolor='#0e1117')
+                _mplt.close(fig)
+                buf.seek(0)
+                img = Image.open(buf)
+                log.info(f"SPY chart drawn from yfinance: {img.size}")
                 self.root.after(0, lambda: self._show_spy_image(img))
             except Exception as e:
-                log.warning(f"SPY chart fetch: {e}")
-                # Fallback: try StockCharts
-                try:
-                    url2 = "https://stockcharts.com/c-sc/sc?s=SPY&p=D&yr=0&mn=1&dy=0&id=p75498498580"
-                    resp2 = requests.get(url2, timeout=10, headers={
-                        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                    })
-                    resp2.raise_for_status()
-                    img2 = Image.open(io.BytesIO(resp2.content))
-                    self.root.after(0, lambda: self._show_spy_image(img2))
-                except Exception as e2:
-                    log.warning(f"SPY chart fallback also failed: {e2}")
-        threading.Thread(target=_fetch, daemon=True).start()
+                log.warning(f"SPY chart yfinance: {e}, trying Finviz")
+                self._fetch_spy_finviz()
+
+        threading.Thread(target=_draw, daemon=True).start()
+
+    def _fetch_spy_finviz(self):
+        """Fallback: fetch SPY chart image from Finviz."""
+        try:
+            url = "https://finviz.com/chart.ashx?t=SPY&ty=c&ta=1&p=i5&s=l"
+            resp = requests.get(url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            })
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content))
+            log.info(f"SPY Finviz fallback: {img.size}")
+            self.root.after(0, lambda: self._show_spy_image(img))
+        except Exception as e:
+            log.warning(f"SPY Finviz fallback: {e}")
 
     def _show_spy_image(self, img):
         """Display SPY chart image in the panel."""
         try:
-            w = self._spy_chart_label.winfo_width() or 400
-            h = self._spy_chart_label.winfo_height() or 180
+            w = self._spy_chart_label.winfo_width() or 320
+            h = self._spy_chart_label.winfo_height() or 140
             if w > 10 and h > 10:
                 img = img.resize((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
@@ -9963,54 +10003,36 @@ class App:
             log.warning(f"SPY image display: {e}")
 
     def _render_recent_trades(self):
-        """Show today's trades in 3-column grid layout with bidi-correct Hebrew."""
+        """Show IBKR fills (manual demo trades) in 3-column layout."""
         for w in self._trades_frame.winfo_children():
             w.destroy()
 
-        try:
-            trades = _load_journal_trades()
-        except Exception:
-            trades = []
-
-        if not trades:
-            return
-
-        _robot_short = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנ', 'FT': 'סיבב'}
-
-        # Filter to today's date only
-        today_str = datetime.now().strftime('%d/%m/%Y')
-        today_trades = [t for t in trades if t.get('date', '') == today_str]
-
-        if not today_trades:
+        fills = self._cached_fills
+        if not fills:
             tk.Label(self._trades_frame, text=bidi_display("אין עסקאות היום"),
                      font=("Courier", 11), bg=self.BG, fg='#555').pack(anchor='w')
             return
 
         # Summary header
-        day_pnl = sum(t.get('pnl', 0) for t in today_trades)
-        day_pnl_fg = self.GREEN if day_pnl >= 0 else self.RED
-        wins = sum(1 for t in today_trades if t.get('pnl', 0) > 0)
+        buys = sum(1 for f in fills if f['side'] == 'BOT')
+        sells = sum(1 for f in fills if f['side'] == 'SLD')
         hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
         hdr.pack(fill='x', pady=(0, 2))
-        tk.Label(hdr, text=bidi_display(f"היום: {len(today_trades)} עסקאות | {wins} רווח"),
+        tk.Label(hdr, text=bidi_display(f"עסקאות היום: {len(fills)} | קניה {buys} | מכירה {sells}"),
                  font=("Helvetica", 11, "bold"), bg='#1a1a3e', fg='#00d4ff').pack(side='left', padx=4)
-        tk.Label(hdr, text=f"${day_pnl:+,.2f}",
-                 font=("Courier", 12, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=6)
 
-        # 3-column grid container
+        # 3-column grid
         cols_frame = tk.Frame(self._trades_frame, bg=self.BG)
         cols_frame.pack(fill='both', expand=True)
         for c in range(3):
             cols_frame.columnconfigure(c, weight=1)
 
-        # Split trades into 3 columns
-        sorted_trades = list(reversed(today_trades))
-        n = len(sorted_trades)
-        per_col = (n + 2) // 3  # ceiling division
+        n = len(fills)
+        per_col = max(1, (n + 2) // 3)
 
         for col_idx in range(3):
-            col_trades = sorted_trades[col_idx * per_col : (col_idx + 1) * per_col]
-            if not col_trades and col_idx > 0:
+            col_fills = fills[col_idx * per_col : (col_idx + 1) * per_col]
+            if not col_fills and col_idx > 0:
                 continue
 
             col_frame = tk.Frame(cols_frame, bg=self.BG)
@@ -10019,42 +10041,40 @@ class App:
             # Column header
             chdr = tk.Frame(col_frame, bg='#222244')
             chdr.pack(fill='x')
-            for txt, w, anc in [("שם", 5, 'w'), ("כניסה", 5, 'w'), ("יציאה", 5, 'w'),
-                                ("רוה״פ", 7, 'w'), ("%", 5, 'w')]:
-                tk.Label(chdr, text=bidi_display(txt), font=("Helvetica", 9, "bold"),
-                         bg='#222244', fg='#888', width=w, anchor=anc).pack(side='left')
+            for txt, w in [(bidi_display("שעה"), 5), (bidi_display("מניה"), 6),
+                           (bidi_display("פעולה"), 5), (bidi_display("כמות"), 5),
+                           (bidi_display("מחיר"), 7)]:
+                tk.Label(chdr, text=txt, font=("Helvetica", 9, "bold"),
+                         bg='#222244', fg='#888', width=w, anchor='w').pack(side='left')
 
-            for i, t in enumerate(col_trades):
+            for i, f in enumerate(col_fills):
                 row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
                 row = tk.Frame(col_frame, bg=row_bg)
                 row.pack(fill='x')
 
-                # Symbol + robot tag
-                sym = t.get('symbol', '?')
-                robot_he = _robot_short.get(t.get('robot', '?'), t.get('robot', '?')[:3])
-                tk.Label(row, text=f"{sym}", font=("Courier", 11, "bold"),
+                # Time
+                tk.Label(row, text=f.get('time', ''), font=("Courier", 10),
+                         bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
+
+                # Symbol
+                tk.Label(row, text=f.get('symbol', '?'), font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
+
+                # Side (buy=green, sell=red)
+                side = f.get('side', '')
+                side_text = bidi_display("קניה") if side == 'BOT' else bidi_display("מכירה")
+                side_fg = self.GREEN if side == 'BOT' else self.RED
+                tk.Label(row, text=side_text, font=("Courier", 10, "bold"),
+                         bg=row_bg, fg=side_fg, width=5, anchor='w').pack(side='left')
+
+                # Qty
+                tk.Label(row, text=str(f.get('qty', 0)), font=("Courier", 10),
                          bg=row_bg, fg=self.FG, width=5, anchor='w').pack(side='left')
 
-                # Entry
-                entry_p = t.get('entry_price', 0)
-                tk.Label(row, text=f"{entry_p:.2f}", font=("Courier", 10),
-                         bg=row_bg, fg='#aaa', width=5, anchor='w').pack(side='left')
-
-                # Exit
-                exit_p = t.get('exit_price', 0)
-                tk.Label(row, text=f"{exit_p:.2f}", font=("Courier", 10),
-                         bg=row_bg, fg=self.FG, width=5, anchor='w').pack(side='left')
-
-                # P&L $
-                pnl = t.get('pnl', 0)
-                pnl_fg = self.GREEN if pnl >= 0 else self.RED
-                tk.Label(row, text=f"${pnl:+.1f}", font=("Courier", 11, "bold"),
-                         bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
-
-                # P&L %
-                pnl_pct = t.get('pnl_pct', 0)
-                tk.Label(row, text=f"{pnl_pct:+.0f}%", font=("Courier", 10, "bold"),
-                         bg=row_bg, fg=pnl_fg, width=5, anchor='w').pack(side='left')
+                # Price
+                price = f.get('price', 0)
+                tk.Label(row, text=f"${price:.2f}", font=("Courier", 11, "bold"),
+                         bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
@@ -10897,11 +10917,13 @@ class App:
             self._hdr_account_var.set("")
 
     def _on_account_data(self, net_liq: float, buying_power: float,
-                         positions: dict[str, tuple]):
-        """Callback from ScannerThread with account data."""
+                         positions: dict[str, tuple], fills: list[dict] = None):
+        """Callback from OrderThread with account data + fills."""
         self._cached_net_liq = net_liq
         self._cached_buying_power = buying_power
         self._cached_positions = positions
+        if fills is not None:
+            self._cached_fills = fills
         def _refresh():
             self._update_account_display()
             self._update_position_display()

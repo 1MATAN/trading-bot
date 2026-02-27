@@ -131,6 +131,7 @@ class OrderThread(threading.Thread):
         self.net_liq: float = 0.0
         self.buying_power: float = 0.0
         self.positions: dict[str, tuple] = {}  # sym → (qty, avgCost, mktPrice, pnl)
+        self.fills: list[dict] = []  # today's fills from IBKR
 
         # Connection backoff — prevent reconnect spam when TWS needs manual action
         self._connect_fail_count: int = 0
@@ -366,9 +367,26 @@ class OrderThread(threading.Thread):
                 except Exception as e:
                     log.warning(f"OrderThread: retry account fetch failed: {e}")
 
+            # Fetch today's fills (manual trades)
+            fills = []
+            try:
+                for fill in ib.fills():
+                    ex = fill.execution
+                    fills.append({
+                        'symbol': fill.contract.symbol,
+                        'side': ex.side,  # BOT or SLD
+                        'qty': int(ex.shares),
+                        'price': round(ex.price, 4),
+                        'time': ex.time.strftime('%H:%M') if ex.time else '',
+                        'orderId': ex.orderId,
+                    })
+            except Exception as e:
+                log.debug(f"OrderThread: fills fetch: {e}")
+
             self.net_liq = net_liq
             self.buying_power = buying_power
             self.positions = positions
+            self.fills = fills
             self._last_successful_fetch = time_mod.time()
 
             if positions:
@@ -378,7 +396,7 @@ class OrderThread(threading.Thread):
                 log.debug(f"OrderThread: NetLiq=${net_liq:,.0f} BP=${buying_power:,.0f} Positions: (none)")
 
             if self.on_account:
-                self.on_account(net_liq, buying_power, positions)
+                self.on_account(net_liq, buying_power, positions, fills)
         except Exception as e:
             log.error(f"OrderThread: account fetch failed: {e}")
             # If fetch keeps failing, force reconnect sooner
