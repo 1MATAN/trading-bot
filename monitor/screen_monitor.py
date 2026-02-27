@@ -9199,9 +9199,9 @@ class App:
         self._rebuild_column_headers()
 
         # ── Bottom Panel: Portfolio + Account + Trades ──
-        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=2)
-        bottom = tk.Frame(self.root, bg=self.BG, height=200)
-        bottom.pack(fill='x', padx=10, pady=2)
+        tk.Frame(self.root, bg="#444", height=1).pack(fill='x', padx=10, pady=1)
+        bottom = tk.Frame(self.root, bg=self.BG, height=150)
+        bottom.pack(fill='x', padx=10, pady=1)
         bottom.pack_propagate(True)
 
         # Left side: account summary + IBKR positions
@@ -9245,12 +9245,12 @@ class App:
         # 2px separator
         tk.Frame(bottom, bg='#444', width=2).pack(side='left', fill='y', padx=6)
 
-        # Right side: SPY chart
-        right_port = tk.Frame(bottom, bg='#0e1117', width=420)
-        right_port.pack(side='right', fill='both')
+        # Right side: SPY chart (compact)
+        right_port = tk.Frame(bottom, bg='#0e1117', width=320)
+        right_port.pack(side='right', fill='y')
         right_port.pack_propagate(False)
-        tk.Label(right_port, text="SPY", font=("Helvetica", 10, "bold"),
-                 bg='#0e1117', fg=self.ACCENT).pack(anchor='w', padx=4)
+        tk.Label(right_port, text="SPY", font=("Helvetica", 9, "bold"),
+                 bg='#0e1117', fg=self.ACCENT).pack(anchor='w', padx=2)
         self._spy_chart_label = tk.Label(right_port, bg='#0e1117')
         self._spy_chart_label.pack(fill='both', expand=True)
         self._spy_chart_image = None  # keep reference to prevent GC
@@ -9963,7 +9963,7 @@ class App:
             log.warning(f"SPY image display: {e}")
 
     def _render_recent_trades(self):
-        """Show trades from the last 3 days, grouped by date, bigger font."""
+        """Show trades from the last 24 hours only, compact rows."""
         for w in self._trades_frame.winfo_children():
             w.destroy()
 
@@ -9973,97 +9973,60 @@ class App:
             trades = []
 
         if not trades:
-            tk.Label(self._trades_frame, text="אין עסקאות", font=("Courier", 11),
-                     bg=self.BG, fg='#555').pack(anchor='w')
             return
 
         _robot_short = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנ', 'FT': 'סיבב'}
-        _day_names = {0: 'ב׳', 1: 'ג׳', 2: 'ד׳', 3: 'ה׳', 4: 'ו׳', 5: 'שבת', 6: 'א׳'}
 
-        # Group by date (last 3 unique dates)
-        from collections import OrderedDict
-        by_date = OrderedDict()
-        for t in reversed(trades):
-            d = t.get('date', '')
-            if d not in by_date:
-                by_date[d] = []
-            by_date[d].append(t)
+        # Filter to today's date only
+        today_str = datetime.now().strftime('%d/%m/%Y')
+        today_trades = [t for t in trades if t.get('date', '') == today_str]
 
-        # Take last 3 dates
-        dates_to_show = list(by_date.keys())[:3]
-        row_idx = 0
+        if not today_trades:
+            tk.Label(self._trades_frame, text="אין עסקאות היום", font=("Courier", 9),
+                     bg=self.BG, fg='#555').pack(anchor='w')
+            return
 
-        for date_key in dates_to_show:
-            day_trades = by_date[date_key]
+        # Summary header
+        day_pnl = sum(t.get('pnl', 0) for t in today_trades)
+        day_pnl_fg = self.GREEN if day_pnl >= 0 else self.RED
+        hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
+        hdr.pack(fill='x')
+        tk.Label(hdr, text=f" היום: {len(today_trades)} עסקאות",
+                 font=("Courier", 9, "bold"), bg='#1a1a3e', fg='#00d4ff').pack(side='left')
+        tk.Label(hdr, text=f"${day_pnl:+,.2f}",
+                 font=("Courier", 9, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=4)
 
-            # Day P&L summary
-            day_pnl = sum(t.get('pnl', 0) for t in day_trades)
-            day_pnl_fg = self.GREEN if day_pnl >= 0 else self.RED
+        for i, t in enumerate(reversed(today_trades)):
+            row_bg = self.ROW_BG if i % 2 == 0 else self.ROW_ALT
+            row = tk.Frame(self._trades_frame, bg=row_bg)
+            row.pack(fill='x')
 
-            # Parse day name
-            day_label = date_key
-            try:
-                from datetime import datetime as _dt
-                parts = date_key.split('/')
-                if len(parts) == 3:
-                    parsed = _dt(int(parts[2]), int(parts[1]), int(parts[0]))
-                    day_label = f"{_day_names.get(parsed.weekday(), '')} {date_key[:5]}"
-            except Exception:
-                pass
+            exit_t = t.get('exit_time', '')
+            tk.Label(row, text=exit_t or '-', font=("Courier", 9),
+                     bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
 
-            # Date header row
-            hdr = tk.Frame(self._trades_frame, bg='#1a1a3e')
-            hdr.pack(fill='x', pady=(3, 0))
-            tk.Label(hdr, text=f"  {day_label}", font=("Helvetica", 10, "bold"),
-                     bg='#1a1a3e', fg='#00d4ff').pack(side='left')
-            tk.Label(hdr, text=f"  {len(day_trades)} עסקאות",
-                     font=("Helvetica", 9), bg='#1a1a3e', fg='#888').pack(side='left', padx=6)
-            tk.Label(hdr, text=f"${day_pnl:+,.2f}",
-                     font=("Courier", 10, "bold"), bg='#1a1a3e', fg=day_pnl_fg).pack(side='right', padx=6)
+            robot_he = _robot_short.get(t.get('robot', '?'), t.get('robot', '?')[:4])
+            tk.Label(row, text=robot_he, font=("Courier", 9),
+                     bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
 
-            # Trade rows for this date
-            for t in day_trades:
-                row_bg = self.ROW_BG if row_idx % 2 == 0 else self.ROW_ALT
-                row = tk.Frame(self._trades_frame, bg=row_bg)
-                row.pack(fill='x')
-                row_idx += 1
+            tk.Label(row, text=t.get('symbol', '?'), font=("Courier", 10, "bold"),
+                     bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
 
-                # Time
-                exit_t = t.get('exit_time', '')
-                tk.Label(row, text=exit_t or '-', font=("Courier", 10),
-                         bg=row_bg, fg='#888', width=5, anchor='w').pack(side='left')
+            entry_p = t.get('entry_price', 0)
+            exit_p = t.get('exit_price', 0)
+            tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 9),
+                     bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
+            tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 9),
+                     bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
 
-                # Robot (Hebrew short)
-                robot = t.get('robot', '?')
-                robot_he = _robot_short.get(robot, robot[:4])
-                tk.Label(row, text=robot_he, font=("Courier", 10),
-                         bg=row_bg, fg=self.ACCENT, width=5, anchor='w').pack(side='left')
+            pnl = t.get('pnl', 0)
+            pnl_fg = self.GREEN if pnl >= 0 else self.RED
+            tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 9, "bold"),
+                     bg=row_bg, fg=pnl_fg, width=9, anchor='w').pack(side='left')
 
-                # Symbol
-                sym = t.get('symbol', '?')
-                tk.Label(row, text=sym, font=("Courier", 11, "bold"),
-                         bg=row_bg, fg=self.FG, width=6, anchor='w').pack(side='left')
-
-                # Entry price
-                entry_p = t.get('entry_price', 0)
-                tk.Label(row, text=f"${entry_p:.2f}", font=("Courier", 10),
-                         bg=row_bg, fg='#aaa', width=7, anchor='w').pack(side='left')
-
-                # Exit price
-                exit_p = t.get('exit_price', 0)
-                tk.Label(row, text=f"${exit_p:.2f}", font=("Courier", 10),
-                         bg=row_bg, fg=self.FG, width=7, anchor='w').pack(side='left')
-
-                # P&L $
-                pnl = t.get('pnl', 0)
-                pnl_fg = self.GREEN if pnl >= 0 else self.RED
-                tk.Label(row, text=f"${pnl:+,.2f}", font=("Courier", 11, "bold"),
-                         bg=row_bg, fg=pnl_fg, width=9, anchor='w').pack(side='left')
-
-                # P&L %
-                pnl_pct = t.get('pnl_pct', 0)
-                tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 10, "bold"),
-                         bg=row_bg, fg=pnl_fg, width=7, anchor='w').pack(side='left')
+            pnl_pct = t.get('pnl_pct', 0)
+            tk.Label(row, text=f"{pnl_pct:+.1f}%", font=("Courier", 9, "bold"),
+                     bg=row_bg, fg=pnl_fg, width=6, anchor='w').pack(side='left')
 
     # ── Trading (right-click menu) ────────────────────────
 
