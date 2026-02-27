@@ -817,11 +817,15 @@ def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
 #  Webull Desktop OCR Scanner
 # ══════════════════════════════════════════════════════════
 
-# Multi-scanner sources: up to 4 user-picked windows for OCR scanning
-_scanner_sources: list[dict] = []  # [{'wid': int, 'name': str}, ...] max 4
+# Multi-scanner sources: fixed-size 4-slot array for OCR scanning.
+# Each slot is either None (empty) or {'wid': int, 'name': str}.
+# Fixed-size preserves slot indices — no compaction, no index corruption.
+_scanner_sources: list[dict | None] = [None] * 4
 _scanner_sources_lock = threading.Lock()
 _MAX_SCANNER_SOURCES = 4
 _ocr_capture_lock = threading.Lock()  # prevent simultaneous OCR captures
+# Callback for GUI refresh when scanner sources change (set by App)
+_on_scanner_sources_changed = None
 
 
 def _verify_wid(wid: int) -> bool:
@@ -883,38 +887,40 @@ def _find_window_by_title(title: str) -> int | None:
 
 
 def add_scanner_source(wid: int, name: str = ""):
-    """Add a scanner source window. Max 3."""
-    global _scanner_sources
+    """Add a scanner source window to the first empty slot."""
     if not name:
         name = _get_window_name(wid)
     with _scanner_sources_lock:
-        if len(_scanner_sources) >= _MAX_SCANNER_SOURCES:
-            log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
-            return False
         # Don't add duplicates
-        if any(s['wid'] == wid for s in _scanner_sources):
+        if any(s and s['wid'] == wid for s in _scanner_sources):
             log.info(f"Scanner source WID {wid} already added")
             return False
-        _scanner_sources.append({'wid': wid, 'name': name})
-        log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
-        return True
+        # Find first empty slot
+        for i in range(_MAX_SCANNER_SOURCES):
+            if _scanner_sources[i] is None:
+                _scanner_sources[i] = {'wid': wid, 'name': name}
+                active = sum(1 for s in _scanner_sources if s is not None)
+                log.info(f"Scanner source added: slot {i} WID={wid} name={name} (active: {active})")
+                return True
+        log.warning(f"Max {_MAX_SCANNER_SOURCES} scanner sources reached")
+        return False
 
 
 def remove_scanner_source(idx: int):
-    """Remove scanner source by slot index (0-based)."""
-    global _scanner_sources
+    """Remove scanner source by slot index (0-based). Sets slot to None."""
     with _scanner_sources_lock:
-        if 0 <= idx < len(_scanner_sources):
-            removed = _scanner_sources.pop(idx)
+        if 0 <= idx < _MAX_SCANNER_SOURCES and _scanner_sources[idx] is not None:
+            removed = _scanner_sources[idx]
+            _scanner_sources[idx] = None
             log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
         else:
-            log.warning(f"Invalid scanner source index: {idx}")
+            log.warning(f"Invalid or empty scanner source index: {idx}")
 
 
 def get_scanner_sources() -> list[dict]:
-    """Get current scanner sources list."""
+    """Get active (non-None) scanner sources."""
     with _scanner_sources_lock:
-        return list(_scanner_sources)
+        return [s for s in _scanner_sources if s is not None]
 
 
 def _capture_and_ocr(wid: int) -> str:
@@ -1248,21 +1254,36 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
     (prefer source with more fields). Returns dict: {sym: {price, pct, volume, ...}}.
     Falls back to empty dict if no sources configured or all fail.
     """
-    global _scanner_sources
-
-    # Snapshot under lock, prune outside (avoid holding lock during I/O)
+    # Validate each slot — dead WIDs become None, indices preserved.
+    # Snapshot first (fast, under lock), verify outside lock (slow I/O).
     with _scanner_sources_lock:
         snapshot = list(_scanner_sources)
-    valid = [s for s in snapshot if _verify_wid(s['wid'])]
+    dead_slots: list[int] = []
+    for i, src in enumerate(snapshot):
+        if src is not None and not _verify_wid(src['wid']):
+            log.warning(f"Scanner source died: slot {i} WID={src['wid']} ({src['name']})")
+            dead_slots.append(i)
+    pruned = len(dead_slots) > 0
+    if dead_slots:
+        with _scanner_sources_lock:
+            for i in dead_slots:
+                _scanner_sources[i] = None
+    # Take final snapshot of active sources
     with _scanner_sources_lock:
-        _scanner_sources = valid
+        active = [(i, s) for i, s in enumerate(_scanner_sources) if s is not None]
 
-    if not valid:
+    if pruned and _on_scanner_sources_changed:
+        try:
+            _on_scanner_sources_changed()
+        except Exception:
+            pass
+
+    if not active:
         log.debug("No scanner sources configured, will fallback to IBKR scan")
         return {}
 
     all_parsed: list[dict] = []
-    for src in valid:
+    for _slot_idx, src in active:
         text = _capture_and_ocr(src['wid'])
         if not text.strip():
             log.warning(f"OCR empty for source WID={src['wid']} ({src['name']})")
@@ -1324,7 +1345,7 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
         }
 
     session = _get_market_session()
-    src_count = len(_scanner_sources)
+    src_count = sum(1 for s in _scanner_sources if s is not None)
     log.info(f"OCR scan [{session}]: {src_count} sources → {len(best)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
     return stocks
 
@@ -1337,7 +1358,7 @@ def _quick_ocr_capture(price_min: float = MONITOR_PRICE_MIN,
     Returns {sym: {'price': float, 'pct': float}} — minimal fields.
     """
     with _scanner_sources_lock:
-        snapshot = list(_scanner_sources)
+        snapshot = [s for s in _scanner_sources if s is not None]
     if not snapshot:
         return {}
 
@@ -9396,10 +9417,10 @@ class App:
                    buttonbackground=self.ROW_BG, relief='flat',
                    command=self._apply_table_font).pack(side='left', padx=(0, 4))
 
-        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 16, "bold"),
+        self.btn = tk.Button(ctrl_row, text="START", font=("Helvetica", 11, "bold"),
                              bg=self.GREEN, fg="white", command=self._toggle,
-                             relief='flat', activebackground="#00a844")
-        self.btn.pack(side='left', fill='x', expand=True, ipady=2)
+                             relief='flat', activebackground="#00a844", padx=10)
+        self.btn.pack(side='left', ipady=1)
 
         # Status
         self.status = tk.StringVar(value="Ready")
@@ -9408,6 +9429,9 @@ class App:
                  ).pack(padx=10, pady=1, anchor='w')
 
         self._load()
+        # Register callback so scanner thread can refresh GUI labels when sources die
+        global _on_scanner_sources_changed
+        _on_scanner_sources_changed = lambda: self.root.after(0, self._refresh_scanner_slots)
         self.root.after(500, self._check_connection)
         # Initial SPY chart render
         self.root.after(3000, self._render_spy_chart)
@@ -11414,18 +11438,12 @@ class App:
                     wid = int(result.stdout.strip())
                     name = _get_window_name(wid)
                     with _scanner_sources_lock:
-                        # If slot already occupied, remove old one first
-                        if idx < len(_scanner_sources):
-                            removed = _scanner_sources.pop(idx)
-                            log.info(f"Scanner source removed: slot {idx} WID={removed['wid']}")
-                        # Pad sources list if needed
-                        while len(_scanner_sources) < idx:
-                            _scanner_sources.append({'wid': 0, 'name': ''})
-                        if idx < len(_scanner_sources):
-                            _scanner_sources[idx] = {'wid': wid, 'name': name}
-                        else:
-                            _scanner_sources.append({'wid': wid, 'name': name})
-                            log.info(f"Scanner source added: WID={wid} name={name} (total: {len(_scanner_sources)})")
+                        old = _scanner_sources[idx]
+                        if old:
+                            log.info(f"Scanner source replaced: slot {idx} WID={old['wid']} → {wid}")
+                        _scanner_sources[idx] = {'wid': wid, 'name': name}
+                    active = sum(1 for s in _scanner_sources if s is not None)
+                    log.info(f"Scanner source set: slot {idx} WID={wid} name={name} (active: {active})")
                     short_name = name[:12] if name else str(wid)
                     self.root.after(0, lambda: self._scanner_slot_vars[idx].set(f"S{idx+1}: {short_name}"))
                     self.root.after(0, lambda: self._scanner_slot_labels[idx].config(fg=self.GREEN))
@@ -11479,8 +11497,8 @@ class App:
         with _scanner_sources_lock:
             snapshot = list(_scanner_sources)
         for i in range(_MAX_SCANNER_SOURCES):
-            if i < len(snapshot) and snapshot[i].get('wid'):
-                src = snapshot[i]
+            src = snapshot[i]
+            if src is not None and src.get('wid'):
                 short_name = src['name'][:12] if src['name'] else str(src['wid'])
                 self._scanner_slot_vars[i].set(f"S{i+1}: {short_name}")
                 self._scanner_slot_labels[i].config(fg=self.GREEN)
@@ -11493,6 +11511,7 @@ class App:
             scanner_data = [
                 {'wid': s['wid'], 'name': s['name'],
                  'wm_title': _get_window_full_name(s['wid'])}
+                if s is not None else None
                 for s in _scanner_sources
             ]
         with open(STATE_PATH, 'w') as f:
@@ -11520,28 +11539,32 @@ class App:
             self.thresh.set(s.get('thresh', MONITOR_DEFAULT_ALERT_PCT))
             self.price_min.set(s.get('price_min', MONITOR_PRICE_MIN))
             self.price_max.set(s.get('price_max', MONITOR_PRICE_MAX))
-            # Restore scanner sources
+            # Restore scanner sources (fixed-size 4-slot array)
             global _scanner_sources
             saved_sources = s.get('scanner_sources', [])
             # Legacy: migrate from old webull_wid format
             if not saved_sources and s.get('webull_wid'):
                 saved_sources = [{'wid': int(s['webull_wid']), 'name': 'Webull'}]
-            verified = []
-            for src in saved_sources:
+            restored = [None] * _MAX_SCANNER_SOURCES
+            for i, src in enumerate(saved_sources):
+                if i >= _MAX_SCANNER_SOURCES:
+                    break
+                if src is None:
+                    continue
                 wid = int(src.get('wid', 0))
                 name = src.get('name', '')
                 wm_title = src.get('wm_title', '')
                 if wid and _verify_wid(wid):
-                    verified.append({'wid': wid, 'name': name})
+                    restored[i] = {'wid': wid, 'name': name}
                 elif wm_title:
                     # WID died (app restarted) — try to find window by title
                     new_wid = _find_window_by_title(wm_title)
                     if new_wid and _verify_wid(new_wid):
                         new_name = _get_window_name(new_wid)
-                        verified.append({'wid': new_wid, 'name': new_name})
+                        restored[i] = {'wid': new_wid, 'name': new_name}
                         log.info(f"Scanner source recovered by title: '{wm_title}' → WID={new_wid}")
             with _scanner_sources_lock:
-                _scanner_sources = verified
+                _scanner_sources = restored
             self._refresh_scanner_slots()
             # Restore font settings
             if 'table_font' in s:
