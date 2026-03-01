@@ -685,7 +685,7 @@ def _composite_score(sym: str, d: dict, strategy: str = 'default') -> float:
 
     # Strategy-specific weights (gap%, rvol, turnover)
     weights = {
-        'vz':      (0.4, 0.4, 0.2),  # balanced gap + RVOL for VWAP Zone
+        'vz':      (0.2, 0.35, 0.45),  # volume conviction: turnover 45%, RVOL 35%, gap 20%
         'fib_dt':  (0.2, 0.3, 0.5),
         'gg':      (0.5, 0.3, 0.2),
         'mr':      (0.4, 0.4, 0.2),
@@ -698,7 +698,28 @@ def _composite_score(sym: str, d: dict, strategy: str = 'default') -> float:
     rvol_score = min(rvol / 10, 1.0) * 100  # cap at 10x
     turn_score = min(turnover / 100, 1.5) * 100  # cap at 100%
 
-    return w_gap * gap_score + w_rvol * rvol_score + w_turn * turn_score
+    score = w_gap * gap_score + w_rvol * rvol_score + w_turn * turn_score
+
+    # VZ convergence bonus — stocks with ALL strong signals are clearly "the one"
+    if strategy == 'vz':
+        strong_signals = 0
+        if pct >= 40: strong_signals += 1        # big gap
+        if rvol >= 4.0: strong_signals += 1      # very high RVOL
+        if turnover >= 20: strong_signals += 1   # 20%+ of float traded
+        if strong_signals >= 2:
+            score *= 1.3  # 30% bonus for convergence
+        if strong_signals >= 3:
+            score *= 1.2  # additional 20% (total ~56% boost)
+
+    return score
+
+
+def _get_turnover(sym: str, d: dict) -> float:
+    """Compute float turnover % for a candidate (volume / float * 100)."""
+    enrich = _enrichment.get(sym, {})
+    flt = _parse_float_to_shares(enrich.get('float', '-'))
+    vol = d.get('volume_raw', 0)
+    return (vol / flt * 100) if flt > 0 and vol > 0 else 0.0
 
 
 def _avg_bar_range_pct(sym: str) -> float:
@@ -6970,7 +6991,17 @@ class ScannerThread(threading.Thread):
                 return
 
             log.info(f"VZ candidates ({len(candidates)}): "
-                     + " | ".join(f"{s} +{d['pct']:.0f}% score={_composite_score(s, d, 'vz'):.1f}" for s, d in candidates))
+                     + " | ".join(
+                         f"{s} +{d['pct']:.0f}% RVOL={d.get('rvol',0):.1f}x "
+                         f"FT={_get_turnover(s, d):.0f}% score={_composite_score(s, d, 'vz'):.1f}"
+                         for s, d in candidates))
+
+            # Log "Stock of the Day" — top ranked candidate
+            top_sym, top_d = candidates[0]
+            top_turn = _get_turnover(top_sym, top_d)
+            log.info(f"VZ TOP PICK: {top_sym} | gap +{top_d['pct']:.0f}% | "
+                     f"RVOL {top_d.get('rvol',0):.1f}x | turnover {top_turn:.0f}% | "
+                     f"score {_composite_score(top_sym, top_d, 'vz'):.1f}")
 
             # ── 2. Build VZCandidate objects ──
             vz_candidates = []

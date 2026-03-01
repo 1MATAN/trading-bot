@@ -351,7 +351,7 @@ VZ_LIVE_LOSS_COOLDOWN_SEC = 300           # 5 min cooldown after loss
 VZ_LIVE_GAP_MIN_PCT = 20.0               # min gap % filter
 VZ_LIVE_RVOL_MIN = 2.0                   # min relative volume
 VZ_LIVE_REQUIRE_NEWS = True              # require news catalyst
-VZ_LIVE_MAX_TRACKED_SYMBOLS = 5          # top N candidates to track
+VZ_LIVE_MAX_TRACKED_SYMBOLS = 3          # top N candidates to track
 VZ_LIVE_MAX_HOLD_MINUTES = 240           # 4h max hold
 VZ_LIVE_DEAD_ZONES = [                   # no entries during these windows (ET)
     ("11:00", "11:30"),
