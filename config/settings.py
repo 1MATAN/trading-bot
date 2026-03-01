@@ -269,12 +269,14 @@ GG_LIVE_GAP_MIN_PCT = 30.0
 GG_LIVE_RVOL_MIN = 2.5                # minimum relative volume (strong momentum)
 GG_LIVE_REQUIRE_NEWS = True            # require news catalyst
 GG_LIVE_INITIAL_CASH = 3000.0
-GG_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
-GG_LIVE_VWAP_PROXIMITY_PCT = 0.02      # first entry: within 2% of VWAP
+GG_LIVE_POSITION_SIZE_FIXED = 700      # $700 per position (was $1K — risk $42/trade at 6% stop)
+GG_LIVE_VWAP_PROXIMITY_PCT = 0.05      # first entry: within 5% of VWAP (was 2%, too tight for 30%+ gappers)
+GG_LIVE_REENTRY_VWAP_MAX_PCT = 0.06   # re-entry: max 6% above VWAP (was unlimited)
+GG_LIVE_REENTRY_MIN_VOLUME = 5000     # re-entry: min 5K shares last bar (vs 1K first entry)
 GG_LIVE_MAX_TRACKED_SYMBOLS = 8
 GG_LIVE_MAX_POSITIONS = 3              # max open positions
-GG_LIVE_SAFETY_STOP_PCT = 0.08         # 8% max loss from entry
-GG_LIVE_TRAILING_STOP_PCT = 0.10       # 10% trailing from highest high (was 6%, shaken out by normal pullbacks)
+GG_LIVE_SAFETY_STOP_PCT = 0.08         # 8% max loss from entry (6% was too tight for penny volatility)
+GG_LIVE_TRAILING_STOP_PCT = 0.07       # 7% trailing from highest high (was 10%)
 GG_LIVE_MIN_HOLD_SEC = 600             # 10 min minimum hold before HA exit allowed
 GG_LIVE_HA_EXIT_BARS = 3              # 3 consecutive HA red bars required for exit
 GG_LIVE_PROFIT_TARGET_PCT = 0.05      # +5% → sell half, move stop to breakeven
@@ -282,32 +284,40 @@ GG_MAX_HOLD_MINUTES = 120              # 2 hours max hold
 
 # ── Momentum Ride LIVE ───────────────────────────────
 MR_LIVE_INITIAL_CASH = 3000.0
-MR_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
+MR_LIVE_POSITION_SIZE_FIXED = 700      # $700 per position (was $1K — risk $49/trade at 7% stop)
 MR_LIVE_MAX_TRACKED_SYMBOLS = 5
 MR_LIVE_MAX_POSITIONS = 3              # max open positions
-MR_TRAILING_STOP_PCT = 0.12            # 12% trailing from highest high (was 8%, too tight on 20-50% gap stocks)
-MR_SAFETY_STOP_PCT = 0.10             # 10% below entry (was 8%)
+MR_TRAILING_STOP_PCT = 0.07            # 7% trailing from highest high (was 12%, too wide)
+MR_SAFETY_STOP_PCT = 0.07             # 7% below entry (was 10%)
 MR_LIVE_TRAILING_STOP_PCT = MR_TRAILING_STOP_PCT
 MR_LIVE_SAFETY_STOP_PCT = MR_SAFETY_STOP_PCT
 MR_LIVE_PULLBACK_TOUCH_PCT = 0.02      # low within 2% of VWAP
+MR_ATR_STOP_MAX_PCT = 0.05            # cap ATR-based stop distance at 5% (penny 1.5x = 7.5%) — was 8%, too wide
+MR_ATR_CAP = 0.10                     # if ATR > 0.10, reject ATR trailing — use fixed % instead
+MR_REENTRY_COOLDOWN_SEC = 300         # 5 min between re-entries on same symbol
+MR_MAX_ENTRIES_PER_SYM_PER_DAY = 5    # max 5 entries per symbol per day
 MR_LIVE_PROFIT_TARGET_PCT = 0.10      # +10% → sell half, move stop to breakeven
 
 # ── Float Turnover (FT) Robot ──────────────────────────
 FT_LIVE_INITIAL_CASH = 3000.0
-FT_LIVE_POSITION_SIZE_FIXED = 1000     # $1,000 per position (was 95% all-in)
+FT_LIVE_POSITION_SIZE_FIXED = 700      # $700 per position (was $1K — risk $42/trade at 6% stop)
 FT_LIVE_MAX_TRACKED_SYMBOLS = 5        # was 20 — concentrate on top turnover
 FT_LIVE_MAX_POSITIONS = 3              # max open positions
 FT_MIN_FLOAT_TURNOVER_PCT = 25.0     # minimum % of float traded (was 15%)
 FT_LIVE_GAP_MIN_PCT = 30.0           # minimum gap % (directional filter)
 FT_LIVE_RVOL_MIN = 3.0               # minimum relative volume (extreme volume)
 FT_LIVE_REQUIRE_NEWS = True           # require news catalyst
+FT_SAFETY_STOP_PCT = 0.06            # 6% below entry — absolute safety net
+FT_TRAILING_STOP_PCT = 0.06          # 6% trailing from highest high
 FT_MAX_HOLD_MINUTES = 180             # 3 hours max hold (was 60min, killed winners mid-move)
 FT_LIVE_PROFIT_TARGET_PCT = 0.08      # +8% → sell half, move stop to breakeven
+FT_BREAKEVEN_OFFSET_PCT = 0.01       # breakeven triggers at entry + 1% (not exact entry — avoids noise)
+FT_ENTRY_SKIP_BEFORE = "09:30"       # no FT entries before 9:30 ET (pre-market too volatile)
 
 # ── Strategy-Wide Risk Controls ──────────────────────
 STRATEGY_MIN_PRICE = 0.50              # skip stocks under $0.50 (huge spreads)
 STRATEGY_MAX_BAR_RANGE_PCT = 0.05      # skip stocks with avg bar range > 5% (spread/chop proxy)
-FIB_DT_POSITION_SIZE_FIXED = 500       # $500 per position (FIB DT cap)
+FIB_DT_POSITION_SIZE_FIXED = 500       # $500 per position (highest WR robot — risk $30/trade at 6% stop)
 FIB_DT_MAX_POSITIONS = 3              # max open positions for FIB DT
 FIB_DT_MAX_HOLD_MINUTES = 180         # 3 hours max hold
 FIB_DT_WARMUP_SEC = 300               # 5 min warmup: skip entries for stocks seen < 5 min ago
@@ -315,6 +325,39 @@ STRATEGY_REENTRY_COOLDOWN_SEC = 600              # 10 min after exit before re-e
 STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC = 1800  # 30 min after a losing exit
 STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY = 2       # max 2 entries per stock per day
 STRATEGY_DAILY_LOSS_LIMIT = 300.0      # $300 max realized loss per strategy per day
+
+# ── Smart Timed Exits (P&L-aware) ────────────────────────
+TIMED_EXIT_IMMEDIATE_MAX_LOSS_PCT = 0.05   # close immediately if loss ≤ 5%
+TIMED_EXIT_TIGHT_TRAIL_PCT = 0.02          # tight 2% trailing for deep-loss positions
+TIMED_EXIT_TIGHT_TRAIL_PENNY_PCT = 0.03    # 3% for sub-$2 stocks
+
+# ── EOD Profit Protection ────────────────────────────────
+EOD_PROFIT_LOCK_TIME = "15:30"             # after this time, lock profits with tight trail
+EOD_PROFIT_LOCK_TRAIL_PCT = 0.03           # 3% trailing stop on profitable positions
+EOD_PROFIT_LOCK_PENNY_TRAIL_PCT = 0.04     # 4% for sub-$2 stocks
+
+# ── VWAP Zone Live Robot ──────────────────────────────
+VZ_LIVE_INITIAL_CASH = 3000.0
+VZ_LIVE_POSITION_SIZE = 300               # $300 per position (default)
+VZ_LIVE_POSITION_SIZE_SUB2 = 400          # $400 for sub-$2 stocks
+VZ_LIVE_MAX_SLOTS_PER_SYM = 3            # 3 concurrent slots per symbol (SYM_0/1/2)
+VZ_LIVE_VWAP_BAND_PCT = 0.03             # ±3% of VWAP for entry zone
+VZ_LIVE_SMA_PERIOD = 20                  # SMA20 on 1-min bars
+VZ_LIVE_ATR_PERIOD = 14                  # ATR(14)
+VZ_LIVE_ATR_TRAIL_MULT = 1.5             # trailing stop = ATR × 1.5
+VZ_LIVE_MIN_HOLD_BARS = 3                # min 3 bars before exit check
+VZ_LIVE_MAX_ENTRIES_PER_SYM = 9          # max entries per symbol per day
+VZ_LIVE_LOSS_COOLDOWN_SEC = 300           # 5 min cooldown after loss
+VZ_LIVE_GAP_MIN_PCT = 20.0               # min gap % filter
+VZ_LIVE_RVOL_MIN = 2.0                   # min relative volume
+VZ_LIVE_REQUIRE_NEWS = True              # require news catalyst
+VZ_LIVE_MAX_TRACKED_SYMBOLS = 5          # top N candidates to track
+VZ_LIVE_MAX_HOLD_MINUTES = 240           # 4h max hold
+VZ_LIVE_DEAD_ZONES = [                   # no entries during these windows (ET)
+    ("11:00", "11:30"),
+    ("13:00", "13:30"),
+    ("14:00", "15:00"),
+]
 
 # ── Screen Monitor (IBKR Scanner) ────────────────────
 MONITOR_IBKR_CLIENT_ID = 20

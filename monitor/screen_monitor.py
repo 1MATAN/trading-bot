@@ -53,17 +53,8 @@ from deep_translator import GoogleTranslator
 from strategies.fibonacci_engine import (
     find_anchor_candle, build_dual_series, advance_series,
 )
-from strategies.fib_dt_live_strategy import (
-    FibDTLiveStrategySync, GapSignal,
-)
-from strategies.gap_go_live_strategy import (
-    GapGoLiveStrategy, GGCandidate,
-)
-from strategies.momentum_ride_live_strategy import (
-    MomentumRideLiveStrategy, MRCandidate,
-)
-from strategies.float_turnover_live_strategy import (
-    FloatTurnoverLiveStrategy, FTCandidate,
+from strategies.vwap_zone_live_strategy import (
+    VWAPZoneLiveStrategy, VZCandidate,
 )
 from monitor.order_thread import OrderThread
 from config.settings import (
@@ -72,21 +63,14 @@ from config.settings import (
     MONITOR_PRICE_MIN, MONITOR_PRICE_MAX, MONITOR_DEFAULT_FREQ,
     MONITOR_DEFAULT_ALERT_PCT, ALERT_VWAP_MAX_BELOW_PCT,
     BRACKET_FIB_STOP_PCT, BRACKET_TRAILING_PROFIT_PCT, STOP_LIMIT_OFFSET_PCT,
-    GG_LIVE_GAP_MIN_PCT, GG_LIVE_INITIAL_CASH, GG_LIVE_POSITION_SIZE_FIXED,
-    GG_LIVE_MAX_POSITIONS, GG_MAX_HOLD_MINUTES,
-    GG_LIVE_RVOL_MIN, GG_LIVE_REQUIRE_NEWS,
-    MR_GAP_MIN_PCT, MR_GAP_MAX_PCT, MR_LIVE_INITIAL_CASH, MR_LIVE_POSITION_SIZE_FIXED,
-    MR_LIVE_MAX_POSITIONS, MR_LIVE_RVOL_MIN, MR_LIVE_REQUIRE_NEWS, MR_LIVE_PROFIT_TARGET_PCT,
-    FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_FIXED, FT_MIN_FLOAT_TURNOVER_PCT,
-    FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES, FT_LIVE_PROFIT_TARGET_PCT,
-    FT_LIVE_GAP_MIN_PCT, FT_LIVE_RVOL_MIN, FT_LIVE_REQUIRE_NEWS,
     STRATEGY_MIN_PRICE, STRATEGY_MAX_BAR_RANGE_PCT,
-    FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
-    FIB_DT_MAX_HOLD_MINUTES,
-    FIB_DT_GAP_MIN_PCT, FIB_DT_GAP_MAX_PCT, FIB_DT_RVOL_MIN, FIB_DT_REQUIRE_NEWS,
     STRATEGY_REENTRY_COOLDOWN_SEC, STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC,
     STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY, STRATEGY_DAILY_LOSS_LIMIT,
-    FIB_DT_WARMUP_SEC,
+    TIMED_EXIT_IMMEDIATE_MAX_LOSS_PCT, TIMED_EXIT_TIGHT_TRAIL_PCT, TIMED_EXIT_TIGHT_TRAIL_PENNY_PCT,
+    EOD_PROFIT_LOCK_TIME, EOD_PROFIT_LOCK_TRAIL_PCT, EOD_PROFIT_LOCK_PENNY_TRAIL_PCT,
+    VZ_LIVE_INITIAL_CASH, VZ_LIVE_POSITION_SIZE, VZ_LIVE_POSITION_SIZE_SUB2,
+    VZ_LIVE_MAX_SLOTS_PER_SYM, VZ_LIVE_GAP_MIN_PCT, VZ_LIVE_RVOL_MIN,
+    VZ_LIVE_REQUIRE_NEWS, VZ_LIVE_MAX_TRACKED_SYMBOLS, VZ_LIVE_MAX_HOLD_MINUTES,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -701,10 +685,11 @@ def _composite_score(sym: str, d: dict, strategy: str = 'default') -> float:
 
     # Strategy-specific weights (gap%, rvol, turnover)
     weights = {
-        'fib_dt':  (0.2, 0.3, 0.5),  # turnover-heavy (float rotation matters)
-        'gg':      (0.5, 0.3, 0.2),  # gap-heavy (momentum direction)
-        'mr':      (0.4, 0.4, 0.2),  # balanced gap + RVOL
-        'ft':      (0.1, 0.3, 0.6),  # turnover-dominant
+        'vz':      (0.4, 0.4, 0.2),  # balanced gap + RVOL for VWAP Zone
+        'fib_dt':  (0.2, 0.3, 0.5),
+        'gg':      (0.5, 0.3, 0.2),
+        'mr':      (0.4, 0.4, 0.2),
+        'ft':      (0.1, 0.3, 0.6),
     }
     w_gap, w_rvol, w_turn = weights.get(strategy, (0.33, 0.33, 0.34))
 
@@ -2241,11 +2226,8 @@ def _track_daily_stats(current: dict, new_count: int = 0):
 
 def _check_daily_summary(positions: dict[str, tuple] | None = None,
                          net_liq: float = 0, buying_power: float = 0,
-                         fib_dt_sym: str | None = None, cycle_count: int = 0,
-                         virtual_portfolio_summary: str = '',
-                         gg_portfolio_summary: str = '',
-                         mr_portfolio_summary: str = '',
-                         ft_portfolio_summary: str = ''):
+                         cycle_count: int = 0,
+                         vz_portfolio_summary: str = ''):
     """Send comprehensive end-of-day report at ~16:05 ET. Only once per day."""
     global _daily_summary_sent, _daily_new_stocks, _daily_reports_sent
     now_et = datetime.now(ZoneInfo('US/Eastern'))
@@ -2267,83 +2249,22 @@ def _check_daily_summary(positions: dict[str, tuple] | None = None,
         "━━━━━━━━━━━━━━━━━━",
     ]
 
-    # ── FIB DT Section ──
-    fib_tracks = [e for e in _daily_events if e['type'] == 'fib_dt_track']
-    fib_signals = [e for e in _daily_events if e['type'] == 'fib_dt_signal']
-    fib_entries = [e for e in _daily_events if e['type'] == 'fib_dt_entry']
-    fib_closes = [e for e in _daily_events if e['type'] == 'fib_dt_close']
+    # ── VWAP Zone Section ──
+    vz_entries = [e for e in _daily_events if e['type'] == 'vz_entry']
+    vz_exits = [e for e in _daily_events if e['type'] == 'vz_exit']
 
     lines.append("")
-    lines.append("📐 <b>אסטרטגיית FIB DT:</b>")
-    if fib_dt_sym:
-        lines.append(f"  • מניה נסרקת: {fib_dt_sym}")
-    if fib_tracks:
-        tracked_syms = list(dict.fromkeys(e['symbol'] for e in fib_tracks))
-        lines.append(f"  • מניות שנסרקו: {', '.join(tracked_syms)}")
-    lines.append(f"  • איתותי כניסה: {len(fib_signals)}")
-    for e in fib_signals:
+    lines.append("📊 <b>אסטרטגיית VWAP Zone:</b>")
+    lines.append(f"  • כניסות: {len(vz_entries)}")
+    for e in vz_entries:
         lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-    lines.append(f"  • כניסות שבוצעו: {len(fib_entries)}")
-    for e in fib_entries:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-    lines.append(f"  • יציאות/סגירות: {len(fib_closes)}")
-    for e in fib_closes:
+    lines.append(f"  • יציאות: {len(vz_exits)}")
+    for e in vz_exits:
         lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
 
-    if virtual_portfolio_summary:
+    if vz_portfolio_summary:
         lines.append("")
-        lines.append(virtual_portfolio_summary)
-
-    # ── Gap and Go Section ──
-    gg_entries = [e for e in _daily_events if e['type'] == 'gg_entry']
-    gg_exits = [e for e in _daily_events if e['type'] == 'gg_exit']
-
-    lines.append("")
-    lines.append("🚀 <b>אסטרטגיית Gap&Go:</b>")
-    lines.append(f"  • כניסות: {len(gg_entries)}")
-    for e in gg_entries:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-    lines.append(f"  • יציאות: {len(gg_exits)}")
-    for e in gg_exits:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-
-    if gg_portfolio_summary:
-        lines.append("")
-        lines.append(gg_portfolio_summary)
-
-    # ── Momentum Ride Section ──
-    mr_entries = [e for e in _daily_events if e['type'] == 'mr_entry']
-    mr_exits = [e for e in _daily_events if e['type'] == 'mr_exit']
-
-    lines.append("")
-    lines.append("📈 <b>אסטרטגיית Momentum Ride:</b>")
-    lines.append(f"  • כניסות: {len(mr_entries)}")
-    for e in mr_entries:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-    lines.append(f"  • יציאות: {len(mr_exits)}")
-    for e in mr_exits:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-
-    if mr_portfolio_summary:
-        lines.append("")
-        lines.append(mr_portfolio_summary)
-
-    # ── Float Turnover Section ──
-    ft_entries = [e for e in _daily_events if e['type'] == 'ft_entry']
-    ft_exits = [e for e in _daily_events if e['type'] == 'ft_exit']
-
-    lines.append("")
-    lines.append("🔄 <b>אסטרטגיית Float Turnover:</b>")
-    lines.append(f"  • כניסות: {len(ft_entries)}")
-    for e in ft_entries:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-    lines.append(f"  • יציאות: {len(ft_exits)}")
-    for e in ft_exits:
-        lines.append(f"    {e['time']} — {e['symbol']} {e['detail']}")
-
-    if ft_portfolio_summary:
-        lines.append("")
-        lines.append(ft_portfolio_summary)
+        lines.append(vz_portfolio_summary)
 
     # ── Open Positions ──
     if positions:
@@ -2454,18 +2375,15 @@ def _week_key() -> str:
     return f"{now.year}-W{now.isocalendar()[1]:02d}"
 
 
-def _build_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict) -> str:
-    """Build a comprehensive weekly performance report for all 4 portfolios."""
+def _build_weekly_report(vz_vp, current_prices: dict) -> str:
+    """Build a weekly performance report for the VZ portfolio."""
     lines = [
         f"📊 <b>דוח שבועי — שבוע {_week_key()}</b>",
         "━━━━━━━━━━━━━━━━━━",
     ]
 
     for label, vp, journal_path in [
-        ("📐 FIB DT [SIM]", fib_vp, VirtualPortfolio.JOURNAL_PATH),
-        ("🚀 Gap&Go [GG-SIM]", gg_vp, GGVirtualPortfolio.JOURNAL_PATH),
-        ("📈 Momentum Ride [MR-SIM]", mr_vp, MRVirtualPortfolio.JOURNAL_PATH),
-        ("🔄 Float Turnover [FT-SIM]", ft_vp, FTVirtualPortfolio.JOURNAL_PATH),
+        ("📊 VWAP Zone [VZ-SIM]", vz_vp, VZVirtualPortfolio.JOURNAL_PATH),
     ]:
         nlv = vp.net_liq(current_prices)
         total_pnl = nlv - vp.INITIAL_CASH
@@ -2510,31 +2428,20 @@ def _build_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict) -> s
             lines.append(f"  💀 Worst: {worst_trade[0]} ${worst_trade[1]:+.2f}")
         if vp.positions:
             lines.append(f"  📋 Open positions ({len(vp.positions)}):")
-            for sym, pos in vp.positions.items():
-                px = current_prices.get(sym, pos['entry_price'])
-                qty = pos.get('qty', pos.get('other_half', 0))
+            for slot_key, pos in vp.positions.items():
+                base_sym = vp._base_sym(slot_key)
+                px = current_prices.get(base_sym, pos['entry_price'])
+                qty = pos.get('qty', 0)
                 sym_pnl = (px - pos['entry_price']) * qty
-                lines.append(f"    • {sym}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+                lines.append(f"    • {slot_key}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
 
-    # Combined totals
-    combined_nlv = sum(vp.net_liq(current_prices) for vp in [fib_vp, gg_vp, mr_vp, ft_vp])
-    combined_initial = fib_vp.INITIAL_CASH + gg_vp.INITIAL_CASH + mr_vp.INITIAL_CASH + ft_vp.INITIAL_CASH
-    combined_pnl = combined_nlv - combined_initial
-    combined_pct = (combined_nlv / combined_initial - 1) * 100
-
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<b>סה\"כ משולב (4 אסטרטגיות):</b>")
-    lines.append(f"  💰 השקעה: ${combined_initial:,.0f}")
-    lines.append(f"  📊 Net Liq: ${combined_nlv:,.0f} ({combined_pct:+.1f}%)")
-    lines.append(f"  {'💚' if combined_pnl >= 0 else '❤️'} P&L: ${combined_pnl:+,.2f}")
     lines.append("")
     lines.append("🔄 איפוס שבועי ביום שני 04:00 ET")
 
     return "\n".join(lines)
 
 
-def _check_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict):
+def _check_weekly_report(vz_vp, current_prices: dict):
     """Send weekly performance report on Friday 16:03-16:10 ET."""
     global _weekly_report_sent
     now_et = datetime.now(_ET)
@@ -2542,7 +2449,6 @@ def _check_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict):
     wk = _week_key()
     if wk == _weekly_report_sent:
         return
-    # Only on Friday (weekday=4)
     if now_et.weekday() != 4:
         return
     t = now_et.time()
@@ -2552,20 +2458,19 @@ def _check_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices: dict):
     _weekly_report_sent = wk
     _save_weekly_state()
 
-    report = _build_weekly_report(fib_vp, gg_vp, mr_vp, ft_vp, current_prices)
+    report = _build_weekly_report(vz_vp, current_prices)
     send_telegram(report)
     log.info(f"Weekly report sent for {wk}")
 
 
-def _check_weekly_reset(fib_vp, gg_vp, mr_vp, ft_vp):
-    """Reset all 4 portfolios on Monday 03:30-04:00 ET."""
+def _check_weekly_reset(vz_vp):
+    """Reset VZ portfolio on Monday 03:30-04:00 ET."""
     global _weekly_reset_done
     now_et = datetime.now(_ET)
 
     wk = _week_key()
     if wk == _weekly_reset_done:
         return
-    # Only on Monday (weekday=0)
     if now_et.weekday() != 0:
         return
     t = now_et.time()
@@ -2575,16 +2480,13 @@ def _check_weekly_reset(fib_vp, gg_vp, mr_vp, ft_vp):
     _weekly_reset_done = wk
     _save_weekly_state()
 
-    fib_vp.reset()
-    gg_vp.reset()
-    mr_vp.reset()
-    ft_vp.reset()
+    vz_vp.reset()
 
     send_telegram(
         f"🔄 <b>איפוס שבועי — {wk}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"כל 4 הפורטפוליו אופסו ל-$3,000.\n"
-        f"📐 FIB DT | 🚀 Gap&Go | 📈 Momentum Ride | 🔄 Float Turnover\n"
+        f"פורטפוליו VWAP Zone אופס ל-$3,000.\n"
+        f"📊 VWAP Zone\n"
         f"שבוע חדש מתחיל! 🚀"
     )
     log.info(f"Weekly reset done for {wk}")
@@ -3339,37 +3241,13 @@ def _build_trade_logic_detail(robot_name: str, prefix: str, sym: str,
 
     # ── 4. Robot thresholds (what this robot requires) ──
     thresh = ''
-    if robot_name == 'FIB DT':
+    if robot_name == 'VWAP Zone':
         thresh = (
-            f"🤖 חוקי רובוט: גאפ {FIB_DT_GAP_MIN_PCT:.0f}-{FIB_DT_GAP_MAX_PCT:.0f}% | "
-            f"RVOL≥{FIB_DT_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
-            f"חדשות: {'כן' if FIB_DT_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
-            f"💰 גודל: ${FIB_DT_POSITION_SIZE_FIXED}/פוז | מקס {FIB_DT_MAX_POSITIONS} פוז | "
-            f"warmup {FIB_DT_WARMUP_SEC}s | מקס החזקה {FIB_DT_MAX_HOLD_MINUTES} דק"
-        )
-    elif robot_name == 'Gap&Go':
-        thresh = (
-            f"🤖 חוקי רובוט: גאפ≥{GG_LIVE_GAP_MIN_PCT:.0f}% | "
-            f"RVOL≥{GG_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
-            f"חדשות: {'כן' if GG_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
-            f"💰 גודל: ${GG_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {GG_LIVE_MAX_POSITIONS} פוז | "
-            f"מקס החזקה {GG_MAX_HOLD_MINUTES} דק"
-        )
-    elif robot_name == 'MR':
-        thresh = (
-            f"🤖 חוקי רובוט: גאפ {MR_GAP_MIN_PCT:.0f}-{MR_GAP_MAX_PCT:.0f}% | "
-            f"RVOL≥{MR_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
-            f"חדשות: {'כן' if MR_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
-            f"💰 גודל: ${MR_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {MR_LIVE_MAX_POSITIONS} פוז | "
-            f"טרגט +{MR_LIVE_PROFIT_TARGET_PCT*100:.0f}%"
-        )
-    elif robot_name == 'FT':
-        thresh = (
-            f"🤖 חוקי רובוט: turnover≥{FT_MIN_FLOAT_TURNOVER_PCT:.0f}% | "
-            f"גאפ≥{FT_LIVE_GAP_MIN_PCT:.0f}% | RVOL≥{FT_LIVE_RVOL_MIN}x | "
-            f"חדשות: {'כן' if FT_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
-            f"💰 גודל: ${FT_LIVE_POSITION_SIZE_FIXED}/פוז | מקס {FT_LIVE_MAX_POSITIONS} פוז | "
-            f"טרגט +{FT_LIVE_PROFIT_TARGET_PCT*100:.0f}% | מקס {FT_MAX_HOLD_MINUTES} דק"
+            f"🤖 חוקי רובוט: גאפ≥{VZ_LIVE_GAP_MIN_PCT:.0f}% | "
+            f"RVOL≥{VZ_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
+            f"חדשות: {'כן' if VZ_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
+            f"💰 גודל: ${VZ_LIVE_POSITION_SIZE}/פוז | מקס {VZ_LIVE_MAX_SLOTS_PER_SYM} slots/sym | "
+            f"מקס החזקה {VZ_LIVE_MAX_HOLD_MINUTES} דק"
         )
     if thresh:
         lines.append(thresh)
@@ -3441,7 +3319,7 @@ def _send_trade_journal_entry(robot_emoji: str, robot_name: str,
     date_csv = exit_dt.strftime('%Y-%m-%d')
 
     # Find entry reason from _daily_events
-    prefix_map = {'FIB DT': 'fib_dt_', 'Gap&Go': 'gg_', 'MR': 'mr_', 'FT': 'ft_'}
+    prefix_map = {'VWAP Zone': 'vz_', 'FIB DT': 'fib_dt_', 'Gap&Go': 'gg_', 'MR': 'mr_', 'FT': 'ft_'}
     prefix = prefix_map.get(robot_name, '')
     entry_reason = ''
     for ev in reversed(_daily_events):
@@ -6302,44 +6180,45 @@ class TelegramListenerThread(threading.Thread):
 
 
 # ══════════════════════════════════════════════════════════
-#  Virtual Portfolio for FIB DT Simulation
+#  VWAP Zone Virtual Portfolio (slot-based positions)
 # ══════════════════════════════════════════════════════════
 
-class VirtualPortfolio:
-    """Virtual portfolio for FIB DT paper simulation.
+class VZVirtualPortfolio:
+    """Virtual portfolio for VWAP Zone paper simulation.
 
-    Tracks cash, positions, and P&L independently of the IBKR account.
-    Uses real-time prices for stop/target checks.
-    Writes all trades to a CSV journal for performance analysis.
+    Slot-based positions: SYM_0, SYM_1, SYM_2 (up to 3 per symbol).
     """
 
-    INITIAL_CASH = 3000.0
-    JOURNAL_PATH = DATA_DIR / "virtual_trades.csv"
-    _STATE_PATH = DATA_DIR / "fib_dt_state.json"
+    INITIAL_CASH = VZ_LIVE_INITIAL_CASH
+    JOURNAL_PATH = DATA_DIR / "vz_virtual_trades.csv"
+    _STATE_PATH = DATA_DIR / "vz_state.json"
 
     def __init__(self):
         self.cash: float = self.INITIAL_CASH
         self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, stop, target, half, other_half, phase, entry_ts}
-        # phase: IN_POSITION | TRAILING
-        self.trades: list[dict] = []  # history
-        self._exit_history: list[dict] = []  # {sym, ts, pnl} for cooldown
+        # slot_key -> {qty, entry_price, entry_ts}
+        # slot_key format: "SYM_0", "SYM_1", "SYM_2"
+        self.trades: list[dict] = []
+        self._exit_history: list[dict] = []
         self._daily_realized_pnl: float = 0.0
         self._daily_pnl_date: str = ""
         self._init_journal()
         self._load_state()
 
+    @staticmethod
+    def _base_sym(slot_key: str) -> str:
+        """Extract base symbol from slot key: 'AAPL_0' -> 'AAPL'."""
+        return slot_key.rsplit('_', 1)[0]
+
     def _save_state(self):
-        """Persist portfolio state to disk (survives restarts)."""
         try:
             state = {'cash': self.cash, 'positions': self.positions}
             with open(self._STATE_PATH, 'w') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
-            log.warning(f"FIB DT state save error: {e}")
+            log.warning(f"VZ state save error: {e}")
 
     def _load_state(self):
-        """Load portfolio state from disk."""
         try:
             if not self._STATE_PATH.exists():
                 return
@@ -6348,14 +6227,13 @@ class VirtualPortfolio:
             self.cash = state.get('cash', self.INITIAL_CASH)
             self.positions = state.get('positions', {})
             if self.positions:
-                log.info(f"FIB DT state restored: cash=${self.cash:.0f}, "
+                log.info(f"VZ state restored: cash=${self.cash:.0f}, "
                          f"{len(self.positions)} positions: "
                          + ", ".join(self.positions.keys()))
         except Exception as e:
-            log.warning(f"FIB DT state load error: {e}")
+            log.warning(f"VZ state load error: {e}")
 
     def _reset_daily_pnl(self):
-        """Reset daily P&L tracker if new day."""
         today = datetime.now(_ET).strftime('%Y-%m-%d')
         if self._daily_pnl_date != today:
             self._daily_pnl_date = today
@@ -6363,448 +6241,21 @@ class VirtualPortfolio:
             self._exit_history = [e for e in self._exit_history
                                   if time_mod.time() - e['ts'] < 86400]
 
-    def can_enter(self, sym: str) -> tuple[bool, str]:
-        """Check if entry is allowed (max positions, cooldown, daily loss, min price)."""
+    def can_enter(self, slot_key: str) -> tuple[bool, str]:
+        """Check if entry is allowed (max positions, cooldown, daily loss)."""
         self._reset_daily_pnl()
-        # Max positions
-        if len(self.positions) >= FIB_DT_MAX_POSITIONS:
-            return False, f"max positions ({FIB_DT_MAX_POSITIONS})"
+        sym = self._base_sym(slot_key)
+        # Max total open positions (all slots across all symbols)
+        max_total = VZ_LIVE_MAX_TRACKED_SYMBOLS * VZ_LIVE_MAX_SLOTS_PER_SYM
+        if len(self.positions) >= max_total:
+            return False, f"max total positions ({max_total})"
         # Daily loss limit
         if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
             return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
-        # Max entries per stock per day
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
-                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
-        # Count current position too
-        if sym in self.positions:
-            today_entries += 1
-        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
-            return False, f"max entries/day for {sym} ({STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY})"
-        # Cooldown
+        # Cooldown per symbol (check exit history for base symbol)
         now_ts = time_mod.time()
         for e in reversed(self._exit_history):
-            if e['sym'] == sym:
-                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
-                            else STRATEGY_REENTRY_COOLDOWN_SEC)
-                elapsed = now_ts - e['ts']
-                if elapsed < cooldown:
-                    remaining = int(cooldown - elapsed)
-                    return False, f"cooldown {remaining}s for {sym}"
-                break
-        return True, ""
-
-    def _record_exit(self, sym: str, pnl: float):
-        """Record exit for cooldown/daily tracking."""
-        self._reset_daily_pnl()
-        self._daily_realized_pnl += pnl
-        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
-
-    def _init_journal(self):
-        """Create CSV journal with header if it doesn't exist."""
-        if not self.JOURNAL_PATH.exists():
-            with open(self.JOURNAL_PATH, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    'date', 'time_et', 'symbol', 'side', 'reason',
-                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
-                    'cash_after', 'net_liq', 'positions_open',
-                ])
-
-    def _log_journal(self, sym: str, side: str, reason: str,
-                     qty: int, price: float, entry_price: float,
-                     pnl: float, net_liq: float):
-        """Append a row to the CSV journal."""
-        now = datetime.now(_ET)
-        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
-        try:
-            with open(self.JOURNAL_PATH, 'a', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    now.strftime('%Y-%m-%d'),
-                    now.strftime('%H:%M:%S'),
-                    sym, side, reason,
-                    qty, f'{price:.4f}', f'{entry_price:.4f}',
-                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
-                    f'{self.cash:.2f}', f'{net_liq:.2f}',
-                    len(self.positions),
-                ])
-        except Exception as e:
-            log.warning(f"Journal write error: {e}")
-        if side != 'BUY':
-            _send_trade_journal_entry('📐', 'FIB DT', sym, reason, qty,
-                                      price, entry_price, pnl, net_liq,
-                                      self.cash, self.trades)
-
-    @staticmethod
-    def _ts() -> str:
-        """Current ET timestamp for alerts."""
-        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
-
-    def buy(self, sym: str, qty: int, price: float,
-            stop: float, target: float) -> str | None:
-        """Open a virtual position. Returns Telegram alert text or None."""
-        if qty < 2:
-            return None
-        if sym in self.positions:
-            return None
-
-        cost = qty * price
-        if cost > self.cash:
-            return None
-
-        half = qty // 2
-        other_half = qty - half
-        old_cash = self.cash
-        self.cash -= cost
-
-        self.positions[sym] = {
-            'qty': qty,
-            'entry_price': price,
-            'stop': stop,
-            'target': target,
-            'half': half,
-            'other_half': other_half,
-            'phase': 'IN_POSITION',
-            'high_since_target': 0.0,
-            'trailing_synced': False,
-            'entry_ts': time_mod.time(),
-        }
-
-        self.trades.append({
-            'sym': sym, 'side': 'BUY', 'qty': qty,
-            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
-        })
-
-        net = self._net_liq_internal({})
-        self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
-        self._save_state()
-
-        msg = (
-            f"📐 <b>FIB DT [SIM] — BUY {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  💰 {qty}sh @ ${price:.2f} | Stop: ${stop:.2f} | Target: ${target:.2f}\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}"
-        )
-        log.info(f"VIRTUAL BUY: {sym} {qty}sh @ ${price:.2f} stop=${stop:.2f} target=${target:.2f}")
-        return msg
-
-    def check_stops_and_targets(self, current_prices: dict) -> list[str]:
-        """Check all positions against current prices. Returns list of alert texts."""
-        alerts = []
-        closed = []
-
-        for sym, pos in self.positions.items():
-            price = current_prices.get(sym, 0)
-            if price <= 0:
-                continue
-            phase = pos['phase']
-
-            # ── STOP HIT (any phase with remaining shares) ──
-            if price <= pos['stop']:
-                remaining = pos['qty']
-                if phase == 'TRAILING':
-                    remaining = pos['other_half']
-
-                # Simulate stop-limit: sell at stop price, not gapped-down market price.
-                # In reality a stop-limit order fires at the stop level during decline.
-                # Only use actual price if it's above stop (normal fill).
-                fill_price = max(price, pos['stop'])
-
-                pnl = (fill_price - pos['entry_price']) * remaining
-                pnl_pct = (fill_price / pos['entry_price'] - 1) * 100
-                old_cash = self.cash
-                self.cash += remaining * fill_price
-
-                self.trades.append({
-                    'sym': sym, 'side': 'SELL', 'qty': remaining,
-                    'price': fill_price, 'pnl': pnl, 'time': datetime.now(_ET),
-                })
-
-                net_liq = self._net_liq_internal(current_prices, exclude=sym)
-                self._log_journal(sym, 'SELL', f'STOP ({phase})', remaining, fill_price,
-                                  pos['entry_price'], pnl, net_liq)
-
-                slippage_note = f" [stop-limit fill, mkt=${price:.2f}]" if fill_price > price else ""
-                alert = (
-                    f"📐 <b>FIB DT [SIM] — STOP HIT {sym}</b>\n"
-                    f"  🕐 {self._ts()}\n"
-                    f"  🔴 {remaining}sh @ ${fill_price:.2f} (entry ${pos['entry_price']:.2f}){slippage_note}\n"
-                    f"  📉 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-                    f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-                    f"  📊 Portfolio: ${net_liq:,.0f}"
-                )
-                alerts.append(alert)
-                closed.append(sym)
-                self._record_exit(sym, pnl)
-                log.info(f"VIRTUAL STOP: {sym} {remaining}sh @ ${fill_price:.2f} (mkt=${price:.2f}) P&L=${pnl:+.2f}")
-                continue
-
-            # ── UPDATE HIGH (TRAILING phase) ──
-            if phase == 'TRAILING' and price > pos.get('high_since_target', 0):
-                pos['high_since_target'] = price
-
-            # ── TARGET HIT (first half) — only in IN_POSITION phase ──
-            if phase == 'IN_POSITION' and price >= pos['target']:
-                half = pos['half']
-                pnl = (price - pos['entry_price']) * half
-                pnl_pct = (price / pos['entry_price'] - 1) * 100
-                old_cash = self.cash
-                self.cash += half * price
-
-                self.trades.append({
-                    'sym': sym, 'side': 'SELL', 'qty': half,
-                    'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-                })
-
-                pos['phase'] = 'TRAILING'
-                pos['qty'] = pos['other_half']
-                pos['high_since_target'] = price
-                pos['stop'] = pos['entry_price']  # breakeven stop
-
-                net_liq = self._net_liq_internal(current_prices)
-                self._log_journal(sym, 'SELL', 'TARGET (half)', half, price,
-                                  pos['entry_price'], pnl, net_liq)
-
-                alert = (
-                    f"📐 <b>FIB DT [SIM] — TARGET HIT {sym}</b>\n"
-                    f"  🕐 {self._ts()}\n"
-                    f"  🟢 {half}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
-                    f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-                    f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-                    f"  📊 Portfolio: ${net_liq:,.0f} ({pos['other_half']}sh still in position)\n"
-                    f"  🛡️ Stop → breakeven ${pos['entry_price']:.2f}"
-                )
-                alerts.append(alert)
-                self._save_state()
-                log.info(f"VIRTUAL TARGET: {sym} {half}sh @ ${price:.2f} P&L=${pnl:+.2f}")
-
-        for sym in closed:
-            del self.positions[sym]
-
-        if closed:
-            self._save_state()
-
-        return alerts
-
-    def trailing_exit(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell remaining shares in trailing phase. Returns alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos or pos['phase'] != 'TRAILING':
-            return None
-
-        remaining = pos['other_half']
-        pnl = (price - pos['entry_price']) * remaining
-        pnl_pct = (price / pos['entry_price'] - 1) * 100
-        old_cash = self.cash
-        self.cash += remaining * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': remaining,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        del self.positions[sym]
-        self._record_exit(sym, pnl)
-        self._save_state()
-
-        net_liq = self.net_liq({})
-        self._log_journal(sym, 'SELL', f'TRAILING ({reason})', remaining, price,
-                          pos['entry_price'], pnl, net_liq)
-
-        alert = (
-            f"📐 <b>FIB DT [SIM] — TRAILING EXIT {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  🔵 {remaining}sh @ ${price:.2f} (entry ${pos['entry_price']:.2f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net_liq:,.0f}\n"
-            f"  📝 Reason: {reason}"
-        )
-        log.info(f"VIRTUAL TRAILING EXIT: {sym} {remaining}sh @ ${price:.2f} P&L=${pnl:+.2f} ({reason})")
-        return alert
-
-    def _net_liq_internal(self, current_prices: dict, exclude: str = '') -> float:
-        """Calculate net liquidation value. Optionally exclude a symbol being closed."""
-        val = self.cash
-        for sym, pos in self.positions.items():
-            if sym == exclude:
-                continue
-            px = current_prices.get(sym, pos['entry_price'])
-            remaining = pos['qty']
-            if pos['phase'] == 'TRAILING':
-                remaining = pos['other_half']
-            val += remaining * px
-        return val
-
-    def net_liq(self, current_prices: dict) -> float:
-        """Public net liquidation value."""
-        return self._net_liq_internal(current_prices)
-
-    def summary_text(self, current_prices: dict) -> str:
-        """Generate summary text for daily report."""
-        nlv = self.net_liq(current_prices)
-        total_pnl = nlv - self.INITIAL_CASH
-        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
-
-        lines = [
-            f"📐 <b>FIB DT [SIM] Portfolio</b>",
-            f"  💵 Cash: ${self.cash:,.0f}",
-            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
-        ]
-        if self.positions:
-            lines.append(f"  📋 Open positions: {len(self.positions)}")
-            for sym, pos in self.positions.items():
-                px = current_prices.get(sym, pos['entry_price'])
-                qty = pos.get('qty', pos.get('other_half', 0))
-                sym_pnl = (px - pos['entry_price']) * qty
-                lines.append(f"    • {sym}: {qty}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
-        if self.trades:
-            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
-            lines.append(f"  📝 Trades today: {len(today_trades)}")
-            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
-            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
-
-        return "\n".join(lines)
-
-    def reset(self):
-        """Reset portfolio for new week. Archive old journal, start fresh."""
-        # Archive old journal
-        if self.JOURNAL_PATH.exists():
-            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
-            archive = self.JOURNAL_PATH.with_name(f"virtual_trades_week_{week_label}.csv")
-            try:
-                self.JOURNAL_PATH.rename(archive)
-                log.info(f"FIB DT journal archived → {archive.name}")
-            except Exception as e:
-                log.warning(f"FIB DT journal archive error: {e}")
-        # Reset state
-        self.cash = self.INITIAL_CASH
-        self.positions = {}
-        self.trades = []
-        self._init_journal()
-        self._save_state()
-        log.info("FIB DT portfolio reset to $3,000")
-
-
-# ══════════════════════════════════════════════════════════
-#  Gap and Go Virtual Portfolio
-# ══════════════════════════════════════════════════════════
-
-class GGVirtualPortfolio:
-    """Virtual portfolio for Gap and Go paper simulation.
-
-    Simpler than VirtualPortfolio — no stop/target/half-split.
-    Entry and exit are fully driven by the strategy (HA signals).
-    """
-
-    INITIAL_CASH = GG_LIVE_INITIAL_CASH
-    JOURNAL_PATH = DATA_DIR / "gg_virtual_trades.csv"
-    _STATE_PATH = DATA_DIR / "gg_state.json"
-
-    def __init__(self):
-        self.cash: float = self.INITIAL_CASH
-        self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, vwap_at_entry, entry_ts}
-        self.trades: list[dict] = []
-        self._exit_history: list[dict] = []
-        self._daily_realized_pnl: float = 0.0
-        self._daily_pnl_date: str = ""
-        self._init_journal()
-        self._load_state()
-
-    def _save_state(self):
-        """Persist portfolio state to disk (survives restarts)."""
-        try:
-            state = {
-                'cash': self.cash,
-                'positions': self.positions,
-                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
-            }
-            with open(self._STATE_PATH, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            log.warning(f"GG state save error: {e}")
-
-    def _load_state(self):
-        """Load portfolio state from disk (persists across days within the week)."""
-        try:
-            if not self._STATE_PATH.exists():
-                return
-            with open(self._STATE_PATH) as f:
-                state = json.load(f)
-            self.cash = state.get('cash', self.INITIAL_CASH)
-            self.positions = state.get('positions', {})
-            if self.positions:
-                log.info(f"GG state restored: cash=${self.cash:.0f}, "
-                         f"{len(self.positions)} positions: "
-                         + ", ".join(self.positions.keys()))
-        except Exception as e:
-            log.warning(f"GG state load error: {e}")
-
-    def _init_journal(self):
-        if not self.JOURNAL_PATH.exists():
-            with open(self.JOURNAL_PATH, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    'date', 'time_et', 'symbol', 'side', 'reason',
-                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
-                    'cash_after', 'net_liq', 'positions_open',
-                ])
-
-    def _log_journal(self, sym: str, side: str, reason: str,
-                     qty: int, price: float, entry_price: float,
-                     pnl: float, net_liq_val: float):
-        now = datetime.now(_ET)
-        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
-        try:
-            with open(self.JOURNAL_PATH, 'a', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    now.strftime('%Y-%m-%d'),
-                    now.strftime('%H:%M:%S'),
-                    sym, side, reason,
-                    qty, f'{price:.4f}', f'{entry_price:.4f}',
-                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
-                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
-                    len(self.positions),
-                ])
-        except Exception as e:
-            log.warning(f"GG journal write error: {e}")
-        if side != 'BUY':
-            _send_trade_journal_entry('🚀', 'Gap&Go', sym, reason, qty,
-                                      price, entry_price, pnl, net_liq_val,
-                                      self.cash, self.trades)
-
-    @staticmethod
-    def _ts() -> str:
-        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
-
-    def _reset_daily_pnl(self):
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        if self._daily_pnl_date != today:
-            self._daily_pnl_date = today
-            self._daily_realized_pnl = 0.0
-            self._exit_history = [e for e in self._exit_history
-                                  if time_mod.time() - e['ts'] < 86400]
-
-    def can_enter(self, sym: str) -> tuple[bool, str]:
-        self._reset_daily_pnl()
-        if len(self.positions) >= GG_LIVE_MAX_POSITIONS:
-            return False, f"max positions ({GG_LIVE_MAX_POSITIONS})"
-        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
-            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
-                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
-        if sym in self.positions:
-            today_entries += 1
-        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
-            return False, f"max entries/day for {sym}"
-        now_ts = time_mod.time()
-        for e in reversed(self._exit_history):
-            if e['sym'] == sym:
+            if self._base_sym(e['sym']) == sym:
                 cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
                             else STRATEGY_REENTRY_COOLDOWN_SEC)
                 if now_ts - e['ts'] < cooldown:
@@ -6812,14 +6263,53 @@ class GGVirtualPortfolio:
                 break
         return True, ""
 
-    def _record_exit(self, sym: str, pnl: float):
+    def _record_exit(self, slot_key: str, pnl: float):
         self._reset_daily_pnl()
         self._daily_realized_pnl += pnl
-        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
+        self._exit_history.append({'sym': slot_key, 'ts': time_mod.time(), 'pnl': pnl})
 
-    def buy(self, sym: str, qty: int, price: float, vwap: float) -> str | None:
-        """Open a GG virtual position. Returns Telegram alert text or None."""
-        if qty < 1 or sym in self.positions:
+    def _init_journal(self):
+        if not self.JOURNAL_PATH.exists():
+            with open(self.JOURNAL_PATH, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'date', 'time_et', 'symbol', 'slot_key', 'side', 'reason',
+                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
+                    'cash_after', 'net_liq', 'positions_open',
+                ])
+
+    def _log_journal(self, slot_key: str, side: str, reason: str,
+                     qty: int, price: float, entry_price: float,
+                     pnl: float, net_liq_val: float):
+        now = datetime.now(_ET)
+        sym = self._base_sym(slot_key)
+        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
+        try:
+            with open(self.JOURNAL_PATH, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    now.strftime('%Y-%m-%d'),
+                    now.strftime('%H:%M:%S'),
+                    sym, slot_key, side, reason,
+                    qty, f'{price:.4f}', f'{entry_price:.4f}',
+                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
+                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
+                    len(self.positions),
+                ])
+        except Exception as e:
+            log.warning(f"VZ journal write error: {e}")
+        if side != 'BUY':
+            _send_trade_journal_entry('\U0001f4ca', 'VWAP Zone', sym, reason, qty,
+                                      price, entry_price, pnl, net_liq_val,
+                                      self.cash, self.trades)
+
+    @staticmethod
+    def _ts() -> str:
+        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
+
+    def buy(self, slot_key: str, qty: int, price: float, vwap: float) -> str | None:
+        """Open a VZ virtual position. Returns Telegram alert text or None."""
+        if qty < 1 or slot_key in self.positions:
             return None
         cost = qty * price
         if cost > self.cash:
@@ -6827,8 +6317,9 @@ class GGVirtualPortfolio:
 
         old_cash = self.cash
         self.cash -= cost
+        sym = self._base_sym(slot_key)
 
-        self.positions[sym] = {
+        self.positions[slot_key] = {
             'qty': qty,
             'entry_price': price,
             'vwap_at_entry': vwap,
@@ -6836,27 +6327,27 @@ class GGVirtualPortfolio:
         }
 
         self.trades.append({
-            'sym': sym, 'side': 'BUY', 'qty': qty,
+            'sym': slot_key, 'side': 'BUY', 'qty': qty,
             'price': price, 'pnl': 0, 'time': datetime.now(_ET),
         })
 
         net = self.net_liq({})
-        self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
+        self._log_journal(slot_key, 'BUY', 'ENTRY', qty, price, price, 0, net)
         self._save_state()
 
         msg = (
-            f"🚀 <b>Gap&Go [GG-SIM] — BUY {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  💰 {qty}sh @ ${price:.4f} | VWAP: ${vwap:.4f}\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}"
+            f"\U0001f4ca <b>VWAP Zone [VZ-SIM] \u2014 BUY {sym} (slot {slot_key})</b>\n"
+            f"  \U0001f550 {self._ts()}\n"
+            f"  \U0001f4b0 {qty}sh @ ${price:.4f} | VWAP: ${vwap:.4f}\n"
+            f"  \U0001f4b5 Cash: ${old_cash:,.0f} \u2192 ${self.cash:,.0f}\n"
+            f"  \U0001f4ca Portfolio: ${net:,.0f}"
         )
-        log.info(f"GG VIRTUAL BUY: {sym} {qty}sh @ ${price:.4f} vwap=${vwap:.4f}")
+        log.info(f"VZ BUY: {slot_key} {qty}sh @ ${price:.4f} vwap=${vwap:.4f}")
         return msg
 
-    def sell(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell entire GG position. Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
+    def sell(self, slot_key: str, price: float, reason: str) -> str | None:
+        """Sell a VZ slot position. Returns Telegram alert text or None."""
+        pos = self.positions.get(slot_key)
         if not pos:
             return None
 
@@ -6864,107 +6355,80 @@ class GGVirtualPortfolio:
         entry_price = pos['entry_price']
         pnl = (price - entry_price) * qty
         pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+        sym = self._base_sym(slot_key)
 
         old_cash = self.cash
         self.cash += qty * price
 
         self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': qty,
+            'sym': slot_key, 'side': 'SELL', 'qty': qty,
             'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
         })
 
-        del self.positions[sym]
-        self._record_exit(sym, pnl)
+        del self.positions[slot_key]
+        self._record_exit(slot_key, pnl)
         self._save_state()
 
         net = self.net_liq({})
-        self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
+        self._log_journal(slot_key, 'SELL', reason, qty, price, entry_price, pnl, net)
 
-        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        pnl_icon = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
         msg = (
-            f"🚀 <b>Gap&Go [GG-SIM] — SELL {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
+            f"\U0001f4ca <b>VWAP Zone [VZ-SIM] \u2014 SELL {sym} (slot {slot_key})</b>\n"
+            f"  \U0001f550 {self._ts()}\n"
             f"  {pnl_icon} {qty}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}\n"
-            f"  📝 Reason: {reason}"
+            f"  \U0001f4c8 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
+            f"  \U0001f4b5 Cash: ${old_cash:,.0f} \u2192 ${self.cash:,.0f}\n"
+            f"  \U0001f4ca Portfolio: ${net:,.0f}\n"
+            f"  \U0001f4dd Reason: {reason}"
         )
-        log.info(f"GG VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
+        log.info(f"VZ SELL: {slot_key} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
         return msg
 
-    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell half the GG position (profit target). Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos:
-            return None
+    def active_slots(self, sym: str) -> list[int]:
+        """Return list of active slot indices for a symbol."""
+        slots = []
+        for i in range(VZ_LIVE_MAX_SLOTS_PER_SYM):
+            if f"{sym}_{i}" in self.positions:
+                slots.append(i)
+        return slots
 
-        total_qty = pos['qty']
-        half = total_qty // 2
-        if half < 1:
-            # Position too small to split — sell all
-            return self.sell(sym, price, reason)
-
-        entry_price = pos['entry_price']
-        pnl = (price - entry_price) * half
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
-
-        old_cash = self.cash
-        self.cash += half * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': half,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        # Update position: reduce qty, keep rest
-        pos['qty'] = total_qty - half
-        self._save_state()
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
-
-        remaining = total_qty - half
-        msg = (
-            f"🚀 <b>Gap&Go [GG-SIM] — TARGET HIT {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
-            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
-        )
-        log.info(f"GG TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
-        return msg
+    def next_slot(self, sym: str) -> int | None:
+        """Return next available slot index for a symbol, or None if full."""
+        for i in range(VZ_LIVE_MAX_SLOTS_PER_SYM):
+            if f"{sym}_{i}" not in self.positions:
+                return i
+        return None
 
     def net_liq(self, current_prices: dict) -> float:
         val = self.cash
-        for sym, pos in self.positions.items():
+        for slot_key, pos in self.positions.items():
+            sym = self._base_sym(slot_key)
             px = current_prices.get(sym, pos['entry_price'])
             val += pos['qty'] * px
         return val
 
     def summary_text(self, current_prices: dict) -> str:
         nlv = self.net_liq(current_prices)
-        total_pnl = nlv - self.INITIAL_CASH
         pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
 
         lines = [
-            f"🚀 <b>Gap&Go [GG-SIM] Portfolio</b>",
-            f"  💵 Cash: ${self.cash:,.0f}",
-            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
+            f"\U0001f4ca <b>VWAP Zone [VZ-SIM] Portfolio</b>",
+            f"  \U0001f4b5 Cash: ${self.cash:,.0f}",
+            f"  \U0001f4ca Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
         ]
         if self.positions:
-            lines.append(f"  📋 Open positions: {len(self.positions)}")
-            for sym, pos in self.positions.items():
+            lines.append(f"  \U0001f4cb Open positions: {len(self.positions)}")
+            for slot_key, pos in self.positions.items():
+                sym = self._base_sym(slot_key)
                 px = current_prices.get(sym, pos['entry_price'])
                 sym_pnl = (px - pos['entry_price']) * pos['qty']
-                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
+                lines.append(f"    \u2022 {slot_key}: {pos['qty']}sh @ ${pos['entry_price']:.2f} \u2192 ${px:.2f} (${sym_pnl:+.2f})")
         if self.trades:
             today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
-            lines.append(f"  📝 Trades today: {len(today_trades)}")
+            lines.append(f"  \U0001f4dd Trades today: {len(today_trades)}")
             total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
-            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
+            lines.append(f"  \U0001f4b0 Realized today: ${total_realized:+,.2f}")
 
         return "\n".join(lines)
 
@@ -6972,614 +6436,18 @@ class GGVirtualPortfolio:
         """Reset portfolio for new week. Archive old journal, start fresh."""
         if self.JOURNAL_PATH.exists():
             week_label = datetime.now(_ET).strftime('%Y-%m-%d')
-            archive = self.JOURNAL_PATH.with_name(f"gg_virtual_trades_week_{week_label}.csv")
+            archive = self.JOURNAL_PATH.with_name(f"vz_virtual_trades_week_{week_label}.csv")
             try:
                 self.JOURNAL_PATH.rename(archive)
-                log.info(f"GG journal archived → {archive.name}")
+                log.info(f"VZ journal archived \u2192 {archive.name}")
             except Exception as e:
-                log.warning(f"GG journal archive error: {e}")
+                log.warning(f"VZ journal archive error: {e}")
         self.cash = self.INITIAL_CASH
         self.positions = {}
         self.trades = []
         self._init_journal()
         self._save_state()
-        log.info("GG portfolio reset to $3,000")
-
-
-# ──────────────────────────────────────────────────────────
-#  MR Virtual Portfolio (Momentum Ride paper simulation)
-# ──────────────────────────────────────────────────────────
-
-class MRVirtualPortfolio:
-    """Virtual portfolio for Momentum Ride paper simulation.
-
-    Similar to GGVirtualPortfolio — buy/sell driven by strategy signals.
-    Uses trailing stop + safety stop from the strategy.
-    """
-
-    INITIAL_CASH = MR_LIVE_INITIAL_CASH
-    JOURNAL_PATH = DATA_DIR / "mr_virtual_trades.csv"
-    _STATE_PATH = DATA_DIR / "mr_state.json"
-
-    def __init__(self):
-        self.cash: float = self.INITIAL_CASH
-        self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, vwap_at_entry, signal_type, entry_ts}
-        self.trades: list[dict] = []
-        self._exit_history: list[dict] = []
-        self._daily_realized_pnl: float = 0.0
-        self._daily_pnl_date: str = ""
-        self._init_journal()
-        self._load_state()
-
-    def _save_state(self):
-        """Persist portfolio state to disk (survives restarts)."""
-        try:
-            state = {
-                'cash': self.cash,
-                'positions': self.positions,
-                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
-            }
-            with open(self._STATE_PATH, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            log.warning(f"MR state save error: {e}")
-
-    def _load_state(self):
-        """Load portfolio state from disk (persists across days within the week)."""
-        try:
-            if not self._STATE_PATH.exists():
-                return
-            with open(self._STATE_PATH) as f:
-                state = json.load(f)
-            self.cash = state.get('cash', self.INITIAL_CASH)
-            self.positions = state.get('positions', {})
-            if self.positions:
-                log.info(f"MR state restored: cash=${self.cash:.0f}, "
-                         f"{len(self.positions)} positions: "
-                         + ", ".join(self.positions.keys()))
-        except Exception as e:
-            log.warning(f"MR state load error: {e}")
-
-    def _init_journal(self):
-        if not self.JOURNAL_PATH.exists():
-            with open(self.JOURNAL_PATH, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    'date', 'time_et', 'symbol', 'side', 'reason',
-                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
-                    'cash_after', 'net_liq', 'positions_open',
-                ])
-
-    def _log_journal(self, sym: str, side: str, reason: str,
-                     qty: int, price: float, entry_price: float,
-                     pnl: float, net_liq_val: float):
-        now = datetime.now(_ET)
-        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
-        try:
-            with open(self.JOURNAL_PATH, 'a', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    now.strftime('%Y-%m-%d'),
-                    now.strftime('%H:%M:%S'),
-                    sym, side, reason,
-                    qty, f'{price:.4f}', f'{entry_price:.4f}',
-                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
-                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
-                    len(self.positions),
-                ])
-        except Exception as e:
-            log.warning(f"MR journal write error: {e}")
-        if side != 'BUY':
-            _send_trade_journal_entry('📈', 'MR', sym, reason, qty,
-                                      price, entry_price, pnl, net_liq_val,
-                                      self.cash, self.trades)
-
-    @staticmethod
-    def _ts() -> str:
-        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
-
-    def _reset_daily_pnl(self):
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        if self._daily_pnl_date != today:
-            self._daily_pnl_date = today
-            self._daily_realized_pnl = 0.0
-            self._exit_history = [e for e in self._exit_history
-                                  if time_mod.time() - e['ts'] < 86400]
-
-    def can_enter(self, sym: str) -> tuple[bool, str]:
-        self._reset_daily_pnl()
-        if len(self.positions) >= MR_LIVE_MAX_POSITIONS:
-            return False, f"max positions ({MR_LIVE_MAX_POSITIONS})"
-        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
-            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
-                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
-        if sym in self.positions:
-            today_entries += 1
-        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
-            return False, f"max entries/day for {sym}"
-        now_ts = time_mod.time()
-        for e in reversed(self._exit_history):
-            if e['sym'] == sym:
-                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
-                            else STRATEGY_REENTRY_COOLDOWN_SEC)
-                if now_ts - e['ts'] < cooldown:
-                    return False, f"cooldown for {sym}"
-                break
-        return True, ""
-
-    def _record_exit(self, sym: str, pnl: float):
-        self._reset_daily_pnl()
-        self._daily_realized_pnl += pnl
-        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
-
-    def buy(self, sym: str, qty: int, price: float, vwap: float,
-            signal_type: str = '') -> str | None:
-        """Open an MR virtual position. Returns Telegram alert text or None."""
-        if qty < 1 or sym in self.positions:
-            return None
-        cost = qty * price
-        if cost > self.cash:
-            return None
-
-        old_cash = self.cash
-        self.cash -= cost
-
-        self.positions[sym] = {
-            'qty': qty,
-            'entry_price': price,
-            'vwap_at_entry': vwap,
-            'signal_type': signal_type,
-            'entry_ts': time_mod.time(),
-        }
-
-        self.trades.append({
-            'sym': sym, 'side': 'BUY', 'qty': qty,
-            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
-        })
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'BUY', f'ENTRY ({signal_type})', qty, price, price, 0, net)
-        self._save_state()
-
-        msg = (
-            f"📈 <b>Momentum Ride [MR-SIM] — BUY {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  💰 {qty}sh @ ${price:.4f} | VWAP: ${vwap:.4f}\n"
-            f"  📋 Signal: {signal_type}\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}"
-        )
-        log.info(f"MR VIRTUAL BUY: {sym} {qty}sh @ ${price:.4f} vwap=${vwap:.4f} ({signal_type})")
-        return msg
-
-    def sell(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell entire MR position. Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos:
-            return None
-
-        qty = pos['qty']
-        entry_price = pos['entry_price']
-        pnl = (price - entry_price) * qty
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
-
-        old_cash = self.cash
-        self.cash += qty * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': qty,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        del self.positions[sym]
-        self._record_exit(sym, pnl)
-        self._save_state()
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
-
-        pnl_icon = "🟢" if pnl >= 0 else "🔴"
-        msg = (
-            f"📈 <b>Momentum Ride [MR-SIM] — SELL {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  {pnl_icon} {qty}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}\n"
-            f"  📝 Reason: {reason}"
-        )
-        log.info(f"MR VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
-        return msg
-
-    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell half the MR position (profit target). Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos:
-            return None
-
-        total_qty = pos['qty']
-        half = total_qty // 2
-        if half < 1:
-            return self.sell(sym, price, reason)
-
-        entry_price = pos['entry_price']
-        pnl = (price - entry_price) * half
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
-
-        old_cash = self.cash
-        self.cash += half * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': half,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        pos['qty'] = total_qty - half
-        pos['target_hit'] = True
-        self._save_state()
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
-
-        remaining = total_qty - half
-        msg = (
-            f"📈 <b>Momentum Ride [MR-SIM] — TARGET HIT {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
-            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
-        )
-        log.info(f"MR TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
-        return msg
-
-    def net_liq(self, current_prices: dict) -> float:
-        val = self.cash
-        for sym, pos in self.positions.items():
-            px = current_prices.get(sym, pos['entry_price'])
-            val += pos['qty'] * px
-        return val
-
-    def summary_text(self, current_prices: dict) -> str:
-        nlv = self.net_liq(current_prices)
-        total_pnl = nlv - self.INITIAL_CASH
-        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
-
-        lines = [
-            f"📈 <b>Momentum Ride [MR-SIM] Portfolio</b>",
-            f"  💵 Cash: ${self.cash:,.0f}",
-            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
-        ]
-        if self.positions:
-            lines.append(f"  📋 Open positions: {len(self.positions)}")
-            for sym, pos in self.positions.items():
-                px = current_prices.get(sym, pos['entry_price'])
-                sym_pnl = (px - pos['entry_price']) * pos['qty']
-                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
-        if self.trades:
-            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
-            lines.append(f"  📝 Trades today: {len(today_trades)}")
-            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
-            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
-
-        return "\n".join(lines)
-
-    def reset(self):
-        """Reset portfolio for new week. Archive old journal, start fresh."""
-        if self.JOURNAL_PATH.exists():
-            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
-            archive = self.JOURNAL_PATH.with_name(f"mr_virtual_trades_week_{week_label}.csv")
-            try:
-                self.JOURNAL_PATH.rename(archive)
-                log.info(f"MR journal archived → {archive.name}")
-            except Exception as e:
-                log.warning(f"MR journal archive error: {e}")
-        self.cash = self.INITIAL_CASH
-        self.positions = {}
-        self.trades = []
-        self._init_journal()
-        self._save_state()
-        log.info("MR portfolio reset to $3,000")
-
-
-# ──────────────────────────────────────────────────────────
-#  FT Virtual Portfolio (Float Turnover paper simulation)
-# ──────────────────────────────────────────────────────────
-
-class FTVirtualPortfolio:
-    """Virtual portfolio for Float Turnover paper simulation.
-
-    Entry and exit are fully driven by the strategy (1-min bar high/low).
-    """
-
-    INITIAL_CASH = FT_LIVE_INITIAL_CASH
-    JOURNAL_PATH = DATA_DIR / "ft_virtual_trades.csv"
-    _STATE_PATH = DATA_DIR / "ft_state.json"
-
-    def __init__(self):
-        self.cash: float = self.INITIAL_CASH
-        self.positions: dict[str, dict] = {}
-        # sym -> {qty, entry_price, turnover_at_entry, entry_ts}
-        self.trades: list[dict] = []
-        self._exit_history: list[dict] = []
-        self._daily_realized_pnl: float = 0.0
-        self._daily_pnl_date: str = ""
-        self._init_journal()
-        self._load_state()
-
-    def _save_state(self):
-        """Persist portfolio state to disk (survives restarts)."""
-        try:
-            state = {
-                'cash': self.cash,
-                'positions': self.positions,
-                'date': datetime.now(_ET).strftime('%Y-%m-%d'),
-            }
-            with open(self._STATE_PATH, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            log.warning(f"FT state save error: {e}")
-
-    def _load_state(self):
-        """Load portfolio state from disk (persists across days within the week)."""
-        try:
-            if not self._STATE_PATH.exists():
-                return
-            with open(self._STATE_PATH) as f:
-                state = json.load(f)
-            self.cash = state.get('cash', self.INITIAL_CASH)
-            self.positions = state.get('positions', {})
-            if self.positions:
-                log.info(f"FT state restored: cash=${self.cash:.0f}, "
-                         f"{len(self.positions)} positions: "
-                         + ", ".join(self.positions.keys()))
-        except Exception as e:
-            log.warning(f"FT state load error: {e}")
-
-    def _init_journal(self):
-        if not self.JOURNAL_PATH.exists():
-            with open(self.JOURNAL_PATH, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    'date', 'time_et', 'symbol', 'side', 'reason',
-                    'qty', 'price', 'entry_price', 'pnl', 'pnl_pct',
-                    'cash_after', 'net_liq', 'positions_open',
-                ])
-
-    def _log_journal(self, sym: str, side: str, reason: str,
-                     qty: int, price: float, entry_price: float,
-                     pnl: float, net_liq_val: float):
-        now = datetime.now(_ET)
-        pnl_pct = ((price / entry_price - 1) * 100) if entry_price > 0 and side != 'BUY' else 0.0
-        try:
-            with open(self.JOURNAL_PATH, 'a', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([
-                    now.strftime('%Y-%m-%d'),
-                    now.strftime('%H:%M:%S'),
-                    sym, side, reason,
-                    qty, f'{price:.4f}', f'{entry_price:.4f}',
-                    f'{pnl:.2f}', f'{pnl_pct:.1f}',
-                    f'{self.cash:.2f}', f'{net_liq_val:.2f}',
-                    len(self.positions),
-                ])
-        except Exception as e:
-            log.warning(f"FT journal write error: {e}")
-        if side != 'BUY':
-            _send_trade_journal_entry('🔄', 'FT', sym, reason, qty,
-                                      price, entry_price, pnl, net_liq_val,
-                                      self.cash, self.trades)
-
-    @staticmethod
-    def _ts() -> str:
-        return datetime.now(_ET).strftime('%Y-%m-%d %H:%M ET')
-
-    def _reset_daily_pnl(self):
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        if self._daily_pnl_date != today:
-            self._daily_pnl_date = today
-            self._daily_realized_pnl = 0.0
-            self._exit_history = [e for e in self._exit_history
-                                  if time_mod.time() - e['ts'] < 86400]
-
-    def can_enter(self, sym: str) -> tuple[bool, str]:
-        self._reset_daily_pnl()
-        if len(self.positions) >= FT_LIVE_MAX_POSITIONS:
-            return False, f"max positions ({FT_LIVE_MAX_POSITIONS})"
-        if self._daily_realized_pnl <= -STRATEGY_DAILY_LOSS_LIMIT:
-            return False, f"daily loss limit (${self._daily_realized_pnl:.0f})"
-        today = datetime.now(_ET).strftime('%Y-%m-%d')
-        today_entries = sum(1 for e in self._exit_history if e['sym'] == sym
-                           and datetime.fromtimestamp(e['ts'], _ET).strftime('%Y-%m-%d') == today)
-        if sym in self.positions:
-            today_entries += 1
-        if today_entries >= STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY:
-            return False, f"max entries/day for {sym}"
-        now_ts = time_mod.time()
-        for e in reversed(self._exit_history):
-            if e['sym'] == sym:
-                cooldown = (STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC if e['pnl'] < 0
-                            else STRATEGY_REENTRY_COOLDOWN_SEC)
-                if now_ts - e['ts'] < cooldown:
-                    return False, f"cooldown for {sym}"
-                break
-        return True, ""
-
-    def _record_exit(self, sym: str, pnl: float):
-        self._reset_daily_pnl()
-        self._daily_realized_pnl += pnl
-        self._exit_history.append({'sym': sym, 'ts': time_mod.time(), 'pnl': pnl})
-
-    def buy(self, sym: str, qty: int, price: float, turnover_pct: float) -> str | None:
-        """Open an FT virtual position. Returns Telegram alert text or None."""
-        if qty < 1 or sym in self.positions:
-            return None
-        cost = qty * price
-        if cost > self.cash:
-            return None
-
-        old_cash = self.cash
-        self.cash -= cost
-
-        self.positions[sym] = {
-            'qty': qty,
-            'entry_price': price,
-            'turnover_at_entry': turnover_pct,
-            'entry_ts': time_mod.time(),
-        }
-
-        self.trades.append({
-            'sym': sym, 'side': 'BUY', 'qty': qty,
-            'price': price, 'pnl': 0, 'time': datetime.now(_ET),
-        })
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'BUY', 'ENTRY', qty, price, price, 0, net)
-        self._save_state()
-
-        msg = (
-            f"🔄 <b>Float Turnover [FT-SIM] — BUY {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  💰 {qty}sh @ ${price:.4f} | Turnover: {turnover_pct:.0f}%\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}"
-        )
-        log.info(f"FT VIRTUAL BUY: {sym} {qty}sh @ ${price:.4f} turnover={turnover_pct:.0f}%")
-        return msg
-
-    def sell(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell entire FT position. Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos:
-            return None
-
-        qty = pos['qty']
-        entry_price = pos['entry_price']
-        pnl = (price - entry_price) * qty
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
-
-        old_cash = self.cash
-        self.cash += qty * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': qty,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        del self.positions[sym]
-        self._record_exit(sym, pnl)
-        self._save_state()
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'SELL', reason, qty, price, entry_price, pnl, net)
-
-        pnl_icon = "🟢" if pnl >= 0 else "🔴"
-        msg = (
-            f"🔄 <b>Float Turnover [FT-SIM] — SELL {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  {pnl_icon} {qty}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f}\n"
-            f"  📝 Reason: {reason}"
-        )
-        log.info(f"FT VIRTUAL SELL: {sym} {qty}sh @ ${price:.4f} P&L=${pnl:+.2f} ({reason})")
-        return msg
-
-    def sell_half(self, sym: str, price: float, reason: str) -> str | None:
-        """Sell half the FT position (profit target). Returns Telegram alert text or None."""
-        pos = self.positions.get(sym)
-        if not pos:
-            return None
-
-        total_qty = pos['qty']
-        half = total_qty // 2
-        if half < 1:
-            return self.sell(sym, price, reason)
-
-        entry_price = pos['entry_price']
-        pnl = (price - entry_price) * half
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
-
-        old_cash = self.cash
-        self.cash += half * price
-
-        self.trades.append({
-            'sym': sym, 'side': 'SELL', 'qty': half,
-            'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-        })
-
-        pos['qty'] = total_qty - half
-        pos['target_hit'] = True
-        self._save_state()
-
-        net = self.net_liq({})
-        self._log_journal(sym, 'SELL', f'TARGET_HALF ({reason})', half, price, entry_price, pnl, net)
-
-        remaining = total_qty - half
-        msg = (
-            f"🔄 <b>Float Turnover [FT-SIM] — TARGET HIT {sym}</b>\n"
-            f"  🕐 {self._ts()}\n"
-            f"  🟢 {half}sh @ ${price:.4f} (entry ${entry_price:.4f})\n"
-            f"  📈 P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-            f"  💵 Cash: ${old_cash:,.0f} → ${self.cash:,.0f}\n"
-            f"  📊 Portfolio: ${net:,.0f} ({remaining}sh still in position)\n"
-            f"  🛡️ Stop → breakeven ${entry_price:.4f}"
-        )
-        log.info(f"FT TARGET HALF: {sym} {half}sh @ ${price:.4f} P&L=${pnl:+.2f} ({remaining}sh remain)")
-        return msg
-
-    def net_liq(self, current_prices: dict) -> float:
-        val = self.cash
-        for sym, pos in self.positions.items():
-            px = current_prices.get(sym, pos['entry_price'])
-            val += pos['qty'] * px
-        return val
-
-    def summary_text(self, current_prices: dict) -> str:
-        nlv = self.net_liq(current_prices)
-        total_pnl = nlv - self.INITIAL_CASH
-        pnl_pct = (nlv / self.INITIAL_CASH - 1) * 100
-
-        lines = [
-            f"🔄 <b>Float Turnover [FT-SIM] Portfolio</b>",
-            f"  💵 Cash: ${self.cash:,.0f}",
-            f"  📊 Net Liq: ${nlv:,.0f} ({pnl_pct:+.1f}%)",
-        ]
-        if self.positions:
-            lines.append(f"  📋 Open positions: {len(self.positions)}")
-            for sym, pos in self.positions.items():
-                px = current_prices.get(sym, pos['entry_price'])
-                sym_pnl = (px - pos['entry_price']) * pos['qty']
-                lines.append(f"    • {sym}: {pos['qty']}sh @ ${pos['entry_price']:.2f} → ${px:.2f} (${sym_pnl:+.2f})")
-        if self.trades:
-            today_trades = [t for t in self.trades if t['time'].date() == datetime.now(_ET).date()]
-            lines.append(f"  📝 Trades today: {len(today_trades)}")
-            total_realized = sum(t['pnl'] for t in today_trades if t['side'] == 'SELL')
-            lines.append(f"  💰 Realized today: ${total_realized:+,.2f}")
-
-        return "\n".join(lines)
-
-    def reset(self):
-        """Reset portfolio for new week. Archive old journal, start fresh."""
-        if self.JOURNAL_PATH.exists():
-            week_label = datetime.now(_ET).strftime('%Y-%m-%d')
-            archive = self.JOURNAL_PATH.with_name(f"ft_virtual_trades_week_{week_label}.csv")
-            try:
-                self.JOURNAL_PATH.rename(archive)
-                log.info(f"FT journal archived → {archive.name}")
-            except Exception as e:
-                log.warning(f"FT journal archive error: {e}")
-        self.cash = self.INITIAL_CASH
-        self.positions = {}
-        self.trades = []
-        self._init_journal()
-        self._save_state()
-        log.info("FT portfolio reset to $3,000")
+        log.info("VZ portfolio reset to $3,000")
 
 
 # ══════════════════════════════════════════════════════════
@@ -7602,42 +6470,21 @@ class ScannerThread(threading.Thread):
         self.previous: dict = {}
         self._prev_lock = threading.Lock()
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
-        self._fib_dt_first_seen: dict[str, float] = {}  # sym → time.time() when first seen (warmup)
         self.count = 0
         self._warmup = True   # suppress alerts on first cycle
         self._warmup_pending: dict[str, dict] = {}  # sym → stock data, enriched during warmup
         self._reports_sent: set[str] = set()      # stocks that got Telegram report this session
         self._last_session: str = _get_market_session()  # track session transitions
-        # ── FIB DT Auto-Strategy ──
-        self._fib_dt_strategy = FibDTLiveStrategySync(ib_getter=_get_ibkr)
-        self._virtual_portfolio = VirtualPortfolio()
-        # Sync strategy state from restored portfolio
-        if self._virtual_portfolio.positions:
-            self._fib_dt_strategy.sync_from_portfolio(self._virtual_portfolio.positions)
-        self._fib_dt_current_sym: str | None = None  # best turnover symbol
-        # Cache scanner contracts for FIB DT (symbol -> Contract)
+        # ── VWAP Zone Auto-Strategy ──
+        self._vz_strategy = VWAPZoneLiveStrategy(ib_getter=_get_ibkr)
+        self._vz_portfolio = VZVirtualPortfolio()
+        if self._vz_portfolio.positions:
+            self._vz_strategy.sync_from_portfolio(self._vz_portfolio.positions)
+        # Cache scanner contracts (symbol -> Contract)
         self._scanner_contracts: dict[str, object] = {}
         self._cached_buying_power: float = 0.0
         self._cached_net_liq: float = 0.0
         self._cached_positions: dict[str, tuple] = {}  # sym → (qty, avg, mkt, pnl)
-        # ── Gap and Go Auto-Strategy ──
-        self._gg_strategy = GapGoLiveStrategy(ib_getter=_get_ibkr)
-        self._gg_portfolio = GGVirtualPortfolio()
-        # Sync strategy state from restored portfolio
-        if self._gg_portfolio.positions:
-            self._gg_strategy.sync_from_portfolio(self._gg_portfolio.positions)
-        # ── Momentum Ride Auto-Strategy ──
-        self._mr_strategy = MomentumRideLiveStrategy(ib_getter=_get_ibkr)
-        self._mr_portfolio = MRVirtualPortfolio()
-        # Sync strategy state from restored portfolio
-        if self._mr_portfolio.positions:
-            self._mr_strategy.sync_from_portfolio(self._mr_portfolio.positions)
-        # ── Float Turnover Auto-Strategy ──
-        self._ft_strategy = FloatTurnoverLiveStrategy(ib_getter=_get_ibkr)
-        self._ft_portfolio = FTVirtualPortfolio()
-        # Sync strategy state from restored portfolio
-        if self._ft_portfolio.positions:
-            self._ft_strategy.sync_from_portfolio(self._ft_portfolio.positions)
         # ── Telegram stock lookup ──
         self._lookup_queue: queue.Queue = queue.Queue()
         self._telegram_listener: TelegramListenerThread | None = None
@@ -7917,145 +6764,198 @@ class ScannerThread(threading.Thread):
         except Exception as e:
             log.debug(f"Account fetch: {e}")
 
+    def _check_eod_profit_lock(self, current: dict):
+        """After 15:30 ET, apply tight trailing stop on profitable positions.
+
+        Prevents giving back gains in late-day / after-hours chop.
+        """
+        now_et = datetime.now(_ET)
+        lock_h, lock_m = (int(x) for x in EOD_PROFIT_LOCK_TIME.split(':'))
+        lock_time = now_et.replace(hour=lock_h, minute=lock_m, second=0, microsecond=0)
+        if now_et < lock_time:
+            return
+
+        current_prices = {}
+        for sym, d in current.items():
+            px = d.get('price', 0)
+            if px > 0:
+                current_prices[sym] = px
+
+        for slot_key in list(self._vz_portfolio.positions.keys()):
+            pos = self._vz_portfolio.positions.get(slot_key)
+            if not pos:
+                continue
+            if pos.get('timed_exit_trail_pct'):
+                continue
+            sym = self._vz_portfolio._base_sym(slot_key)
+            price = current_prices.get(sym, 0)
+            if price <= 0:
+                continue
+            entry_price = pos.get('entry_price', 0)
+            if entry_price <= 0:
+                continue
+            if price <= entry_price:
+                continue
+            # Already has EOD lock? Update peak + check stop
+            if pos.get('eod_stop'):
+                peak = pos.get('eod_peak', price)
+                if price > peak:
+                    pos['eod_peak'] = price
+                    peak = price
+                    trail_pct = pos.get('eod_trail_pct', EOD_PROFIT_LOCK_TRAIL_PCT)
+                    pos['eod_stop'] = peak * (1 - trail_pct)
+                if price <= pos['eod_stop']:
+                    pnl_pct = (price / entry_price - 1) * 100
+                    alert = self._vz_portfolio.sell(slot_key, price,
+                        f"eod_profit_lock (peak=${peak:.4f}, stop=${pos['eod_stop']:.4f})")
+                    if alert:
+                        send_telegram(alert)
+                    idx_s = slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    log.info(f"VZ EOD PROFIT LOCK: {slot_key} @ ${price:.4f} (P&L={pnl_pct:+.1f}%)")
+                continue
+            # Set initial EOD trailing stop
+            trail_pct = EOD_PROFIT_LOCK_PENNY_TRAIL_PCT if entry_price < 2.0 else EOD_PROFIT_LOCK_TRAIL_PCT
+            eod_stop = price * (1 - trail_pct)
+            pos['eod_stop'] = eod_stop
+            pos['eod_peak'] = price
+            pos['eod_trail_pct'] = trail_pct
+            pnl_pct = (price / entry_price - 1) * 100
+            log.info(f"VZ EOD PROFIT LOCK SET: {slot_key} +{pnl_pct:.1f}%, "
+                     f"trail={trail_pct*100:.0f}%, stop=${eod_stop:.4f}")
+
+    def _timed_exit_or_trail(self, portfolio, strategy, slot_key, pos, price, hold_min, max_hold, label):
+        """P&L-aware timed exit helper for VZ robot.
+
+        If in profit or small loss (<=5%): close immediately.
+        If deep loss (>5%): set tight trailing stop instead of dumping.
+        """
+        entry_price = pos.get('entry_price', 0)
+        loss_pct = (entry_price - price) / entry_price if entry_price > 0 else 0
+
+        if loss_pct <= TIMED_EXIT_IMMEDIATE_MAX_LOSS_PCT:
+            alert = portfolio.sell(slot_key, price, f"timed_exit ({hold_min}min)")
+            if alert:
+                send_telegram(alert)
+            sym = portfolio._base_sym(slot_key)
+            idx_s = slot_key.rsplit('_', 1)[1]
+            try:
+                strategy.mark_slot_closed(sym, int(idx_s))
+            except (ValueError, IndexError):
+                pass
+            log.info(f"{label} TIMED EXIT: {slot_key} after {hold_min}min")
+            return alert
+        else:
+            trail_pct = TIMED_EXIT_TIGHT_TRAIL_PENNY_PCT if entry_price < 2.0 else TIMED_EXIT_TIGHT_TRAIL_PCT
+            pos['timed_exit_trail_pct'] = trail_pct
+            pos['timed_exit_peak'] = price
+            pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+            log.info(f"{label} TIMED EXIT DEFERRED: {slot_key} loss {pnl_pct:+.1f}% > -{TIMED_EXIT_IMMEDIATE_MAX_LOSS_PCT*100:.0f}%, "
+                     f"setting {trail_pct*100:.0f}% tight trail from ${price:.4f}")
+            return None
+
     def _check_timed_exits(self, current: dict):
-        """Force-close positions that exceeded their max hold time."""
+        """Force-close VZ positions that exceeded max hold time (4h)."""
         now_ts = time_mod.time()
 
-        # FIB DT — max hold
-        for sym in list(self._virtual_portfolio.positions.keys()):
-            pos = self._virtual_portfolio.positions[sym]
+        for slot_key in list(self._vz_portfolio.positions.keys()):
+            pos = self._vz_portfolio.positions.get(slot_key)
+            if not pos:
+                continue
             entry_ts = pos.get('entry_ts', 0)
-            if entry_ts > 0 and (now_ts - entry_ts) > FIB_DT_MAX_HOLD_MINUTES * 60:
+            if entry_ts > 0 and (now_ts - entry_ts) > VZ_LIVE_MAX_HOLD_MINUTES * 60:
+                if pos.get('timed_exit_trail_pct'):
+                    continue
+                sym = self._vz_portfolio._base_sym(slot_key)
                 price = current.get(sym, {}).get('price', pos['entry_price'])
                 hold_min = int((now_ts - entry_ts) / 60)
-                remaining = pos['other_half'] if pos['phase'] == 'TRAILING' else pos['qty']
-                pnl = (price - pos['entry_price']) * remaining
-                if pos['phase'] == 'TRAILING':
-                    alert = self._virtual_portfolio.trailing_exit(
-                        sym, price, f"timed_exit ({hold_min}min)")
-                else:
-                    # Force sell via stop-like mechanism
-                    old_cash = self._virtual_portfolio.cash
-                    self._virtual_portfolio.cash += remaining * price
-                    self._virtual_portfolio.trades.append({
-                        'sym': sym, 'side': 'SELL', 'qty': remaining,
-                        'price': price, 'pnl': pnl, 'time': datetime.now(_ET),
-                    })
-                    del self._virtual_portfolio.positions[sym]
-                    self._virtual_portfolio._record_exit(sym, pnl)
-                    self._virtual_portfolio._save_state()
-                    pnl_pct = (price / pos['entry_price'] - 1) * 100 if pos['entry_price'] > 0 else 0
-                    net = self._virtual_portfolio.net_liq({})
-                    self._virtual_portfolio._log_journal(
-                        sym, 'SELL', f'TIMED_EXIT ({hold_min}min)', remaining, price,
-                        pos['entry_price'], pnl, net)
-                    alert = (
-                        f"📐 <b>FIB DT [SIM] — TIMED EXIT {sym}</b>\n"
-                        f"  ⏰ Held {hold_min}min (max {FIB_DT_MAX_HOLD_MINUTES})\n"
-                        f"  {'🟢' if pnl >= 0 else '🔴'} {remaining}sh @ ${price:.2f} "
-                        f"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%)"
-                    )
+                self._timed_exit_or_trail(
+                    self._vz_portfolio, self._vz_strategy,
+                    slot_key, pos, price, hold_min, VZ_LIVE_MAX_HOLD_MINUTES, 'VZ')
+
+    def _monitor_virtual_positions(self, current: dict):
+        """Monitor VZ virtual portfolio: tight trailing for deferred timed-exit positions."""
+        current_prices = {}
+        for sym, d in current.items():
+            px = d.get('price', 0)
+            if px > 0:
+                current_prices[sym] = px
+
+        # Tight trailing stop for timed-exit deferred positions
+        for slot_key in list(self._vz_portfolio.positions.keys()):
+            pos = self._vz_portfolio.positions.get(slot_key)
+            if not pos:
+                continue
+            trail_pct = pos.get('timed_exit_trail_pct', 0)
+            if not trail_pct:
+                continue
+            sym = self._vz_portfolio._base_sym(slot_key)
+            price = current_prices.get(sym, 0)
+            if price <= 0:
+                continue
+            # Update peak
+            peak = pos.get('timed_exit_peak', price)
+            if price > peak:
+                pos['timed_exit_peak'] = price
+                peak = price
+            # Check tight trailing stop
+            stop_price = peak * (1 - trail_pct)
+            if price <= stop_price:
+                entry_price = pos.get('entry_price', 0)
+                pnl_pct = (price / entry_price - 1) * 100 if entry_price > 0 else 0
+                alert = self._vz_portfolio.sell(slot_key, price,
+                    f"timed_trail_stop (peak=${peak:.4f}, -{trail_pct*100:.0f}%=${stop_price:.4f})")
                 if alert:
                     send_telegram(alert)
-                self._fib_dt_strategy.mark_position_closed(sym)
-                log.info(f"FIB DT TIMED EXIT: {sym} after {hold_min}min")
+                idx_s = slot_key.rsplit('_', 1)[1]
+                try:
+                    self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                except (ValueError, IndexError):
+                    pass
+                log.info(f"VZ TIMED TRAIL STOP: {slot_key} @ ${price:.4f} "
+                         f"(peak=${peak:.4f}, trail={trail_pct*100:.0f}%, P&L={pnl_pct:+.1f}%)")
 
-        # GG — max hold
-        for sym in list(self._gg_portfolio.positions.keys()):
-            pos = self._gg_portfolio.positions[sym]
-            entry_ts = pos.get('entry_ts', 0)
-            if entry_ts > 0 and (now_ts - entry_ts) > GG_MAX_HOLD_MINUTES * 60:
-                price = current.get(sym, {}).get('price', pos['entry_price'])
-                hold_min = int((now_ts - entry_ts) / 60)
-                alert = self._gg_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
-                if alert:
-                    send_telegram(alert)
-                self._gg_strategy.mark_position_closed(sym)
-                log.info(f"GG TIMED EXIT: {sym} after {hold_min}min")
-
-        # MR — no separate max hold; handled by 90-min timeout in strategy
-        # But add safety for stuck positions (e.g., 4 hours)
-        _MR_SAFETY_MAX_HOLD_MIN = 240
-        for sym in list(self._mr_portfolio.positions.keys()):
-            pos = self._mr_portfolio.positions[sym]
-            entry_ts = pos.get('entry_ts', 0)
-            if entry_ts > 0 and (now_ts - entry_ts) > _MR_SAFETY_MAX_HOLD_MIN * 60:
-                price = current.get(sym, {}).get('price', pos['entry_price'])
-                hold_min = int((now_ts - entry_ts) / 60)
-                alert = self._mr_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
-                if alert:
-                    send_telegram(alert)
-                self._mr_strategy.mark_position_closed(sym)
-                log.info(f"MR TIMED EXIT: {sym} after {hold_min}min")
-
-        # FT — max hold
-        for sym in list(self._ft_portfolio.positions.keys()):
-            pos = self._ft_portfolio.positions[sym]
-            entry_ts = pos.get('entry_ts', 0)
-            if entry_ts > 0 and (now_ts - entry_ts) > FT_MAX_HOLD_MINUTES * 60:
-                price = current.get(sym, {}).get('price', pos['entry_price'])
-                hold_min = int((now_ts - entry_ts) / 60)
-                alert = self._ft_portfolio.sell(sym, price, f"timed_exit ({hold_min}min)")
-                if alert:
-                    send_telegram(alert)
-                self._ft_strategy.mark_position_closed(sym)
-                log.info(f"FT TIMED EXIT: {sym} after {hold_min}min")
-
-    def _run_fib_dt_cycle(self, current: dict, status: str):
-        """Run FIB DT auto-strategy: select best stock by turnover, feed to strategy."""
+    def _run_vwap_zone_cycle(self, current: dict):
+        """Run VWAP Zone auto-strategy: find gappers >= 20%, check VWAP band + SMA20."""
         try:
-            # ── 1. Build ranked candidate list ──
+            # ── 1. Build candidate list ──
             candidates = []
             for sym, d in current.items():
                 pct = d.get('pct', 0)
                 price = d.get('price', 0)
-                vwap = d.get('vwap', 0)
-                volume_raw = d.get('volume_raw', 0)
-                prev_close = d.get('prev_close', 0)
                 contract = d.get('contract')
 
-                if pct < FIB_DT_GAP_MIN_PCT or pct > FIB_DT_GAP_MAX_PCT:
-                    continue
-                if price <= 0 or prev_close <= 0 or not contract:
+                if pct < VZ_LIVE_GAP_MIN_PCT or price <= 0 or not contract:
                     continue
                 if price < STRATEGY_MIN_PRICE:
                     continue
-                if vwap > 0 and price <= vwap:
-                    continue
                 # RVOL filter
                 rvol = d.get('rvol', 0)
-                if rvol < FIB_DT_RVOL_MIN:
+                if rvol < VZ_LIVE_RVOL_MIN:
                     continue
                 # News filter
-                if FIB_DT_REQUIRE_NEWS and not _stock_has_news(sym):
+                if VZ_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
                 # Bearish news filter
                 if _news_is_bearish(sym):
                     continue
 
-                # Get float from enrichment cache (optional — no filter)
-                enrich = _enrichment.get(sym, {})
-                flt_str = enrich.get('float', '-')
-                flt_shares = _parse_float_to_shares(flt_str)
-                if flt_shares <= 0:
-                    flt_shares = 10_000_000  # default if unknown
-                if volume_raw <= 0:
-                    continue
-
-                turnover = volume_raw / flt_shares
-                candidates.append((sym, turnover, d, flt_shares))
+                candidates.append((sym, d))
 
             if not candidates:
                 return
 
-            # Sort by composite score descending, limit to TOP 3
-            candidates.sort(key=lambda x: _composite_score(x[0], x[2], 'fib_dt'), reverse=True)
-            candidates = candidates[:3]
+            # Sort by composite score descending, limit to TOP 5
+            candidates.sort(key=lambda x: _composite_score(x[0], x[1], 'vz'), reverse=True)
+            candidates = candidates[:VZ_LIVE_MAX_TRACKED_SYMBOLS]
 
             # SMA9 filter (only on final candidates to limit IBKR calls)
             candidates = [
                 c for c in candidates
-                if _check_above_sma9(c[0], c[2]['price'], c[2]['contract'])
+                if _check_above_sma9(c[0], c[1]['price'], c[1]['contract'])
             ]
             if not candidates:
                 return
@@ -8064,348 +6964,103 @@ class ScannerThread(threading.Thread):
             candidates = [
                 c for c in candidates
                 if _avg_bar_range_pct(c[0]) <= STRATEGY_MAX_BAR_RANGE_PCT
-                or _avg_bar_range_pct(c[0]) == 0.0  # no data = pass
+                or _avg_bar_range_pct(c[0]) == 0.0
             ]
             if not candidates:
                 return
 
-            # Log ranking
-            ranking_str = " | ".join(
-                f"{s} {t:.2f}x score={_composite_score(s, d, 'fib_dt'):.1f}" for s, t, d, _ in candidates
-            )
-            log.info(f"FIB DT candidates ({len(candidates)}): {ranking_str}")
+            log.info(f"VZ candidates ({len(candidates)}): "
+                     + " | ".join(f"{s} +{d['pct']:.0f}% score={_composite_score(s, d, 'vz'):.1f}" for s, d in candidates))
 
-            # ── 2. Build GapSignals for ALL candidates ──
-            gap_signals = []
-            for sym, turnover, d, flt_shares in candidates:
-                gap_signals.append(GapSignal(
+            # ── 2. Build VZCandidate objects ──
+            vz_candidates = []
+            for sym, d in candidates:
+                vz_candidates.append(VZCandidate(
                     symbol=sym,
                     contract=d['contract'],
                     gap_pct=d['pct'],
-                    prev_close=d['prev_close'],
                     current_price=d['price'],
-                    float_shares=flt_shares,
                 ))
 
-            best_sym = candidates[0][0]
-            if self._fib_dt_current_sym != best_sym:
-                best_turnover = candidates[0][1]
-                best_data = candidates[0][2]
-                log.info(
-                    f"FIB DT: top candidate {best_sym} "
-                    f"(turnover={best_turnover:.2f}x, "
-                    f"+{best_data['pct']:.1f}%, "
-                    f"float={_enrichment.get(best_sym, {}).get('float', '?')})"
-                )
-                self._fib_dt_current_sym = best_sym
+            # ── 3. Run strategy cycle ──
+            entries, exits = self._vz_strategy.process_cycle(vz_candidates)
 
-            # ── 3. Run strategy cycle on ALL candidates ──
-            entry_requests, trailing_exits = self._fib_dt_strategy.process_cycle(
-                gap_signals
-            )
-
-            # ── 4. Execute entries (virtual portfolio) ──
-            for req in entry_requests:
-                now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-                log.info(
-                    f"FIB DT ENTRY SIGNAL [{now_et}]: {req.symbol} "
-                    f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
-                    f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}"
-                )
-                _log_daily_event('fib_dt_signal', req.symbol,
-                                 f"fib=${req.fib_level:.4f} ratio={req.fib_ratio} "
-                                 f"stop=${req.stop_price:.4f} target=${req.target_price:.4f}")
-
-                # Use scan price (same source as stop monitoring) instead of
-                # strategy bar_close which can diverge from OCR/enrichment price
-                scan_price = current.get(req.symbol, {}).get('price', 0)
-                entry_price = scan_price if scan_price > 0 else req.entry_price
-
-                # Adjust stop/target proportionally to scan price
-                if scan_price > 0 and scan_price != req.entry_price and req.entry_price > 0:
-                    stop_ratio = req.stop_price / req.entry_price
-                    adjusted_stop = round(entry_price * stop_ratio, 4)
-                    target_ratio = req.target_price / req.entry_price
-                    adjusted_target = round(entry_price * target_ratio, 4)
-                else:
-                    adjusted_stop = req.stop_price
-                    adjusted_target = req.target_price
-
-                # Sanity: skip if stop is already above current price
-                if entry_price <= adjusted_stop:
-                    log.warning(
-                        f"FIB DT: Skipping {req.symbol} — scan price ${entry_price:.4f} "
-                        f"≤ stop ${adjusted_stop:.4f} (strategy bar_close was ${req.entry_price:.4f})"
-                    )
-                    continue
-
-                # Min price filter
-                if entry_price < STRATEGY_MIN_PRICE:
-                    log.info(f"FIB DT: Skipping {req.symbol} — price ${entry_price:.2f} < min ${STRATEGY_MIN_PRICE}")
-                    continue
-                # Warmup: skip entries within first 5 min of seeing a stock
-                now_ts = time_mod.time()
-                first_seen = self._fib_dt_first_seen.get(req.symbol)
-                if first_seen is None:
-                    self._fib_dt_first_seen[req.symbol] = now_ts
-                    log.info(f"FIB DT: First seen {req.symbol} — warmup {FIB_DT_WARMUP_SEC}s")
-                    continue
-                if now_ts - first_seen < FIB_DT_WARMUP_SEC:
-                    log.debug(f"FIB DT: Skipping {req.symbol} — warmup ({now_ts - first_seen:.0f}s < {FIB_DT_WARMUP_SEC}s)")
-                    continue
-                # Risk controls: max positions, cooldown, daily loss
-                can_buy, reason = self._virtual_portfolio.can_enter(req.symbol)
-                if not can_buy:
-                    log.info(f"FIB DT: Skipping {req.symbol} — {reason}")
-                    continue
-
-                qty = int(min(self._virtual_portfolio.cash, FIB_DT_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
-                qty = min(qty, 5000)  # absolute max shares
-                if qty >= 2:
-                    alert = self._virtual_portfolio.buy(
-                        req.symbol, qty, entry_price,
-                        adjusted_stop, adjusted_target,
-                    )
-                    if alert:
-                        send_telegram(alert)  # private chat, not group
-                        self._fib_dt_strategy.record_entry()
-                        self._fib_dt_strategy.mark_in_position(req.symbol, entry_price)
-                        _log_daily_event('fib_dt_entry', req.symbol,
-                                         f"[SIM] BUY {qty}sh @ ${entry_price:.2f} "
-                                         f"(strategy=${req.entry_price:.2f}, scan=${scan_price:.2f})")
-                    else:
-                        log.warning(f"FIB DT: Virtual buy failed for {req.symbol} [{now_et}]")
-                else:
-                    log.warning(f"FIB DT: Insufficient virtual cash for {req.symbol} "
-                                f"(cash=${self._virtual_portfolio.cash:.0f}, price=${entry_price:.2f})")
-
-            # ── 5. Execute trailing exits (virtual portfolio) ──
-            for exit_sig in trailing_exits:
-                now_et = datetime.now(_ET).strftime('%Y-%m-%d %H:%M:%S ET')
-                log.info(f"FIB DT TRAILING EXIT [{now_et}]: {exit_sig.symbol} — {exit_sig.reason}")
-                pos = self._virtual_portfolio.positions.get(exit_sig.symbol)
-                if pos:
-                    price = current.get(exit_sig.symbol, {}).get('price', pos['entry_price'])
-                    alert = self._virtual_portfolio.trailing_exit(exit_sig.symbol, price, exit_sig.reason)
-                    if alert:
-                        send_telegram(alert)  # private chat, not group
-                    self._fib_dt_strategy.mark_position_closed(exit_sig.symbol)
-
-        except Exception as e:
-            log.error(f"FIB DT cycle error: {e}")
-
-    def _monitor_virtual_positions(self, current: dict):
-        """Monitor virtual portfolio positions for stop/target hits.
-
-        Uses real-time prices from current scan data.
-        Checks: FIB DT stops/targets, MR/FT profit targets + breakeven stops.
-        """
-        # Build current prices from scan data
-        current_prices = {}
-        for sym, d in current.items():
-            px = d.get('price', 0)
-            if px > 0:
-                current_prices[sym] = px
-
-        # ── FIB DT: check stops and targets ──
-        if self._virtual_portfolio.positions:
-            alerts = self._virtual_portfolio.check_stops_and_targets(current_prices)
-            for alert in alerts:
-                send_telegram(alert)
-
-            # Sync strategy state for positions entering TRAILING (once only)
-            for sym in list(self._virtual_portfolio.positions.keys()):
-                pos = self._virtual_portfolio.positions[sym]
-                if pos['phase'] == 'TRAILING' and not pos.get('trailing_synced'):
-                    self._fib_dt_strategy.mark_trailing(sym)
-                    pos['trailing_synced'] = True
-
-        # ── MR: profit target (+10%) → sell half + breakeven stop ──
-        for sym in list(self._mr_portfolio.positions.keys()):
-            pos = self._mr_portfolio.positions.get(sym)
-            if not pos:
-                continue
-            price = current_prices.get(sym, 0)
-            if price <= 0:
-                continue
-            entry_price = pos.get('entry_price', 0)
-            if entry_price <= 0:
-                continue
-
-            # Breakeven stop: after target hit, exit if price drops to entry
-            if pos.get('target_hit') and price <= entry_price:
-                alert = self._mr_portfolio.sell(sym, price,
-                    f"breakeven_stop (entry=${entry_price:.4f})")
-                if alert:
-                    send_telegram(alert)
-                    self._mr_strategy.mark_position_closed(sym)
-                continue
-
-            # Profit target: sell half at +10%
-            if not pos.get('target_hit') and price >= entry_price * (1 + MR_LIVE_PROFIT_TARGET_PCT):
-                pct = MR_LIVE_PROFIT_TARGET_PCT * 100
-                alert = self._mr_portfolio.sell_half(sym, price,
-                    f"profit_target (+{pct:.0f}%, entry=${entry_price:.4f})")
-                if alert:
-                    send_telegram(alert)
-
-        # ── FT: profit target (+8%) → sell half + breakeven stop ──
-        for sym in list(self._ft_portfolio.positions.keys()):
-            pos = self._ft_portfolio.positions.get(sym)
-            if not pos:
-                continue
-            price = current_prices.get(sym, 0)
-            if price <= 0:
-                continue
-            entry_price = pos.get('entry_price', 0)
-            if entry_price <= 0:
-                continue
-
-            # Breakeven stop: after target hit, exit if price drops to entry
-            if pos.get('target_hit') and price <= entry_price:
-                alert = self._ft_portfolio.sell(sym, price,
-                    f"breakeven_stop (entry=${entry_price:.4f})")
-                if alert:
-                    send_telegram(alert)
-                    self._ft_strategy.mark_position_closed(sym)
-                continue
-
-            # Profit target: sell half at +8%
-            if not pos.get('target_hit') and price >= entry_price * (1 + FT_LIVE_PROFIT_TARGET_PCT):
-                pct = FT_LIVE_PROFIT_TARGET_PCT * 100
-                alert = self._ft_portfolio.sell_half(sym, price,
-                    f"profit_target (+{pct:.0f}%, entry=${entry_price:.4f})")
-                if alert:
-                    send_telegram(alert)
-
-    def _run_gap_go_cycle(self, current: dict):
-        """Run Gap and Go auto-strategy: find gappers >= 30%, check HA + VWAP signals."""
-        try:
-            # ── 1. Build candidate list (>= 30% gap, RVOL >= 2.5, news) ──
-            candidates = []
-            for sym, d in current.items():
-                pct = d.get('pct', 0)
-                price = d.get('price', 0)
-                contract = d.get('contract')
-                prev_close = d.get('prev_close', 0)
-
-                if pct < GG_LIVE_GAP_MIN_PCT or price <= 0 or not contract:
-                    continue
-                if prev_close <= 0:
-                    continue
-                if price < STRATEGY_MIN_PRICE:
-                    continue
-                # RVOL filter
-                rvol = d.get('rvol', 0)
-                if rvol < GG_LIVE_RVOL_MIN:
-                    continue
-                # News filter
-                if GG_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
-                    continue
-                # Bearish news filter
-                if _news_is_bearish(sym):
-                    continue
-
-                candidates.append(GGCandidate(
-                    symbol=sym,
-                    contract=contract,
-                    gap_pct=pct,
-                    prev_close=prev_close,
-                    current_price=price,
-                ))
-
-            if not candidates:
-                return
-
-            # Sort by composite score descending, limit to TOP 3
-            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'gg'), reverse=True)
-            candidates = candidates[:3]
-
-            # SMA9 filter (only on final candidates to limit IBKR calls)
-            candidates = [
-                c for c in candidates
-                if _check_above_sma9(c.symbol, c.current_price, c.contract)
-            ]
-            if not candidates:
-                return
-
-            # Bar range filter (spread/chop proxy)
-            candidates = [
-                c for c in candidates
-                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
-                or _avg_bar_range_pct(c.symbol) == 0.0
-            ]
-            if not candidates:
-                return
-
-            log.info(f"GG candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'gg'):.1f}" for c in candidates))
-
-            # ── 2. Run strategy cycle ──
-            entries, exits = self._gg_strategy.process_cycle(candidates)
-
-            # ── 3. Execute exits first ──
+            # ── 4. Execute exits first ──
             for exit_sig in exits:
-                price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
-                if exit_sig.sell_half:
-                    # Profit target: sell half, keep position open
-                    alert = self._gg_portfolio.sell_half(exit_sig.symbol, price, exit_sig.reason)
-                    if alert:
-                        send_telegram(alert)
-                        _log_daily_event('gg_exit', exit_sig.symbol,
-                                         f"[GG-SIM] SELL HALF @ ${price:.4f} ({exit_sig.reason})")
-                else:
-                    alert = self._gg_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
-                    if alert:
-                        send_telegram(alert)
-                        self._gg_strategy.mark_position_closed(exit_sig.symbol)
-                        _log_daily_event('gg_exit', exit_sig.symbol,
-                                         f"[GG-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
+                sym = exit_sig.symbol
+                price = current.get(sym, {}).get('price', exit_sig.price)
+                alert = self._vz_portfolio.sell(exit_sig.slot_key, price, exit_sig.reason)
+                if alert:
+                    send_telegram(alert)
+                    idx_s = exit_sig.slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    # Set loss cooldown if it was a loss
+                    pos_entry = self._vz_portfolio.positions.get(exit_sig.slot_key, {}).get('entry_price', 0)
+                    if price < pos_entry:
+                        self._vz_strategy.set_loss_cooldown(sym)
+                    _log_daily_event('vz_exit', sym,
+                                     f"[VZ-SIM] SELL {exit_sig.slot_key} @ ${price:.4f} ({exit_sig.reason})")
 
-            # ── 4. Execute entries ──
+            # ── 5. Execute entries ──
             for entry in entries:
-                # Duplicate-entry guard: skip if already holding this symbol
-                if entry.symbol in self._gg_portfolio.positions:
-                    self._gg_strategy.mark_position_closed(entry.symbol)
-                    continue
+                sym = entry.symbol
+                slot_key = entry.slot_key
 
-                scan_price = current.get(entry.symbol, {}).get('price', entry.price)
+                scan_price = current.get(sym, {}).get('price', entry.price)
                 entry_price = scan_price if scan_price > 0 else entry.price
 
                 # Min price filter
                 if entry_price < STRATEGY_MIN_PRICE:
-                    self._gg_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"GG: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
-                    continue
-                # Risk controls
-                can_buy, reason = self._gg_portfolio.can_enter(entry.symbol)
-                if not can_buy:
-                    self._gg_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"GG: Skipping {entry.symbol} — {reason}")
+                    idx_s = slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    log.info(f"VZ: Skipping {slot_key} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
                     continue
 
-                qty = int(min(self._gg_portfolio.cash, GG_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
+                # Risk controls
+                can_buy, reason = self._vz_portfolio.can_enter(slot_key)
+                if not can_buy:
+                    idx_s = slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    log.info(f"VZ: Skipping {slot_key} — {reason}")
+                    continue
+
+                # Position sizing: $400 sub-$2, $300 otherwise
+                size = VZ_LIVE_POSITION_SIZE_SUB2 if entry_price < 2.0 else VZ_LIVE_POSITION_SIZE
+                qty = int(min(self._vz_portfolio.cash, size) / entry_price) if entry_price > 0 else 0
                 if qty >= 1:
-                    alert = self._gg_portfolio.buy(entry.symbol, qty, entry_price, entry.vwap)
+                    alert = self._vz_portfolio.buy(slot_key, qty, entry_price, entry.vwap)
                     if alert:
                         send_telegram(alert)
-                        # State already marked in strategy; just log
-                        entry_type = "1st" if entry.is_first_entry else "re"
-                        _log_daily_event('gg_entry', entry.symbol,
-                                         f"[GG-SIM] BUY({entry_type}) {qty}sh @ ${entry_price:.4f} "
-                                         f"VWAP=${entry.vwap:.4f}")
+                        _log_daily_event('vz_entry', sym,
+                                         f"[VZ-SIM] BUY {slot_key} {qty}sh @ ${entry_price:.4f} "
+                                         f"VWAP=${entry.vwap:.4f} SMA20=${entry.sma20:.4f}")
                     else:
-                        # Buy failed — rollback strategy state
-                        self._gg_strategy.mark_position_closed(entry.symbol)
-                        log.warning(f"GG: Virtual buy failed for {entry.symbol}")
+                        idx_s = slot_key.rsplit('_', 1)[1]
+                        try:
+                            self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                        except (ValueError, IndexError):
+                            pass
+                        log.warning(f"VZ: Virtual buy failed for {slot_key}")
                 else:
-                    # Insufficient cash — rollback strategy state
-                    self._gg_strategy.mark_position_closed(entry.symbol)
-                    log.warning(f"GG: Insufficient virtual cash for {entry.symbol} "
-                                f"(cash=${self._gg_portfolio.cash:.0f}, price=${entry_price:.4f})")
+                    idx_s = slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    log.warning(f"VZ: Insufficient virtual cash for {slot_key} "
+                                f"(cash=${self._vz_portfolio.cash:.0f}, price=${entry_price:.4f})")
 
-            # Cache 1-min bars from GG strategy for Doji/MA alerts
-            for sym, raw_bars in self._gg_strategy._last_raw_bars.items():
+            # Cache 1-min bars from VZ strategy for Doji/MA alerts
+            for sym, raw_bars in self._vz_strategy._last_raw_bars.items():
                 if raw_bars and len(raw_bars) >= 5:
                     try:
                         df = ib_util.df(raw_bars)
@@ -8414,288 +7069,7 @@ class ScannerThread(threading.Thread):
                         pass
 
         except Exception as e:
-            log.error(f"GG cycle error: {e}")
-
-    def _run_momentum_ride_cycle(self, current: dict):
-        """Run Momentum Ride auto-strategy: VWAP cross/pullback + SMA9 hourly, 5% trailing stop."""
-        try:
-            # ── 1. Build candidate list (35-150% gap, RVOL >= 2.0, news, near/above VWAP) ──
-            candidates = []
-            for sym, d in current.items():
-                pct = d.get('pct', 0)
-                price = d.get('price', 0)
-                contract = d.get('contract')
-                prev_close = d.get('prev_close', 0)
-
-                if pct < MR_GAP_MIN_PCT or pct > MR_GAP_MAX_PCT or price <= 0 or not contract:
-                    continue
-                if prev_close <= 0:
-                    continue
-                if price < STRATEGY_MIN_PRICE:
-                    continue
-                # Skip if too far below VWAP
-                vwap = d.get('vwap', 0)
-                if vwap > 0 and price < vwap:
-                    if round((vwap - price) / price * 100, 1) > ALERT_VWAP_MAX_BELOW_PCT:
-                        continue
-                # RVOL filter
-                rvol = d.get('rvol', 0)
-                if rvol < MR_LIVE_RVOL_MIN:
-                    continue
-                # News filter
-                if MR_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
-                    continue
-                # Bearish news filter
-                if _news_is_bearish(sym):
-                    continue
-
-                candidates.append(MRCandidate(
-                    symbol=sym,
-                    contract=contract,
-                    gap_pct=pct,
-                    prev_close=prev_close,
-                    current_price=price,
-                ))
-
-            if not candidates:
-                return
-
-            # Sort by composite score descending, limit to TOP 3
-            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'mr'), reverse=True)
-            candidates = candidates[:3]
-
-            # SMA9 filter (only on final candidates to limit IBKR calls)
-            candidates = [
-                c for c in candidates
-                if _check_above_sma9(c.symbol, c.current_price, c.contract)
-            ]
-            if not candidates:
-                return
-
-            # Bar range filter (spread/chop proxy)
-            candidates = [
-                c for c in candidates
-                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
-                or _avg_bar_range_pct(c.symbol) == 0.0
-            ]
-            if not candidates:
-                return
-
-            log.info(f"MR candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'mr'):.1f}" for c in candidates))
-
-            # ── 2. Run strategy cycle ──
-            entries, exits = self._mr_strategy.process_cycle(candidates)
-
-            # ── 3. Execute exits first ──
-            for exit_sig in exits:
-                price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
-                alert = self._mr_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
-                if alert:
-                    send_telegram(alert)
-                    self._mr_strategy.mark_position_closed(exit_sig.symbol)
-                    _log_daily_event('mr_exit', exit_sig.symbol,
-                                     f"[MR-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
-
-            # ── 4. Execute entries ──
-            for entry in entries:
-                # Duplicate-entry guard: skip if already holding this symbol
-                if entry.symbol in self._mr_portfolio.positions:
-                    self._mr_strategy.mark_position_closed(entry.symbol)
-                    continue
-
-                scan_price = current.get(entry.symbol, {}).get('price', entry.price)
-                entry_price = scan_price if scan_price > 0 else entry.price
-
-                # Min price filter
-                if entry_price < STRATEGY_MIN_PRICE:
-                    self._mr_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"MR: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
-                    continue
-                # Risk controls
-                can_buy, reason = self._mr_portfolio.can_enter(entry.symbol)
-                if not can_buy:
-                    self._mr_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"MR: Skipping {entry.symbol} — {reason}")
-                    continue
-
-                qty = int(min(self._mr_portfolio.cash, MR_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
-                if qty >= 1:
-                    alert = self._mr_portfolio.buy(
-                        entry.symbol, qty, entry_price, entry.vwap,
-                        signal_type=entry.signal_type,
-                    )
-                    if alert:
-                        send_telegram(alert)
-                        # State already marked in strategy; just log
-                        _log_daily_event('mr_entry', entry.symbol,
-                                         f"[MR-SIM] BUY({entry.signal_type}) {qty}sh @ ${entry_price:.4f} "
-                                         f"VWAP=${entry.vwap:.4f} SMA9h=${entry.sma9_hourly:.4f}")
-                    else:
-                        # Buy failed — rollback strategy state
-                        self._mr_strategy.mark_position_closed(entry.symbol)
-                        log.warning(f"MR: Virtual buy failed for {entry.symbol}")
-                else:
-                    # Insufficient cash — rollback strategy state
-                    self._mr_strategy.mark_position_closed(entry.symbol)
-                    log.warning(f"MR: Insufficient virtual cash for {entry.symbol} "
-                                f"(cash=${self._mr_portfolio.cash:.0f}, price=${entry_price:.4f})")
-
-            # Cache 1-min bars from MR strategy for Doji/MA alerts
-            for sym, raw_bars in self._mr_strategy._last_raw_bars.items():
-                if raw_bars and len(raw_bars) >= 5:
-                    try:
-                        df = ib_util.df(raw_bars)
-                        _intraday_cache[f"{sym}_1 min"] = (time_mod.time(), df)
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            log.error(f"MR cycle error: {e}")
-
-    def _run_float_turnover_cycle(self, current: dict):
-        """Run Float Turnover auto-strategy: 1-min bar high/low logic on high-turnover stocks."""
-        try:
-            # ── 1. Build candidate list (≥25% turnover + 30% gap + RVOL 3x + news) ──
-            candidates = []
-            for sym, d in current.items():
-                price = d.get('price', 0)
-                contract = d.get('contract')
-                if price <= 0 or not contract:
-                    continue
-                if price < STRATEGY_MIN_PRICE:
-                    continue
-                # Gap % filter (directional confirmation)
-                pct = d.get('pct', 0)
-                if pct < FT_LIVE_GAP_MIN_PCT:
-                    continue
-                # RVOL filter
-                rvol = d.get('rvol', 0)
-                if rvol < FT_LIVE_RVOL_MIN:
-                    continue
-                # News filter
-                if FT_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
-                    continue
-                # Bearish news filter
-                if _news_is_bearish(sym):
-                    continue
-
-                # Skip if too far below VWAP
-                vwap = d.get('vwap', 0)
-                if vwap > 0 and price < vwap:
-                    if round((vwap - price) / price * 100, 1) > ALERT_VWAP_MAX_BELOW_PCT:
-                        continue
-
-                enrich = _enrichment.get(sym, {})
-                if not enrich:
-                    continue
-
-                float_shares = _parse_float_to_shares(enrich.get('float', '-'))
-                if float_shares <= 0:
-                    continue
-
-                vol_raw = d.get('volume_raw', 0)
-                if vol_raw <= 0:
-                    continue
-
-                turnover = vol_raw / float_shares * 100
-                if turnover < FT_MIN_FLOAT_TURNOVER_PCT:
-                    continue
-
-                candidates.append(FTCandidate(
-                    symbol=sym,
-                    contract=contract,
-                    price=price,
-                    float_shares=float_shares,
-                    turnover_pct=turnover,
-                    vwap=vwap,
-                ))
-
-            if not candidates:
-                return
-
-            # Sort by composite score descending, limit to TOP 3
-            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'ft'), reverse=True)
-            candidates = candidates[:3]
-
-            # SMA9 filter (only on final candidates to limit IBKR calls)
-            candidates = [
-                c for c in candidates
-                if _check_above_sma9(c.symbol, c.price, c.contract)
-            ]
-            if not candidates:
-                return
-
-            # Bar range filter (spread/chop proxy)
-            candidates = [
-                c for c in candidates
-                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
-                or _avg_bar_range_pct(c.symbol) == 0.0
-            ]
-            if not candidates:
-                return
-
-            log.info(f"FT candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'ft'):.1f}" for c in candidates))
-
-            # ── 2. Run strategy cycle ──
-            entries, exits = self._ft_strategy.process_cycle(candidates)
-
-            # ── 3. Execute exits first ──
-            for exit_sig in exits:
-                price = current.get(exit_sig.symbol, {}).get('price', exit_sig.price)
-                alert = self._ft_portfolio.sell(exit_sig.symbol, price, exit_sig.reason)
-                if alert:
-                    send_telegram(alert)
-                    self._ft_strategy.mark_position_closed(exit_sig.symbol)
-                    _log_daily_event('ft_exit', exit_sig.symbol,
-                                     f"[FT-SIM] SELL @ ${price:.4f} ({exit_sig.reason})")
-
-            # ── 4. Execute entries ──
-            for entry in entries:
-                # Duplicate-entry guard: skip if already holding this symbol
-                if entry.symbol in self._ft_portfolio.positions:
-                    self._ft_strategy.mark_position_closed(entry.symbol)
-                    continue
-
-                scan_price = current.get(entry.symbol, {}).get('price', entry.price)
-                entry_price = scan_price if scan_price > 0 else entry.price
-
-                # Min price filter
-                if entry_price < STRATEGY_MIN_PRICE:
-                    self._ft_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"FT: Skipping {entry.symbol} — price ${entry_price:.4f} < min ${STRATEGY_MIN_PRICE}")
-                    continue
-                # Risk controls
-                can_buy, reason = self._ft_portfolio.can_enter(entry.symbol)
-                if not can_buy:
-                    self._ft_strategy.mark_position_closed(entry.symbol)
-                    log.info(f"FT: Skipping {entry.symbol} — {reason}")
-                    continue
-
-                qty = int(min(self._ft_portfolio.cash, FT_LIVE_POSITION_SIZE_FIXED) / entry_price) if entry_price > 0 else 0
-                qty = min(qty, 5000)  # absolute max shares
-                if qty >= 1:
-                    alert = self._ft_portfolio.buy(
-                        entry.symbol, qty, entry_price, entry.turnover_pct,
-                    )
-                    if alert:
-                        send_telegram(alert)
-                        _log_daily_event('ft_entry', entry.symbol,
-                                         f"[FT-SIM] BUY {qty}sh @ ${entry_price:.4f} "
-                                         f"turnover={entry.turnover_pct:.0f}%")
-                    else:
-                        # Buy failed — rollback strategy state
-                        self._ft_strategy.mark_position_closed(entry.symbol)
-                        log.warning(f"FT: Virtual buy failed for {entry.symbol}")
-                else:
-                    # Insufficient cash — rollback strategy state
-                    self._ft_strategy.mark_position_closed(entry.symbol)
-                    log.warning(f"FT: Insufficient virtual cash for {entry.symbol} "
-                                f"(cash=${self._ft_portfolio.cash:.0f}, price=${entry_price:.4f})")
-
-        except Exception as e:
-            log.error(f"FT cycle error: {e}")
+            log.error(f"VZ cycle error: {e}")
 
     @staticmethod
     def _merge_stocks(current: dict) -> dict:
@@ -9027,22 +7401,16 @@ class ScannerThread(threading.Thread):
         except Exception as e:
             log.error(f"_check_timed_exits crashed: {e}", exc_info=True)
 
-        # ── FIB DT Auto-Strategy ──
-        _phase('fib_dt_start')
-        self._run_fib_dt_cycle(current, status)
-        _phase('fib_dt_done')
+        # ── EOD profit protection (tight trail after 15:30) ──
+        try:
+            self._check_eod_profit_lock(current)
+        except Exception as e:
+            log.error(f"_check_eod_profit_lock crashed: {e}", exc_info=True)
 
-        # ── Gap and Go Auto-Strategy ──
-        self._run_gap_go_cycle(current)
-        _phase('gg_done')
-
-        # ── Momentum Ride Auto-Strategy ──
-        self._run_momentum_ride_cycle(current)
-        _phase('mr_done')
-
-        # ── Float Turnover Auto-Strategy ──
-        self._run_float_turnover_cycle(current)
-        _phase('ft_done')
+        # ── VWAP Zone Auto-Strategy ──
+        _phase('vz_start')
+        self._run_vwap_zone_cycle(current)
+        _phase('vz_done')
 
         # ── Refresh fib partition with current prices ──
         self._refresh_enrichment_fibs(current)
@@ -9056,23 +7424,16 @@ class ScannerThread(threading.Thread):
             _check_session_summary()
             # Build current prices for virtual portfolio summary
             vp_prices = {s: d.get('price', 0) for s, d in current.items() if d.get('price', 0) > 0}
-            vp_summary = self._virtual_portfolio.summary_text(vp_prices) if self._virtual_portfolio else ''
-            gg_summary = self._gg_portfolio.summary_text(vp_prices) if self._gg_portfolio else ''
-            mr_summary = self._mr_portfolio.summary_text(vp_prices) if self._mr_portfolio else ''
-            ft_summary = self._ft_portfolio.summary_text(vp_prices) if self._ft_portfolio else ''
+            vz_summary = self._vz_portfolio.summary_text(vp_prices) if self._vz_portfolio else ''
             _check_daily_summary(
                 positions=self._cached_positions,
                 net_liq=self._cached_net_liq,
                 buying_power=self._cached_buying_power,
-                fib_dt_sym=self._fib_dt_current_sym,
                 cycle_count=self.count,
-                virtual_portfolio_summary=vp_summary,
-                gg_portfolio_summary=gg_summary,
-                mr_portfolio_summary=mr_summary,
-                ft_portfolio_summary=ft_summary,
+                vz_portfolio_summary=vz_summary,
             )
-            _check_weekly_report(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, self._ft_portfolio, vp_prices)
-            _check_weekly_reset(self._virtual_portfolio, self._gg_portfolio, self._mr_portfolio, self._ft_portfolio)
+            _check_weekly_report(self._vz_portfolio, vp_prices)
+            _check_weekly_reset(self._vz_portfolio)
 
         # Float report runs even during warmup (for force-flag support)
         _check_float_report(current)
