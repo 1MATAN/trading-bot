@@ -191,8 +191,15 @@ class FloatTurnoverLiveStrategy:
             now_ts = time_mod.time()
             cooldown_ok = (now_ts - state.last_exit_time) >= _FT_REENTRY_COOLDOWN_SEC
             vwap_ok = cand.vwap <= 0 or price > cand.vwap  # above VWAP (or no VWAP data)
-            # Entry: support held + above VWAP + cooldown passed
-            if latest_low >= prev_low and vwap_ok and cooldown_ok:
+            # Volume confirmation: min 100 shares + green bar (close > open)
+            latest_vol = float(latest.volume)
+            latest_green = float(latest.close) > float(latest.open)
+            # Close in upper half of range
+            bar_range = float(latest.high) - float(latest.low)
+            upper_half = bar_range <= 0 or (price - float(latest.low)) >= bar_range * 0.5
+            vol_ok = latest_vol >= 100 and latest_green and upper_half
+            # Entry: support held + above VWAP + cooldown passed + volume confirmed
+            if latest_low >= prev_low and vwap_ok and cooldown_ok and vol_ok:
                 state.in_position = True
                 state.entry_price = price
                 return FTEntrySignal(

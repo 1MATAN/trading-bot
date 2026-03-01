@@ -368,6 +368,10 @@ class GapGoLiveStrategy:
             if not latest_1m["is_green"] or not latest_5m["is_green"]:
                 return None, None
 
+            # Volume confirmation: last 1-min bar must have >= 1000 shares
+            if bars_1m[-1]["volume"] < 1000:
+                return None, None
+
             # All conditions met — mark position immediately to prevent duplicate entries
             is_first = not state.first_entry_done
             state.in_position = True

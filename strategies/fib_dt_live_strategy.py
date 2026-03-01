@@ -104,6 +104,8 @@ class DTSymbolState:
     # Tracking
     last_bar_count: int = 0
     date_key: str = ""
+    # Position tracking
+    entry_price: float = 0.0  # for adaptive trailing patience
     # Trailing state
     prev_bar_high: float = 0.0
     trailing_no_high_count: int = 0  # consecutive bars without new high
@@ -220,11 +222,13 @@ class FibDTLiveStrategy:
         self._reset_daily_if_needed()
         self._entries_today += 1
 
-    def mark_in_position(self, symbol: str) -> None:
+    def mark_in_position(self, symbol: str, entry_price: float = 0.0) -> None:
         """Transition symbol to IN_POSITION (split orders handle exit)."""
         st = self._states.get(symbol)
         if st:
             st.phase = DTSymbolPhase.IN_POSITION
+            if entry_price > 0:
+                st.entry_price = entry_price
             logger.info(f"[{symbol}] -> IN_POSITION (split exit orders active)")
 
     def mark_trailing(self, symbol: str) -> None:
@@ -445,9 +449,18 @@ class FibDTLiveStrategy:
 
         bar_high = float(df["high"].iloc[-1])
 
+        # Adaptive trailing patience: more patience when in profit
+        patience = FIB_DT_LIVE_TRAILING_BARS
+        if st.entry_price > 0 and bar_high > 0:
+            profit_pct = (bar_high - st.entry_price) / st.entry_price
+            if profit_pct > 0.05:
+                patience = int(FIB_DT_LIVE_TRAILING_BARS * 2.0)
+            elif profit_pct > 0:
+                patience = int(FIB_DT_LIVE_TRAILING_BARS * 1.5)
+
         if st.prev_bar_high > 0 and bar_high <= st.prev_bar_high:
             st.trailing_no_high_count += 1
-            if st.trailing_no_high_count >= FIB_DT_LIVE_TRAILING_BARS:
+            if st.trailing_no_high_count >= patience:
                 reason = (
                     f"no_new_high x{st.trailing_no_high_count} "
                     f"(prev_high=${st.prev_bar_high:.4f}, bar_high=${bar_high:.4f})"
@@ -458,7 +471,7 @@ class FibDTLiveStrategy:
                     contract=st.contract,
                     reason=reason,
                 )
-            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{FIB_DT_LIVE_TRAILING_BARS}")
+            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{patience}")
         else:
             st.trailing_no_high_count = 0
 
@@ -593,10 +606,12 @@ class FibDTLiveStrategySync:
         self._reset_daily_if_needed()
         self._entries_today += 1
 
-    def mark_in_position(self, symbol: str) -> None:
+    def mark_in_position(self, symbol: str, entry_price: float = 0.0) -> None:
         st = self._states.get(symbol)
         if st:
             st.phase = DTSymbolPhase.IN_POSITION
+            if entry_price > 0:
+                st.entry_price = entry_price
             logger.info(f"[{symbol}] -> IN_POSITION (split exit orders active)")
 
     def mark_trailing(self, symbol: str) -> None:
@@ -843,9 +858,18 @@ class FibDTLiveStrategySync:
 
         bar_high = float(df["high"].iloc[-1])
 
+        # Adaptive trailing patience: more patience when in profit
+        patience = FIB_DT_LIVE_TRAILING_BARS
+        if st.entry_price > 0 and bar_high > 0:
+            profit_pct = (bar_high - st.entry_price) / st.entry_price
+            if profit_pct > 0.05:
+                patience = int(FIB_DT_LIVE_TRAILING_BARS * 2.0)
+            elif profit_pct > 0:
+                patience = int(FIB_DT_LIVE_TRAILING_BARS * 1.5)
+
         if st.prev_bar_high > 0 and bar_high <= st.prev_bar_high:
             st.trailing_no_high_count += 1
-            if st.trailing_no_high_count >= FIB_DT_LIVE_TRAILING_BARS:
+            if st.trailing_no_high_count >= patience:
                 reason = (
                     f"no_new_high x{st.trailing_no_high_count} "
                     f"(prev_high=${st.prev_bar_high:.4f}, bar_high=${bar_high:.4f})"
@@ -856,7 +880,7 @@ class FibDTLiveStrategySync:
                     contract=st.contract,
                     reason=reason,
                 )
-            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{FIB_DT_LIVE_TRAILING_BARS}")
+            logger.debug(f"[{st.symbol}] trailing: no new high {st.trailing_no_high_count}/{patience}")
         else:
             st.trailing_no_high_count = 0
 

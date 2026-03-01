@@ -80,7 +80,8 @@ from config.settings import (
     FT_LIVE_INITIAL_CASH, FT_LIVE_POSITION_SIZE_FIXED, FT_MIN_FLOAT_TURNOVER_PCT,
     FT_LIVE_MAX_POSITIONS, FT_MAX_HOLD_MINUTES, FT_LIVE_PROFIT_TARGET_PCT,
     FT_LIVE_GAP_MIN_PCT, FT_LIVE_RVOL_MIN, FT_LIVE_REQUIRE_NEWS,
-    STRATEGY_MIN_PRICE, FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
+    STRATEGY_MIN_PRICE, STRATEGY_MAX_BAR_RANGE_PCT,
+    FIB_DT_POSITION_SIZE_FIXED, FIB_DT_MAX_POSITIONS,
     FIB_DT_MAX_HOLD_MINUTES,
     FIB_DT_GAP_MIN_PCT, FIB_DT_GAP_MAX_PCT, FIB_DT_RVOL_MIN, FIB_DT_REQUIRE_NEWS,
     STRATEGY_REENTRY_COOLDOWN_SEC, STRATEGY_REENTRY_COOLDOWN_AFTER_LOSS_SEC,
@@ -480,13 +481,23 @@ def _calc_vwap_from_bars(trade_bars: list) -> float | None:
     return None
 
 
+_ext_price_cache: dict[str, tuple[float, tuple]] = {}  # sym → (timestamp, result)
+_EXT_PRICE_CACHE_TTL = 60  # 60-second TTL
+
+
 def _fetch_extended_hours_price(ib: IB, contract, session: str,
                                 bars: list) -> tuple[float, float, float | None, float | None, float | None, int | None]:
     """Fetch price, prev_close, and extended-hours high/low/vwap/volume.
 
     Returns (price, prev_close, ext_high, ext_low, ext_vwap, ext_volume).
     ext_* are None when no extended-hours data is available.
+    Uses 60s cache during RTH to reduce redundant IBKR calls.
     """
+    sym = contract.symbol
+    now = time_mod.time()
+    cached = _ext_price_cache.get(sym)
+    if cached and (now - cached[0]) < _EXT_PRICE_CACHE_TTL:
+        return cached[1]
     last_bar = bars[-1]
     price = last_bar.close
     ext_high = None
@@ -546,7 +557,9 @@ def _fetch_extended_hours_price(ib: IB, contract, session: str,
         except Exception:
             pass
 
-    return price, prev_close, ext_high, ext_low, ext_vwap, ext_volume
+    result = (price, prev_close, ext_high, ext_low, ext_vwap, ext_volume)
+    _ext_price_cache[sym] = (time_mod.time(), result)
+    return result
 
 
 def _format_volume(volume: float) -> str:
@@ -641,11 +654,85 @@ def _get_spy_daily_change() -> float:
     return _spy_cache['pct']
 
 
-# ── Robot helpers: news + SMA9 checks ──
+# ── Robot helpers: news + SMA9 + spread checks ──
 def _stock_has_news(sym: str) -> bool:
     """Check if stock has news from enrichment (Finviz/IBKR)."""
     enrich = _enrichment.get(sym, {})
     return bool(enrich.get('news'))
+
+
+_BEARISH_KEYWORDS = [
+    "offering", "dilution", "reverse split", "delisting", "delist",
+    "fda reject", "fda denial", "chapter 11", "bankruptcy", "default",
+    "sec charge", "sec investigation", "fraud", "recall", "downgrade",
+    "going concern", "shelf registration", "direct offering",
+    "compliance notice", "non-compliance",
+]
+
+
+def _news_is_bearish(sym: str) -> bool:
+    """Check if stock has bearish news headlines (offering, dilution, etc.)."""
+    enrich = _enrichment.get(sym, {})
+    news = enrich.get('news', [])
+    if not news:
+        return False
+    for item in news:
+        title = (item.get('title_he', '') + ' ' + item.get('title_en', '')).lower()
+        for kw in _BEARISH_KEYWORDS:
+            if kw in title:
+                log.debug(f"Bearish news filter: {sym} matched '{kw}' in: {title[:60]}")
+                return True
+    return False
+
+
+def _composite_score(sym: str, d: dict, strategy: str = 'default') -> float:
+    """Compute weighted composite score for candidate ranking.
+
+    Combines gap%, RVOL, and float turnover with strategy-specific weights.
+    """
+    pct = d.get('pct', 0)
+    rvol = d.get('rvol', 0)
+    volume_raw = d.get('volume_raw', 0)
+
+    # Compute turnover if possible
+    enrich = _enrichment.get(sym, {})
+    flt_shares = _parse_float_to_shares(enrich.get('float', '-'))
+    turnover = (volume_raw / flt_shares * 100) if flt_shares > 0 and volume_raw > 0 else 0
+
+    # Strategy-specific weights (gap%, rvol, turnover)
+    weights = {
+        'fib_dt':  (0.2, 0.3, 0.5),  # turnover-heavy (float rotation matters)
+        'gg':      (0.5, 0.3, 0.2),  # gap-heavy (momentum direction)
+        'mr':      (0.4, 0.4, 0.2),  # balanced gap + RVOL
+        'ft':      (0.1, 0.3, 0.6),  # turnover-dominant
+    }
+    w_gap, w_rvol, w_turn = weights.get(strategy, (0.33, 0.33, 0.34))
+
+    # Normalize to roughly 0-100 scale
+    gap_score = min(pct / 100, 1.5) * 100  # cap at 150%
+    rvol_score = min(rvol / 10, 1.0) * 100  # cap at 10x
+    turn_score = min(turnover / 100, 1.5) * 100  # cap at 100%
+
+    return w_gap * gap_score + w_rvol * rvol_score + w_turn * turn_score
+
+
+def _avg_bar_range_pct(sym: str) -> float:
+    """Compute average bar range % from sparkline cache (spread/chop proxy).
+    Returns 0.0 if no data available.
+    """
+    cached = _spark_bars_cache.get(sym)
+    if not cached or len(cached) < 5:
+        return 0.0
+    # sparkline cache items are (close, volume) — need price range
+    # Use consecutive close-to-close changes as proxy
+    closes = [c for c, v in cached[-30:]]
+    if len(closes) < 5:
+        return 0.0
+    ranges = []
+    for i in range(1, len(closes)):
+        if closes[i - 1] > 0:
+            ranges.append(abs(closes[i] - closes[i - 1]) / closes[i - 1])
+    return sum(ranges) / len(ranges) if ranges else 0.0
 
 
 # SMA9 check cache: {sym: (timestamp, above_both)}
@@ -787,7 +874,7 @@ def _run_ibkr_scanner_list(price_min: float = MONITOR_PRICE_MIN,
         belowPrice=price_max,
     )
     try:
-        results = ib.reqScannerData(sub)
+        results = ib.reqScannerData(sub, timeout=15)
     except Exception as e:
         log.error(f"reqScannerData (TOP_PERC_GAIN) failed: {e}")
         return []
@@ -1317,7 +1404,7 @@ def _run_ocr_scan(price_min: float = MONITOR_PRICE_MIN,
 
     session = _get_market_session()
     src_count = sum(1 for s in _scanner_sources if s is not None)
-    log.info(f"OCR scan [{session}]: {src_count} sources → {len(best)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
+    log.debug(f"OCR scan [{session}]: {src_count} sources → {len(best)} parsed → {len(stocks)} stocks (price ${price_min}-${price_max})")
     return stocks
 
 
@@ -1372,9 +1459,16 @@ def _enrich_with_ibkr(current: dict, syms: list[str]):
 
     session = _get_market_session()
     enriched = 0
+    _MAX_ENRICH_PER_CYCLE = 8
 
     for sym in syms:
+        if enriched >= _MAX_ENRICH_PER_CYCLE:
+            log.debug(f"IBKR enrich: capped at {_MAX_ENRICH_PER_CYCLE}, skipping remaining")
+            break
         if sym not in current:
+            continue
+        # Skip symbols already enriched from carry-over
+        if current[sym].get('contract') and current[sym].get('rvol', 0) > 0:
             continue
         contract = _get_contract(sym)
         if not contract:
@@ -1521,7 +1615,22 @@ def _batch_translate(titles_en: list[str]) -> list[str]:
     try:
         combined = "\n||||\n".join(titles_en)
         translated = _translator.translate(combined)
-        return translated.split("\n||||\n")
+        parts = translated.split("\n||||\n")
+        if len(parts) == len(titles_en):
+            return parts
+        # Delimiter got mangled — try variations
+        for delim in ["||||", "\n||\n", "|||"]:
+            parts = translated.split(delim)
+            if len(parts) == len(titles_en):
+                return [p.strip() for p in parts]
+        # Fall back to individual translation
+        result = []
+        for t in titles_en:
+            try:
+                result.append(_translator.translate(t))
+            except Exception:
+                result.append(t)
+        return result
     except Exception:
         return list(titles_en)
 
@@ -3609,6 +3718,23 @@ _tf_high_alerted: dict[str, bool] = {}               # {"SYM_day": True, ...} �
 _TF_LABELS_HE = {'day': 'יומי', 'week': 'שבועי', 'month': 'חודשי', 'quarter': 'רבעוני', 'year': 'שנתי'}
 
 
+_LOG_MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _rotate_logs():
+    """Rotate monitor log files if they exceed 50 MB."""
+    for log_path in (LOG_TXT, LOG_CSV):
+        try:
+            if log_path.exists() and log_path.stat().st_size > _LOG_MAX_SIZE_BYTES:
+                rotated = log_path.with_suffix(log_path.suffix + '.old')
+                if rotated.exists():
+                    rotated.unlink()
+                log_path.rename(rotated)
+                log.info(f"Rotated {log_path.name} → {rotated.name}")
+        except Exception as e:
+            log.debug(f"Log rotation failed for {log_path}: {e}")
+
+
 def _reset_alerts_if_new_day():
     """Clear all alert tracking state when date changes."""
     global _alerts_date, _last_news_summary_time
@@ -3649,6 +3775,12 @@ def _reset_alerts_if_new_day():
         with _fib_cache_lock:
             _fib_cache.clear()
         _daily_cache.clear()
+        _article_cache.clear()
+        _spark_bars_cache.clear()
+        _sma9_cache.clear()
+        _ext_price_cache.clear()
+        stock_history.data.clear()
+        _rotate_logs()
         log.info(f"Alert state reset for new day: {today}")
 
 
@@ -4332,7 +4464,7 @@ def _enrich_stock(sym: str, price: float, on_status=None, force: bool = False) -
                         'article_id': it.get('article_id', ''),
                         'provider_code': it.get('provider_code', ''),
                     })
-            log.info(f"IBKR news {sym}: {len(ibkr_news)} raw → {len(new_titles_en)} new")
+            log.debug(f"IBKR news {sym}: {len(ibkr_news)} raw → {len(new_items)} new")
     except Exception as e:
         log.debug(f"IBKR news enrich {sym}: {e}")
 
@@ -5619,7 +5751,7 @@ _tg_sender.start()
 
 def _do_send_message(chat_id: str, text: str, reply_markup: dict | None = None,
                      reply_to: int | None = None) -> bool:
-    """Actually POST a text message to Telegram (blocking)."""
+    """Actually POST a text message to Telegram (blocking). Handles 429 rate limit."""
     try:
         payload: dict = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
         if reply_markup:
@@ -5630,6 +5762,14 @@ def _do_send_message(chat_id: str, text: str, reply_markup: dict | None = None,
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json=payload, timeout=_TG_SEND_TIMEOUT,
         )
+        if resp.status_code == 429:
+            retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
+            log.warning(f"Telegram 429: retry after {retry_after}s")
+            time_mod.sleep(min(retry_after, 30))
+            resp = requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json=payload, timeout=_TG_SEND_TIMEOUT,
+            )
         if not resp.ok:
             log.warning(f"Telegram send failed ({chat_id}): {resp.status_code}")
         return resp.ok
@@ -5641,7 +5781,7 @@ def _do_send_message(chat_id: str, text: str, reply_markup: dict | None = None,
 def _do_send_photo(chat_id: str, image_path: str | Path, caption: str = "",
                    reply_to: int | None = None,
                    reply_markup: dict | None = None) -> bool:
-    """Actually POST a photo to Telegram (blocking)."""
+    """Actually POST a photo to Telegram (blocking). Handles 429 rate limit."""
     try:
         data: dict = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'HTML'}
         if reply_to:
@@ -5653,6 +5793,15 @@ def _do_send_photo(chat_id: str, image_path: str | Path, caption: str = "",
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                 data=data, files={'photo': photo}, timeout=_TG_PHOTO_TIMEOUT,
             )
+        if resp.status_code == 429:
+            retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
+            log.warning(f"Telegram photo 429: retry after {retry_after}s")
+            time_mod.sleep(min(retry_after, 30))
+            with open(image_path, 'rb') as photo:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                    data=data, files={'photo': photo}, timeout=_TG_PHOTO_TIMEOUT,
+                )
         if not resp.ok:
             log.warning(f"Telegram photo failed ({chat_id}): {resp.status_code}")
         return resp.ok
@@ -7451,6 +7600,7 @@ class ScannerThread(threading.Thread):
         self._order_thread = order_thread  # for Telegram trading buttons
         self.running = False
         self.previous: dict = {}
+        self._prev_lock = threading.Lock()
         self._last_seen_in_scan: dict[str, float] = {}  # sym → time.time() when last found by OCR/IBKR
         self._fib_dt_first_seen: dict[str, float] = {}  # sym → time.time() when first seen (warmup)
         self.count = 0
@@ -7530,7 +7680,10 @@ class ScannerThread(threading.Thread):
         Only captures OCR + updates prices/pct + pushes to GUI.
         No IBKR calls, no fib recalc, no enrichment — keeps it under 1s.
         """
-        if not self.previous:
+        # Grab local reference under lock so main thread can replace self.previous safely
+        with self._prev_lock:
+            prev = self.previous
+        if not prev:
             return
         raw = _quick_ocr_capture(self.price_min, self.price_max)
         if not raw:
@@ -7541,28 +7694,28 @@ class ScannerThread(threading.Thread):
             self._last_seen_in_scan[sym] = now_ts
         price_changes: dict[str, tuple[float, float]] = {}  # sym → (price, pct)
         for sym, d in raw.items():
-            if sym not in self.previous:
+            if sym not in prev:
                 continue
             new_price = d['price']
-            old_price = self.previous[sym].get('price', 0)
+            old_price = prev[sym].get('price', 0)
             if abs(old_price - new_price) < 0.001:
                 continue
-            self.previous[sym]['price'] = new_price
+            prev[sym]['price'] = new_price
             # Use IBKR prev_close if available for accurate pct
-            prev_close = self.previous[sym].get('prev_close', 0)
+            prev_close = prev[sym].get('prev_close', 0)
             if prev_close > 0:
                 new_pct = round((new_price - prev_close) / prev_close * 100, 1)
-                self.previous[sym]['pct'] = new_pct
+                prev[sym]['pct'] = new_pct
             else:
                 new_pct = d['pct']
-                self.previous[sym]['pct'] = new_pct
+                prev[sym]['pct'] = new_pct
             # Update day_high / day_low with real-time price
-            cur_high = self.previous[sym].get('day_high', 0)
-            cur_low = self.previous[sym].get('day_low', 0)
+            cur_high = prev[sym].get('day_high', 0)
+            cur_low = prev[sym].get('day_low', 0)
             if cur_high > 0 and new_price > cur_high:
-                self.previous[sym]['day_high'] = round(new_price, 4)
+                prev[sym]['day_high'] = round(new_price, 4)
             if cur_low > 0 and new_price < cur_low:
-                self.previous[sym]['day_low'] = round(new_price, 4)
+                prev[sym]['day_low'] = round(new_price, 4)
             # Update running alert trackers
             prev_rh = _running_high.get(sym, 0)
             if new_price > prev_rh:
@@ -7617,12 +7770,9 @@ class ScannerThread(threading.Thread):
                 log.warning(f"WATCHDOG: cycle took {cycle_dur:.0f}s (>{self._CYCLE_FORCE_SECS}s). "
                             f"Consecutive slow: {self._consecutive_slow}. Forcing IBKR reconnect.")
                 global _ibkr
-                if _ibkr:
-                    try:
-                        _ibkr.disconnect()
-                    except Exception:
-                        pass
-                    _ibkr = None
+                # Don't call disconnect() — may hang or crash. Just drop the reference
+                # and let _get_ibkr() create a fresh connection on next use.
+                _ibkr = None
                 send_telegram(
                     f"⚠️ <b>Watchdog: cycle איטי</b>\n"
                     f"  משך: {cycle_dur:.0f}s | רצף: {self._consecutive_slow}\n"
@@ -7748,7 +7898,7 @@ class ScannerThread(threading.Thread):
             # Cache for FIB DT position sizing (use NetLiq, not margin-inflated BuyingPower)
             self._cached_buying_power = buying_power
             self._cached_net_liq = net_liq
-            log.info(f"Account: NetLiq=${net_liq:,.0f} BuyingPower=${buying_power:,.0f} (sizing uses NetLiq)")
+            log.debug(f"Account: NetLiq=${net_liq:,.0f} BuyingPower=${buying_power:,.0f} (sizing uses NetLiq)")
 
             positions = {}
             # Use ib.portfolio() for extended data (marketPrice, unrealizedPNL)
@@ -7879,6 +8029,9 @@ class ScannerThread(threading.Thread):
                 # News filter
                 if FIB_DT_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
+                # Bearish news filter
+                if _news_is_bearish(sym):
+                    continue
 
                 # Get float from enrichment cache (optional — no filter)
                 enrich = _enrichment.get(sym, {})
@@ -7895,8 +8048,8 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by turnover descending, limit to TOP 3
-            candidates.sort(key=lambda x: x[1], reverse=True)
+            # Sort by composite score descending, limit to TOP 3
+            candidates.sort(key=lambda x: _composite_score(x[0], x[2], 'fib_dt'), reverse=True)
             candidates = candidates[:3]
 
             # SMA9 filter (only on final candidates to limit IBKR calls)
@@ -7907,9 +8060,18 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
+            # Bar range filter (spread/chop proxy)
+            candidates = [
+                c for c in candidates
+                if _avg_bar_range_pct(c[0]) <= STRATEGY_MAX_BAR_RANGE_PCT
+                or _avg_bar_range_pct(c[0]) == 0.0  # no data = pass
+            ]
+            if not candidates:
+                return
+
             # Log ranking
             ranking_str = " | ".join(
-                f"{s} {t:.2f}x" for s, t, _, _ in candidates
+                f"{s} {t:.2f}x score={_composite_score(s, d, 'fib_dt'):.1f}" for s, t, d, _ in candidates
             )
             log.info(f"FIB DT candidates ({len(candidates)}): {ranking_str}")
 
@@ -8007,7 +8169,7 @@ class ScannerThread(threading.Thread):
                     if alert:
                         send_telegram(alert)  # private chat, not group
                         self._fib_dt_strategy.record_entry()
-                        self._fib_dt_strategy.mark_in_position(req.symbol)
+                        self._fib_dt_strategy.mark_in_position(req.symbol, entry_price)
                         _log_daily_event('fib_dt_entry', req.symbol,
                                          f"[SIM] BUY {qty}sh @ ${entry_price:.2f} "
                                          f"(strategy=${req.entry_price:.2f}, scan=${scan_price:.2f})")
@@ -8140,6 +8302,9 @@ class ScannerThread(threading.Thread):
                 # News filter
                 if GG_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
+                # Bearish news filter
+                if _news_is_bearish(sym):
+                    continue
 
                 candidates.append(GGCandidate(
                     symbol=sym,
@@ -8152,8 +8317,8 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by gap % descending, limit to TOP 3
-            candidates.sort(key=lambda c: c.gap_pct, reverse=True)
+            # Sort by composite score descending, limit to TOP 3
+            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'gg'), reverse=True)
             candidates = candidates[:3]
 
             # SMA9 filter (only on final candidates to limit IBKR calls)
@@ -8164,8 +8329,17 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
+            # Bar range filter (spread/chop proxy)
+            candidates = [
+                c for c in candidates
+                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
+                or _avg_bar_range_pct(c.symbol) == 0.0
+            ]
+            if not candidates:
+                return
+
             log.info(f"GG candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates))
+                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'gg'):.1f}" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._gg_strategy.process_cycle(candidates)
@@ -8271,6 +8445,9 @@ class ScannerThread(threading.Thread):
                 # News filter
                 if MR_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
+                # Bearish news filter
+                if _news_is_bearish(sym):
+                    continue
 
                 candidates.append(MRCandidate(
                     symbol=sym,
@@ -8283,8 +8460,8 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by gap % descending, limit to TOP 3
-            candidates.sort(key=lambda c: c.gap_pct, reverse=True)
+            # Sort by composite score descending, limit to TOP 3
+            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'mr'), reverse=True)
             candidates = candidates[:3]
 
             # SMA9 filter (only on final candidates to limit IBKR calls)
@@ -8295,8 +8472,17 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
+            # Bar range filter (spread/chop proxy)
+            candidates = [
+                c for c in candidates
+                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
+                or _avg_bar_range_pct(c.symbol) == 0.0
+            ]
+            if not candidates:
+                return
+
             log.info(f"MR candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}%" for c in candidates))
+                     + " | ".join(f"{c.symbol} +{c.gap_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'mr'):.1f}" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._mr_strategy.process_cycle(candidates)
@@ -8390,6 +8576,9 @@ class ScannerThread(threading.Thread):
                 # News filter
                 if FT_LIVE_REQUIRE_NEWS and not _stock_has_news(sym):
                     continue
+                # Bearish news filter
+                if _news_is_bearish(sym):
+                    continue
 
                 # Skip if too far below VWAP
                 vwap = d.get('vwap', 0)
@@ -8425,8 +8614,8 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
-            # Sort by turnover descending, limit to TOP 3
-            candidates.sort(key=lambda c: c.turnover_pct, reverse=True)
+            # Sort by composite score descending, limit to TOP 3
+            candidates.sort(key=lambda c: _composite_score(c.symbol, current.get(c.symbol, {}), 'ft'), reverse=True)
             candidates = candidates[:3]
 
             # SMA9 filter (only on final candidates to limit IBKR calls)
@@ -8437,8 +8626,17 @@ class ScannerThread(threading.Thread):
             if not candidates:
                 return
 
+            # Bar range filter (spread/chop proxy)
+            candidates = [
+                c for c in candidates
+                if _avg_bar_range_pct(c.symbol) <= STRATEGY_MAX_BAR_RANGE_PCT
+                or _avg_bar_range_pct(c.symbol) == 0.0
+            ]
+            if not candidates:
+                return
+
             log.info(f"FT candidates ({len(candidates)}): "
-                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}%" for c in candidates))
+                     + " | ".join(f"{c.symbol} {c.turnover_pct:.0f}% score={_composite_score(c.symbol, current.get(c.symbol, {}), 'ft'):.1f}" for c in candidates))
 
             # ── 2. Run strategy cycle ──
             entries, exits = self._ft_strategy.process_cycle(candidates)
@@ -8660,7 +8858,7 @@ class ScannerThread(threading.Thread):
                     and sym not in _enrichment]
         skipped = len(current) - len(new_syms) - sum(1 for s in current if s in _enrichment)
         if skipped > 0:
-            log.info(f"Enrichment filter: {len(new_syms)} stocks ≥{MIN_ENRICH_PCT}% (skipped {skipped} below threshold)")
+            log.debug(f"Enrichment filter: {len(new_syms)} stocks ≥{MIN_ENRICH_PCT}% (skipped {skipped} below threshold)")
 
         # ── Enrich stocks (Finviz + Fib) ──
         _phase('finviz_enrich_start')
@@ -8818,10 +9016,16 @@ class ScannerThread(threading.Thread):
         self._fetch_account_data()
 
         # ── Monitor virtual portfolio positions for stops/targets ──
-        self._monitor_virtual_positions(current)
+        try:
+            self._monitor_virtual_positions(current)
+        except Exception as e:
+            log.error(f"_monitor_virtual_positions crashed: {e}", exc_info=True)
 
         # ── Force-close positions that exceeded max hold time ──
-        self._check_timed_exits(current)
+        try:
+            self._check_timed_exits(current)
+        except Exception as e:
+            log.error(f"_check_timed_exits crashed: {e}", exc_info=True)
 
         # ── FIB DT Auto-Strategy ──
         _phase('fib_dt_start')
@@ -8883,7 +9087,8 @@ class ScannerThread(threading.Thread):
         if self.on_stocks and merged:
             self.on_stocks(merged)
 
-        self.previous = current
+        with self._prev_lock:
+            self.previous = current
         if self._warmup:
             # Populate news state without sending, so next cycle won't re-send
             _check_news_updates(current, suppress_send=True)
@@ -9359,7 +9564,7 @@ class App:
         self.root.after(0, self._render_stock_table_r)
         self.root.after(0, self._render_spy_chart)
 
-    def _compute_row_data(self, sym: str, d: dict, idx: int) -> dict:
+    def _compute_row_data(self, sym: str, d: dict, idx: int, fib_snapshot: dict | None = None) -> dict:
         """Compute display values for a stock row."""
         is_selected = (sym == self._selected_symbol_name)
         # Yellow background if alerted in last 60 seconds
@@ -9453,8 +9658,11 @@ class App:
         # Fib anchor candle: Low - High (4.236)
         fib_near_text = ""
         fib_near_fg = "#555"
-        with _fib_cache_lock:
-            cached_fib = _fib_cache.get(sym)
+        if fib_snapshot is not None:
+            cached_fib = fib_snapshot.get(sym)
+        else:
+            with _fib_cache_lock:
+                cached_fib = _fib_cache.get(sym)
         if cached_fib:
             anchor_low, anchor_high, _all_lvls, _rm, *_ = cached_fib
             if anchor_low > 0 and anchor_high > 0:
@@ -9701,10 +9909,14 @@ class App:
         sorted_stocks = [(s, d) for s, d in all_sorted if lo <= d.get('pct', 0) <= hi]
         new_order = [sym for sym, _ in sorted_stocks]
 
+        # Snapshot fib cache once for all rows (avoid per-row locking)
+        with _fib_cache_lock:
+            fib_snap = dict(_fib_cache)
+
         if new_order == self._rendered_order:
             # ── Fast path: in-place update ──
             for i, (sym, d) in enumerate(sorted_stocks):
-                rd = self._compute_row_data(sym, d, i)
+                rd = self._compute_row_data(sym, d, i, fib_snapshot=fib_snap)
                 if sym in self._row_widgets:
                     self._update_stock_row(self._row_widgets[sym], rd)
         else:
@@ -9715,7 +9927,7 @@ class App:
             self._rendered_order = new_order
 
             for i, (sym, d) in enumerate(sorted_stocks):
-                rd = self._compute_row_data(sym, d, i)
+                rd = self._compute_row_data(sym, d, i, fib_snapshot=fib_snap)
                 self._row_widgets[sym] = self._build_stock_row(sym, rd)
 
         # Auto-update trade price for the selected (picked) stock
@@ -9742,9 +9954,13 @@ class App:
         sorted_stocks = [(s, d) for s, d in all_sorted if lo <= d.get('pct', 0) <= hi]
         new_order = [sym for sym, _ in sorted_stocks]
 
+        # Snapshot fib cache once for all rows
+        with _fib_cache_lock:
+            fib_snap = dict(_fib_cache)
+
         if new_order == self._rendered_order_r:
             for i, (sym, d) in enumerate(sorted_stocks):
-                rd = self._compute_row_data(sym, d, i)
+                rd = self._compute_row_data(sym, d, i, fib_snapshot=fib_snap)
                 if sym in self._row_widgets_r:
                     self._update_stock_row(self._row_widgets_r[sym], rd)
         else:
@@ -9754,7 +9970,7 @@ class App:
             self._rendered_order_r = new_order
 
             for i, (sym, d) in enumerate(sorted_stocks):
-                rd = self._compute_row_data(sym, d, i)
+                rd = self._compute_row_data(sym, d, i, fib_snapshot=fib_snap)
                 self._row_widgets_r[sym] = self._build_stock_row(sym, rd, parent=self.stock_frame_r)
 
     # ── Portfolio Panel ─────────────────────────────────────

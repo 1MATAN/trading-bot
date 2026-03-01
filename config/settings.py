@@ -241,7 +241,7 @@ FIB_DT_LIVE_STOP_PCT = 0.06              # 6% below fib level (was 3%, too tight
 FIB_DT_LIVE_TARGET_LEVELS = 3            # 3rd fib level above entry
 FIB_DT_LIVE_PROXIMITY_PCT = 0.008        # 0.8% proximity threshold
 FIB_DT_LIVE_MIN_BOUNCE_BARS = 6          # min bars between touches (6 × 15s = 90s)
-FIB_DT_LIVE_TRAILING_BARS = 6            # bars without new high before trailing exit (6 × 15s = 90s)
+FIB_DT_LIVE_TRAILING_BARS = 10            # bars without new high before trailing exit (10 × 15s = 150s)
 FIB_DT_LIVE_PREFERRED_RATIOS = {0.382, 0.5, 0.764, 0.88, 2.272, 2.414, 3.272, 3.414, 3.618}
 FIB_DT_LIVE_MIN_TARGET_PCT = 0.04        # 4% minimum target distance
 FIB_DT_LIVE_ATR_STOP_MULT = 2.0          # stop = fib - ATR * 2
@@ -306,6 +306,7 @@ FT_LIVE_PROFIT_TARGET_PCT = 0.08      # +8% → sell half, move stop to breakeve
 
 # ── Strategy-Wide Risk Controls ──────────────────────
 STRATEGY_MIN_PRICE = 0.50              # skip stocks under $0.50 (huge spreads)
+STRATEGY_MAX_BAR_RANGE_PCT = 0.05      # skip stocks with avg bar range > 5% (spread/chop proxy)
 FIB_DT_POSITION_SIZE_FIXED = 500       # $500 per position (FIB DT cap)
 FIB_DT_MAX_POSITIONS = 3              # max open positions for FIB DT
 FIB_DT_MAX_HOLD_MINUTES = 180         # 3 hours max hold
