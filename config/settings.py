@@ -338,8 +338,7 @@ EOD_PROFIT_LOCK_PENNY_TRAIL_PCT = 0.04     # 4% for sub-$2 stocks
 
 # ── VWAP Zone Live Robot ──────────────────────────────
 VZ_LIVE_INITIAL_CASH = 3000.0
-VZ_LIVE_POSITION_SIZE = 300               # $300 per position (default)
-VZ_LIVE_POSITION_SIZE_SUB2 = 400          # $400 for sub-$2 stocks
+VZ_LIVE_POSITION_SIZE_PCT = 0.80          # 80% of available cash per position
 VZ_LIVE_MAX_SLOTS_PER_SYM = 3            # 3 concurrent slots per symbol (SYM_0/1/2)
 VZ_LIVE_VWAP_BAND_PCT = 0.03             # ±3% of VWAP for entry zone
 VZ_LIVE_SMA_PERIOD = 20                  # SMA20 on 1-min bars
@@ -351,8 +350,10 @@ VZ_LIVE_LOSS_COOLDOWN_SEC = 300           # 5 min cooldown after loss
 VZ_LIVE_GAP_MIN_PCT = 20.0               # min gap % filter
 VZ_LIVE_RVOL_MIN = 2.0                   # min relative volume
 VZ_LIVE_REQUIRE_NEWS = True              # require news catalyst
-VZ_LIVE_MAX_TRACKED_SYMBOLS = 3          # top N candidates to track
+VZ_LIVE_MAX_TRACKED_SYMBOLS = 4          # top N candidates to track
 VZ_LIVE_MAX_HOLD_MINUTES = 240           # 4h max hold
+VZ_LIVE_STALE_EXIT_MINUTES = 10          # exit if stock moves < 1% in this time
+VZ_LIVE_STALE_EXIT_MIN_MOVE_PCT = 1.0    # min % move required within stale window
 VZ_LIVE_DEAD_ZONES = [                   # no entries during these windows (ET)
     ("11:00", "11:30"),
     ("13:00", "13:30"),

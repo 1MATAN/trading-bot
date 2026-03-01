@@ -68,9 +68,10 @@ from config.settings import (
     STRATEGY_MAX_ENTRIES_PER_STOCK_PER_DAY, STRATEGY_DAILY_LOSS_LIMIT,
     TIMED_EXIT_IMMEDIATE_MAX_LOSS_PCT, TIMED_EXIT_TIGHT_TRAIL_PCT, TIMED_EXIT_TIGHT_TRAIL_PENNY_PCT,
     EOD_PROFIT_LOCK_TIME, EOD_PROFIT_LOCK_TRAIL_PCT, EOD_PROFIT_LOCK_PENNY_TRAIL_PCT,
-    VZ_LIVE_INITIAL_CASH, VZ_LIVE_POSITION_SIZE, VZ_LIVE_POSITION_SIZE_SUB2,
+    VZ_LIVE_INITIAL_CASH, VZ_LIVE_POSITION_SIZE_PCT,
     VZ_LIVE_MAX_SLOTS_PER_SYM, VZ_LIVE_GAP_MIN_PCT, VZ_LIVE_RVOL_MIN,
     VZ_LIVE_REQUIRE_NEWS, VZ_LIVE_MAX_TRACKED_SYMBOLS, VZ_LIVE_MAX_HOLD_MINUTES,
+    VZ_LIVE_STALE_EXIT_MINUTES, VZ_LIVE_STALE_EXIT_MIN_MOVE_PCT,
 )
 
 # ── Config ────────────────────────────────────────────────
@@ -720,6 +721,10 @@ def _get_turnover(sym: str, d: dict) -> float:
     flt = _parse_float_to_shares(enrich.get('float', '-'))
     vol = d.get('volume_raw', 0)
     return (vol / flt * 100) if flt > 0 and vol > 0 else 0.0
+
+
+# Cache latest VZ candidate scores for trade journal detail
+_vz_last_scores: dict[str, dict] = {}  # sym → {score, rank, total, gap_pct, rvol, turnover, convergence}
 
 
 def _avg_bar_range_pct(sym: str) -> float:
@@ -2814,7 +2819,7 @@ _JOURNAL_HTML_PATH = Path.home() / "Desktop" / "יומן.html"
 _DEMO_JOURNAL_HTML_PATH = Path.home() / "Desktop" / "דמו.html"
 
 # Robot emoji map for HTML
-_ROBOT_EMOJI = {'FIB DT': '📐', 'Gap&Go': '🚀', 'MR': '📈', 'FT': '🔄'}
+_ROBOT_EMOJI = {'VWAP Zone': '📊', 'FIB DT': '📐', 'Gap&Go': '🚀', 'MR': '📈', 'FT': '🔄'}
 
 
 def _load_journal_trades() -> list[dict]:
@@ -2840,6 +2845,7 @@ def _generate_journal_html(trades: list[dict]):
     """
     _TAB_DEFS = [
         ('all', '📒 הכל'),
+        ('VWAP Zone', '📊 VWAP Zone'),
         ('FIB DT', '📐 FIB DT'),
         ('Gap&Go', '🚀 Gap&Go'),
         ('MR', '📈 MR'),
@@ -2847,10 +2853,11 @@ def _generate_journal_html(trades: list[dict]):
     ]
 
     def _stats_for(tlist):
-        pnl = sum(t.get('pnl', 0) for t in tlist)
-        w = [t for t in tlist if t.get('pnl', 0) > 0]
-        l = [t for t in tlist if t.get('pnl', 0) < 0]
-        n = len(tlist)
+        sells = [t for t in tlist if t.get('side', '') != 'BUY']
+        pnl = sum(t.get('pnl', 0) for t in sells)
+        w = [t for t in sells if t.get('pnl', 0) > 0]
+        l = [t for t in sells if t.get('pnl', 0) < 0]
+        n = len(sells)
         wr = (len(w) / n * 100) if n else 0
         aw = (sum(t['pnl'] for t in w) / len(w)) if w else 0
         al = (sum(t['pnl'] for t in l) / len(l)) if l else 0
@@ -2859,37 +2866,45 @@ def _generate_journal_html(trades: list[dict]):
     def _build_rows(tlist):
         rows = ''
         for i, t in enumerate(reversed(tlist)):
+            is_buy = t.get('side') == 'BUY'
             pv = t.get('pnl', 0)
             pp = t.get('pnl_pct', 0)
-            rc = '#4caf50' if pv >= 0 else '#f44336'
-            em = _ROBOT_EMOJI.get(t.get('robot', ''), '')
-            sh = 'מכירה חלקית' if t.get('side') == 'SELL_HALF' else 'מכירה'
             bg = '#1a1a2e' if i % 2 == 0 else '#16213e'
             logic = t.get('logic', '').replace('\n', '<br>')
             det = ''
             if logic:
                 det = (
                     f'<tr class="detail-row" style="background:{bg}">'
-                    f'<td colspan="11" style="padding:8px 16px;font-size:13px;'
+                    f'<td colspan="8" style="padding:8px 16px;font-size:13px;'
                     f'color:#aaa;border-top:none">{logic}</td></tr>'
                 )
-            rows += (
-                f'<tr style="background:{bg}">'
-                f'<td>{t.get("date","")}</td>'
-                f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
-                f'<td>{sh}</td>'
-                f'<td>{t.get("qty","")}</td>'
-                f'<td>${t.get("entry_price",0):.2f}</td>'
-                f'<td>${t.get("exit_price",0):.2f}</td>'
-                f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
-                f'<td style="color:{rc}">{pp:+.1f}%</td>'
-                f'<td>{t.get("entry_time","")}</td>'
-                f'<td>{t.get("exit_time","")}</td>'
-                f'<td class="notes">'
-                f'<b>כניסה:</b> {t.get("entry_note","")}<br>'
-                f'<b>יציאה:</b> {t.get("exit_note","")}</td>'
-                f'</tr>\n{det}'
-            )
+            if is_buy:
+                rows += (
+                    f'<tr style="background:{bg};opacity:0.85">'
+                    f'<td>{t.get("date","")}</td>'
+                    f'<td>{t.get("entry_time","")}</td>'
+                    f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+                    f'<td>{t.get("qty","")}</td>'
+                    f'<td>${t.get("entry_price",0):.2f}</td>'
+                    f'<td style="color:#ffd700">—</td>'
+                    f'<td style="color:#ffd700">פתוח</td>'
+                    f'<td>—</td>'
+                    f'</tr>\n{det}'
+                )
+            else:
+                rc = '#4caf50' if pv >= 0 else '#f44336'
+                rows += (
+                    f'<tr style="background:{bg}">'
+                    f'<td>{t.get("date","")}</td>'
+                    f'<td>{t.get("exit_time","")}</td>'
+                    f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+                    f'<td>{t.get("qty","")}</td>'
+                    f'<td>${t.get("entry_price",0):.2f}</td>'
+                    f'<td>${t.get("exit_price",0):.2f}</td>'
+                    f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
+                    f'<td style="color:{rc}">{pp:+.1f}%</td>'
+                    f'</tr>\n{det}'
+                )
         return rows
 
     def _build_stats_cards(pnl, n, w, l, wr, aw, al, robot_name=None):
@@ -2930,7 +2945,7 @@ def _generate_journal_html(trades: list[dict]):
 
         # For "all" tab, add per-robot mini cards
         if tab_id == 'all':
-            for rname in ['FIB DT', 'Gap&Go', 'MR', 'FT']:
+            for rname in ['VWAP Zone', 'FIB DT', 'Gap&Go', 'MR', 'FT']:
                 rt = [t for t in trades if t.get('robot') == rname]
                 if not rt:
                     continue
@@ -2951,25 +2966,19 @@ def _generate_journal_html(trades: list[dict]):
         rows = _build_rows(tlist)
         display = 'block' if tab_id == 'all' else 'none'
 
-        # Robot column only in "all" tab
-        robot_th = '<th>רובוט</th>' if tab_id == 'all' else ''
-
         tab_panels += f'''
 <div id="tab-{tab_id}" class="tab-panel" style="display:{display}">
 {stats}
 <table>
 <thead><tr>
     <th>תאריך</th>
+    <th>שעה</th>
     <th>סימבול</th>
-    <th>סוג</th>
     <th>כמות</th>
-    <th>כניסה</th>
-    <th>יציאה</th>
-    <th>רווח/הפסד</th>
-    <th>%</th>
-    <th>שעת כניסה</th>
-    <th>שעת יציאה</th>
-    <th>הערות</th>
+    <th>מחיר כניסה</th>
+    <th>מחיר יציאה</th>
+    <th>רווח $</th>
+    <th>רווח %</th>
 </tr></thead>
 <tbody>{rows}</tbody>
 </table>
@@ -3109,21 +3118,22 @@ function switchTab(id) {{
 
 def _generate_demo_journal_html(trades: list[dict]):
     """Generate a clean 'Demo' HTML journal on Desktop showing all trades."""
-    _ROBOT_SHORT = {'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנטום', 'FT': 'סיבוב'}
+    _ROBOT_SHORT = {'VWAP Zone': 'VZ', 'FIB DT': 'פיבו', 'Gap&Go': 'גאפ', 'MR': 'מומנטום', 'FT': 'סיבוב'}
 
-    # Stats
-    total_pnl = sum(t.get('pnl', 0) for t in trades)
-    wins = [t for t in trades if t.get('pnl', 0) > 0]
-    losses = [t for t in trades if t.get('pnl', 0) < 0]
-    n = len(trades)
+    # Stats (only SELL trades)
+    sells = [t for t in trades if t.get('side', '') != 'BUY']
+    total_pnl = sum(t.get('pnl', 0) for t in sells)
+    wins = [t for t in sells if t.get('pnl', 0) > 0]
+    losses = [t for t in sells if t.get('pnl', 0) < 0]
+    n = len(sells)
     wr = (len(wins) / n * 100) if n else 0
     avg_w = (sum(t['pnl'] for t in wins) / len(wins)) if wins else 0
     avg_l = (sum(t['pnl'] for t in losses) / len(losses)) if losses else 0
 
     # Per-robot stats
     robot_stats_html = ''
-    for rname in ['FIB DT', 'Gap&Go', 'MR', 'FT']:
-        rt = [t for t in trades if t.get('robot') == rname]
+    for rname in ['VWAP Zone', 'FIB DT', 'Gap&Go', 'MR', 'FT']:
+        rt = [t for t in sells if t.get('robot') == rname]
         if not rt:
             continue
         rpnl = sum(t.get('pnl', 0) for t in rt)
@@ -3145,24 +3155,37 @@ def _generate_demo_journal_html(trades: list[dict]):
     # Trade rows
     rows_html = ''
     for i, t in enumerate(reversed(trades)):
+        is_buy = t.get('side') == 'BUY'
         pv = t.get('pnl', 0)
         pp = t.get('pnl_pct', 0)
-        rc = '#4caf50' if pv >= 0 else '#f44336'
         bg = '#1a1a2e' if i % 2 == 0 else '#16213e'
-        rhe = _ROBOT_SHORT.get(t.get('robot', ''), t.get('robot', ''))
-        rows_html += (
-            f'<tr style="background:{bg}">'
-            f'<td>{t.get("date","")}</td>'
-            f'<td>{t.get("exit_time","")}</td>'
-            f'<td style="color:#00d4ff">{rhe}</td>'
-            f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
-            f'<td>${t.get("entry_price",0):.2f}</td>'
-            f'<td>${t.get("exit_price",0):.2f}</td>'
-            f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
-            f'<td style="color:{rc}">{pp:+.1f}%</td>'
-            f'<td style="color:#888;font-size:11px">{t.get("exit_note","")[:30]}</td>'
-            f'</tr>\n'
-        )
+        if is_buy:
+            rows_html += (
+                f'<tr style="background:{bg};opacity:0.85">'
+                f'<td>{t.get("date","")}</td>'
+                f'<td>{t.get("entry_time","")}</td>'
+                f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+                f'<td>{t.get("qty","")}</td>'
+                f'<td>${t.get("entry_price",0):.2f}</td>'
+                f'<td style="color:#ffd700">—</td>'
+                f'<td style="color:#ffd700">פתוח</td>'
+                f'<td>—</td>'
+                f'</tr>\n'
+            )
+        else:
+            rc = '#4caf50' if pv >= 0 else '#f44336'
+            rows_html += (
+                f'<tr style="background:{bg}">'
+                f'<td>{t.get("date","")}</td>'
+                f'<td>{t.get("exit_time","")}</td>'
+                f'<td style="font-weight:bold">{t.get("symbol","")}</td>'
+                f'<td>{t.get("qty","")}</td>'
+                f'<td>${t.get("entry_price",0):.2f}</td>'
+                f'<td>${t.get("exit_price",0):.2f}</td>'
+                f'<td style="color:{rc};font-weight:bold">${pv:+,.2f}</td>'
+                f'<td style="color:{rc}">{pp:+.1f}%</td>'
+                f'</tr>\n'
+            )
 
     pnl_color = '#4caf50' if total_pnl >= 0 else '#f44336'
     html = f'''<!DOCTYPE html>
@@ -3191,8 +3214,8 @@ tr:hover {{ background:#222244 !important }}
 <div style="text-align:center">{robot_stats_html}</div>
 <table>
 <thead><tr>
-<th>תאריך</th><th>שעה</th><th>רובוט</th><th>מניה</th>
-<th>כניסה</th><th>יציאה</th><th>ר/ה $</th><th>ר/ה %</th><th>הערה</th>
+<th>תאריך</th><th>שעה</th><th>מניה</th><th>כמות</th>
+<th>מחיר כניסה</th><th>מחיר יציאה</th><th>רווח $</th><th>רווח %</th>
 </tr></thead>
 <tbody>
 {rows_html}
@@ -3267,11 +3290,21 @@ def _build_trade_logic_detail(robot_name: str, prefix: str, sym: str,
             f"🤖 חוקי רובוט: גאפ≥{VZ_LIVE_GAP_MIN_PCT:.0f}% | "
             f"RVOL≥{VZ_LIVE_RVOL_MIN}x | מחיר≥${STRATEGY_MIN_PRICE} | "
             f"חדשות: {'כן' if VZ_LIVE_REQUIRE_NEWS else 'לא'} | SMA9(5m+4h)\n"
-            f"💰 גודל: ${VZ_LIVE_POSITION_SIZE}/פוז | מקס {VZ_LIVE_MAX_SLOTS_PER_SYM} slots/sym | "
-            f"מקס החזקה {VZ_LIVE_MAX_HOLD_MINUTES} דק"
+            f"💰 גודל: {VZ_LIVE_POSITION_SIZE_PCT*100:.0f}% מהקופה | מקס {VZ_LIVE_MAX_SLOTS_PER_SYM} slots/sym | "
+            f"מקס החזקה {VZ_LIVE_MAX_HOLD_MINUTES} דק | stale exit {VZ_LIVE_STALE_EXIT_MINUTES} דק"
         )
     if thresh:
         lines.append(thresh)
+
+    # ── 4b. VZ Scoring (from last cycle) ──
+    vz_sc = _vz_last_scores.get(sym)
+    if vz_sc:
+        conv_str = f" | convergence x{vz_sc['convergence']}" if vz_sc['convergence'] >= 2 else ""
+        lines.append(
+            f"🏆 דירוג: #{vz_sc['rank']}/{vz_sc['total']} | "
+            f"ציון={vz_sc['score']} | gap={vz_sc['gap_pct']:.0f}% | "
+            f"RVOL={vz_sc['rvol']}x | FT={vz_sc['turnover']}%{conv_str}"
+        )
 
     # ── 5. Position sizing detail ──
     cost = qty * entry_price
@@ -3306,6 +3339,53 @@ def _build_trade_logic_detail(robot_name: str, prefix: str, sym: str,
     )
 
     return "\n".join(lines)
+
+
+def _send_buy_journal_entry(robot_emoji: str, robot_name: str,
+                             sym: str, qty: int, price: float,
+                             cash: float, net_liq: float):
+    """Record a BUY event in the persistent HTML journal."""
+    buy_dt = datetime.now(_ET).astimezone(_IL_TZ)
+    date_str = buy_dt.strftime('%d/%m/%Y')
+    time_str = buy_dt.strftime('%H:%M')
+
+    # Build logic detail for BUY
+    prefix_map = {'VWAP Zone': 'vz_', 'FIB DT': 'fib_dt_', 'Gap&Go': 'gg_', 'MR': 'mr_', 'FT': 'ft_'}
+    prefix = prefix_map.get(robot_name, '')
+    logic_detail = _build_trade_logic_detail(robot_name, prefix, sym, price, qty)
+    logic_for_html = logic_detail.replace('<b>', '').replace('</b>', '')
+
+    # Entry note from VZ scoring
+    vz_sc = _vz_last_scores.get(sym)
+    entry_note = (f"#{vz_sc['rank']}/{vz_sc['total']} score={vz_sc['score']}"
+                  if vz_sc else '')
+
+    trade_record = {
+        'date': date_str,
+        'entry_time': time_str,
+        'exit_time': '',
+        'robot': robot_name,
+        'symbol': sym,
+        'side': 'BUY',
+        'qty': qty,
+        'entry_price': round(price, 4),
+        'exit_price': 0,
+        'pnl': 0,
+        'pnl_pct': 0,
+        'cash_after': round(cash, 2),
+        'nlv_after': round(net_liq, 2),
+        'entry_note': entry_note,
+        'exit_note': '',
+        'logic': logic_for_html,
+    }
+    try:
+        all_trades = _load_journal_trades()
+        all_trades.append(trade_record)
+        _save_journal_trades(all_trades)
+        _generate_journal_html(all_trades)
+        _generate_demo_journal_html(all_trades)
+    except Exception as e:
+        log.warning(f"BUY journal write error: {e}")
 
 
 def _send_trade_journal_entry(robot_emoji: str, robot_name: str,
@@ -6319,7 +6399,10 @@ class VZVirtualPortfolio:
                 ])
         except Exception as e:
             log.warning(f"VZ journal write error: {e}")
-        if side != 'BUY':
+        if side == 'BUY':
+            _send_buy_journal_entry('\U0001f4ca', 'VWAP Zone', sym, qty,
+                                     price, self.cash, net_liq_val)
+        else:
             _send_trade_journal_entry('\U0001f4ca', 'VWAP Zone', sym, reason, qty,
                                       price, entry_price, pnl, net_liq_val,
                                       self.cash, self.trades)
@@ -6879,7 +6962,7 @@ class ScannerThread(threading.Thread):
             return None
 
     def _check_timed_exits(self, current: dict):
-        """Force-close VZ positions that exceeded max hold time (4h)."""
+        """Force-close VZ positions that exceeded max hold time (4h) or are stale (no movement)."""
         now_ts = time_mod.time()
 
         for slot_key in list(self._vz_portfolio.positions.keys()):
@@ -6887,12 +6970,40 @@ class ScannerThread(threading.Thread):
             if not pos:
                 continue
             entry_ts = pos.get('entry_ts', 0)
-            if entry_ts > 0 and (now_ts - entry_ts) > VZ_LIVE_MAX_HOLD_MINUTES * 60:
+            if entry_ts <= 0:
+                continue
+            hold_sec = now_ts - entry_ts
+            hold_min = int(hold_sec / 60)
+            sym = self._vz_portfolio._base_sym(slot_key)
+            price = current.get(sym, {}).get('price', 0)
+            if price <= 0:
+                continue
+            entry_price = pos.get('entry_price', 0)
+
+            # ── Stale exit: stock barely moved after N minutes ──
+            if (hold_sec > VZ_LIVE_STALE_EXIT_MINUTES * 60
+                    and not pos.get('timed_exit_trail_pct')
+                    and entry_price > 0):
+                move_pct = abs(price / entry_price - 1) * 100
+                if move_pct < VZ_LIVE_STALE_EXIT_MIN_MOVE_PCT:
+                    pnl = (price - entry_price) * pos.get('qty', 0)
+                    alert = self._vz_portfolio.sell(slot_key, price,
+                        f"stale_exit ({hold_min}min, move={move_pct:.1f}%)")
+                    if alert:
+                        send_telegram(alert)
+                    idx_s = slot_key.rsplit('_', 1)[1]
+                    try:
+                        self._vz_strategy.mark_slot_closed(sym, int(idx_s))
+                    except (ValueError, IndexError):
+                        pass
+                    log.info(f"VZ STALE EXIT: {slot_key} @ ${price:.4f} "
+                             f"({hold_min}min, move={move_pct:.1f}%)")
+                    continue
+
+            # ── Max hold time exit ──
+            if hold_sec > VZ_LIVE_MAX_HOLD_MINUTES * 60:
                 if pos.get('timed_exit_trail_pct'):
                     continue
-                sym = self._vz_portfolio._base_sym(slot_key)
-                price = current.get(sym, {}).get('price', pos['entry_price'])
-                hold_min = int((now_ts - entry_ts) / 60)
                 self._timed_exit_or_trail(
                     self._vz_portfolio, self._vz_strategy,
                     slot_key, pos, price, hold_min, VZ_LIVE_MAX_HOLD_MINUTES, 'VZ')
@@ -7003,6 +7114,21 @@ class ScannerThread(threading.Thread):
                      f"RVOL {top_d.get('rvol',0):.1f}x | turnover {top_turn:.0f}% | "
                      f"score {_composite_score(top_sym, top_d, 'vz'):.1f}")
 
+            # Cache scoring data for trade journal
+            _vz_last_scores.clear()
+            for rank, (s, d) in enumerate(candidates, 1):
+                sc = _composite_score(s, d, 'vz')
+                turn = _get_turnover(s, d)
+                gap_pct = d.get('pct', 0)
+                rvol = d.get('rvol', 0)
+                conv = sum([gap_pct >= 40, rvol >= 4.0, turn >= 20])
+                _vz_last_scores[s] = {
+                    'score': round(sc, 1), 'rank': rank,
+                    'total': len(candidates), 'gap_pct': gap_pct,
+                    'rvol': round(rvol, 1), 'turnover': round(turn, 1),
+                    'convergence': conv,
+                }
+
             # ── 2. Build VZCandidate objects ──
             vz_candidates = []
             for sym, d in candidates:
@@ -7064,9 +7190,9 @@ class ScannerThread(threading.Thread):
                     log.info(f"VZ: Skipping {slot_key} — {reason}")
                     continue
 
-                # Position sizing: $400 sub-$2, $300 otherwise
-                size = VZ_LIVE_POSITION_SIZE_SUB2 if entry_price < 2.0 else VZ_LIVE_POSITION_SIZE
-                qty = int(min(self._vz_portfolio.cash, size) / entry_price) if entry_price > 0 else 0
+                # Position sizing: 80% of available cash
+                size = self._vz_portfolio.cash * VZ_LIVE_POSITION_SIZE_PCT
+                qty = int(size / entry_price) if entry_price > 0 else 0
                 if qty >= 1:
                     alert = self._vz_portfolio.buy(slot_key, qty, entry_price, entry.vwap)
                     if alert:
